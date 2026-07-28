@@ -1,0 +1,12 @@
+{
+  "input_pair_count": 1251762,
+  "kept_pair_count": 1251762,
+  "dropped_pair_count": 0,
+  "split_counts": {
+    "train": 1038583,
+    "val": 108606,
+    "test": 104573
+  },
+  "drop_reason_counts": {},
+  "image_cache_count": 2983
+}

@@ -1,0 +1,25 @@
+{
+  "random_seed": 42,
+  "ratios": {
+    "train": 0.8,
+    "val": 0.1,
+    "test": 0.1
+  },
+  "splits": {
+    "test": {
+      "finger_count": 3,
+      "image_count": 301,
+      "positive_pair_count": 104573
+    },
+    "train": {
+      "finger_count": 24,
+      "image_count": 2402,
+      "positive_pair_count": 1038583
+    },
+    "val": {
+      "finger_count": 3,
+      "image_count": 300,
+      "positive_pair_count": 108606
+    }
+  }
+}

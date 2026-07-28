@@ -1,0 +1,360 @@
+# HardNet / MobileHardNet 训练与推理优化说明
+
+本文记录训练侧和推理侧已经实现的性能优化，并说明每项操作的原理、目的、生效条件与注意事项。
+
+## 一、训练侧
+
+### 1. CUDA 强制检查
+
+**做了什么**
+
+正式训练配置使用 `training.device: cuda`。启动时会检查 `torch.cuda.is_available()`；如果配置要求 CUDA 但当前 PyTorch 不支持 CUDA，会直接报错，不会静默回退到 CPU。
+
+**原理与目的**
+
+CPU 也能执行 PyTorch 代码，因此缺少检查时，训练可能在用户不知情的情况下使用 CPU，速度慢很多。强制检查可以尽早暴露 CUDA 版 PyTorch、驱动或显卡环境问题。
+
+**注意事项**
+
+- `device: cuda`：强制 CUDA，不可用就报错。
+- `device: auto`：CUDA 可用时用 CUDA，否则用 CPU。
+- 只安装 CUDA Toolkit 不够，必须安装 CUDA 版 PyTorch，并确保 `torch.cuda.is_available()` 返回 `True`。
+
+### 2. FP16 autocast
+
+**做了什么**
+
+使用 `torch.autocast` 包裹 MobileHardNet 的前向计算。PyTorch 会根据算子类型自动选择 FP16 或 FP32，而不是把整个模型强制转换成 FP16。
+
+**原理**
+
+FP32 每个数占 4 字节，FP16 每个数占 2 字节。卷积和矩阵乘法通常适合使用 FP16，并可在支持 Tensor Core 的 NVIDIA GPU 上获得更高吞吐；部分数值敏感的运算由 PyTorch 保持较高精度。
+
+**目的**
+
+- 加快卷积和矩阵计算。
+- 减少中间激活显存。
+- 降低 GPU 内存带宽压力。
+- 为增大 batch size 留出显存空间。
+
+**注意事项**
+
+FP16 的数值范围和精度低于 FP32，不能简单使用 `model.half()` 把所有运算强制改成 FP16。当前实现使用 autocast，让 PyTorch按算子选择精度，更安全。
+
+### 3. GradScaler
+
+**做了什么**
+
+FP16 CUDA 训练时使用 `GradScaler`：先放大 loss，再反向传播；更新模型前恢复梯度，并检查 `inf/NaN`。
+
+**原理**
+
+反向传播中的梯度可能很小，例如 `1e-8`，FP16 可能无法准确表示并将其变成 0。GradScaler 假设缩放系数为 `S`，先计算：
+
+`scaled_loss = loss × S`
+
+梯度也随之放大。optimizer 更新前再除以 `S`，所以最终数学意义上的参数更新没有改变，只是避免小梯度在 FP16 中消失。
+
+如果梯度出现 `inf/NaN`，GradScaler 会跳过本次 optimizer 更新并降低缩放系数；连续稳定后又会尝试提高缩放系数。
+
+**目的**
+
+- 防止 FP16 梯度下溢为 0。
+- 检测梯度溢出。
+- 避免异常梯度污染模型参数。
+- 提高混合精度训练稳定性。
+
+**生效条件**
+
+- CUDA + FP16：autocast 和 GradScaler 都启用。
+- CUDA + BF16：使用 autocast，通常不启用 GradScaler，因为 BF16 的数值范围接近 FP32。
+- CPU/FP32：GradScaler 关闭。
+
+### 4. CNN 前向使用混合精度，距离矩阵和 loss 使用 FP32
+
+**做了什么**
+
+训练被划分为两个精度区域：
+
+1. anchor 和 positive patch 进入 MobileHardNet，在 autocast 中执行前向。
+2. 得到描述子后显式调用 `.float()` 转成 FP32。
+3. 使用 FP32 描述子计算距离矩阵、top-k 难负样本和 HardNet loss。
+
+**原理**
+
+CNN 卷积计算量大，适合 FP16。HardNet loss 需要从大量接近的距离中选择最难负样本，例如 `0.82341` 和 `0.82347`；FP16 可能把它们舍入成相同值，影响 top-k 排序。转回 FP32 后再计算距离，可以降低排序抖动。
+
+**目的**
+
+- CNN 使用低精度获得速度和显存收益。
+- 难负样本挖掘使用高精度保证排序稳定。
+- 避免因距离舍入错误选择不正确的 hardest negative。
+
+**注意事项**
+
+配置开启 `allow_tf32: true` 时，距离张量仍是 FP32，但支持的 NVIDIA GPU 可能使用 TF32 硬件路径执行内部矩阵乘法。如果需要严格的 FP32 对照实验，可设置 `allow_tf32: false`。
+
+### 5. AMP scaler 状态随 checkpoint 保存和恢复
+
+**做了什么**
+
+当 GradScaler 启用时，checkpoint 会额外保存 `amp_scaler` 状态；续训时和模型、optimizer、epoch、global step 一起恢复。
+
+**原理**
+
+GradScaler 的缩放系数会随训练动态变化。如果中断前已经找到合适的缩放系数，续训时重新初始化 scaler 可能导致前几个 step 溢出或下溢。恢复 scaler 状态能延续中断前的数值状态。
+
+**目的**
+
+- 保持断点续训前后的混合精度行为连续。
+- 避免恢复训练后重新搜索 loss scale。
+- 减少恢复初期因缩放不合适而跳过更新。
+
+### 6. channels_last
+
+**做了什么**
+
+CUDA 训练时，模型和输入张量都转换为 `channels_last` 内存格式。代码中看到的逻辑形状仍然是 `[B,C,H,W]`，改变的是底层内存排列。
+
+**原理**
+
+默认 NCHW 和 channels-last 只是数据在内存中的摆放顺序不同。部分 NVIDIA GPU、cuDNN 和 Tensor Core 卷积在 channels-last 格式下能更连续地读取通道数据，减少格式转换和访存开销。
+
+**目的**
+
+- 提高部分卷积的内存访问效率。
+- 更好地配合 FP16 和 Tensor Core。
+- 避免模型与输入内存格式不一致产生额外复制。
+
+**注意事项**
+
+channels-last 不保证所有硬件和算子都更快。MobileHardNet 包含较多 Depthwise Conv 和小通道卷积，最终收益需要在目标 GPU 上实测。CPU smoke 配置会关闭该功能。
+
+### 7. cuDNN benchmark
+
+**做了什么**
+
+CUDA 训练时根据 `cudnn_benchmark` 配置启用 cuDNN benchmark。
+
+**原理**
+
+同一种卷积可以有多种实现算法，各自在计算量、显存和硬件适配上不同。cuDNN 第一次遇到某种输入形状时会试跑候选算法，选择当前设备上最快的实现并缓存结果。
+
+**目的**
+
+当前 patch 固定为 `32×32`，模型结构和 batch size 基本稳定，适合复用已选择的最快卷积算法，从而提高后续训练吞吐。
+
+**注意事项**
+
+首次运行某个形状时会有额外测试开销。如果输入尺寸频繁变化，benchmark 可能重复搜索并降低效率；本项目输入尺寸固定，适合开启。
+
+### 8. TF32
+
+**做了什么**
+
+根据 `allow_tf32` 配置允许 CUDA matmul 和 cuDNN 使用 TF32。
+
+**原理**
+
+TF32 的数值范围接近 FP32，但有效精度较低。在支持 TF32 的 NVIDIA GPU 上，部分原本的 FP32 矩阵乘法和卷积可以使用更快的硬件路径。模型参数和输出张量不会永久变成 TF32，它只影响特定运算的内部执行方式。
+
+**目的**
+
+- 加速部分 FP32 矩阵乘法。
+- 加速部分 cuDNN 卷积。
+- 在速度和 FP32 数值范围之间取得平衡。
+
+**注意事项**
+
+HardNet 会对接近的描述子距离排序，TF32 的舍入可能对极接近样本产生轻微影响。正式精度对照可分别测试 `allow_tf32: true/false`。
+
+### 9. 4 个常驻 DataLoader worker
+
+**做了什么**
+
+正式配置使用 4 个 DataLoader worker，并开启 `persistent_workers`。
+
+**原理**
+
+GPU 训练的同时，CPU worker 并行完成 PNG 读取、PIL 解码、单 patch 标准化和 Tensor 构造。常驻 worker 在一个 epoch 结束后不退出，后续 epoch 不需要重新创建进程。
+
+**目的**
+
+- 让 CPU 数据准备与 GPU 计算并行。
+- 减少 GPU 等待磁盘和图片解码。
+- 避免 Windows 每个 epoch 重建 worker 的开销。
+
+**注意事项**
+
+`num_workers=4` 是起始值，不一定适合所有 CPU 和磁盘。可根据 GPU 利用率和磁盘负载测试 2、4、8。机械硬盘上过多 worker 可能造成随机读取竞争。
+
+### 10. 锁页内存 pin_memory
+
+**做了什么**
+
+CUDA 可用且配置开启时，DataLoader 把 batch 放入锁页内存，并用 `non_blocking=True` 搬运到 GPU。
+
+**原理**
+
+普通 CPU 内存可能被操作系统换出。锁页内存固定在物理内存中，GPU 可以通过 DMA 更直接地读取，是实现高效异步 CPU→GPU 传输的重要条件。
+
+**目的**
+
+- 提高 CPU 到 GPU 的传输效率。
+- 允许数据传输与 GPU 计算重叠。
+- 减少 GPU 等待下一批数据。
+
+**注意事项**
+
+锁页内存不能被系统正常换出，使用过多会影响系统。当前只锁定预取的少量 batch，通常合理。
+
+### 11. 数据预取 prefetch
+
+**做了什么**
+
+当前 `prefetch_factor: 2`，每个 worker 最多提前准备 2 个 batch。4 个 worker 理论上最多预备约 8 个 batch。
+
+**原理**
+
+GPU 训练当前 batch 时，CPU worker 已经开始读取并处理后续 batch，形成“磁盘读取→解码→标准化→锁页内存→GPU”的流水线。
+
+**目的**
+
+- 减少 batch 之间的数据等待。
+- 提高训练流水线连续性。
+- 提高 GPU 利用率。
+
+**注意事项**
+
+预取越多会占用更多 CPU 内存、锁页内存和磁盘带宽。当前 `4×2` 是较保守的设置。
+
+## 二、推理侧
+
+### 12. torch.inference_mode()
+
+**做了什么**
+
+描述子推理入口使用 `@torch.inference_mode()`。
+
+**原理**
+
+训练时 PyTorch 需要记录计算图、中间激活和张量版本，供反向传播使用。推理不需要这些信息。inference mode 会关闭梯度记录并减少部分额外状态管理。
+
+**目的**
+
+- 减少推理内存和显存。
+- 减少计算图管理开销。
+- 提高推理速度。
+
+### 13. FP16/BF16/FP32 可配置推理
+
+**做了什么**
+
+通过 `model.inference_precision` 选择 `fp32`、`fp16` 或 `bf16`。
+
+**原理**
+
+FP32 精度和兼容性最好；FP16 占用更少显存并可使用 Tensor Core；BF16 的数值范围接近 FP32，但需要硬件支持。
+
+**目的**
+
+让同一套推理流程适配不同设备和精度要求，并在性能与数值稳定性之间切换。
+
+**注意事项**
+
+- FP16/BF16 只在 CUDA 上真正启用。
+- CPU 上请求 FP16/BF16 时实际使用 FP32。
+- GPU 不支持 BF16 时会明确报错。
+- 更换推理精度后应重新确认描述子距离和认证阈值。
+
+### 14. channels-last 模型和输入
+
+**做了什么**
+
+CUDA 推理时同时转换模型和输入 batch 的内存格式为 channels-last。
+
+**原理**
+
+只转换模型或只转换输入可能导致运行时反复调整内存布局。两者保持一致，才能减少格式转换，并让优化卷积核直接使用目标布局。
+
+**目的**
+
+- 提高 CUDA 卷积访存效率。
+- 配合 FP16/Tensor Core。
+- 避免额外内存格式复制。
+
+如果推理回退到 CPU，代码会恢复普通 contiguous 格式。
+
+### 15. 锁页内存及异步 CPU→GPU 传输
+
+**做了什么**
+
+完整 patch 数组先转成 CPU Tensor；CUDA 模式下调用 `pin_memory()`，分 batch 使用 `non_blocking=True` 搬运到 GPU。
+
+**原理**
+
+同步传输时，CPU 线程需要等待数据到达 GPU。锁页内存配合异步传输，可以让上一批 GPU 计算和下一批数据传输部分重叠。
+
+**目的**
+
+- 减少 CPU/GPU 互相等待。
+- 减少大量 patch 传输造成的同步开销。
+- 提高批量描述子生成吞吐。
+
+### 16. 多个推理 batch 在 GPU 合并后只回传一次
+
+**做了什么**
+
+一张图的 patch 被拆成多个 batch 推理，每个 batch 的描述子先保留在 GPU；全部完成后在 GPU 上 `torch.cat`，最后统一转换为 FP32 并传回 CPU。
+
+**原理**
+
+GPU→CPU 每次同步都有固定开销。多个小结果分别回传会产生多次同步；合并后回传只同步一次。
+
+**目的**
+
+- 减少 GPU/CPU 同步次数。
+- 减少小数据传输的固定开销。
+- 提高多关键点场景的推理效率。
+
+**注意事项**
+
+所有 batch 输出会短暂保留在 GPU，但每个描述子只有 128 维，通常占用很小。
+
+### 17. 在线基准记录实际设备和推理精度
+
+**做了什么**
+
+在线基准的 `startup` 结果记录：
+
+- 实际 device。
+- 实际 inference_precision。
+- channels_last 是否启用。
+- 模型初始化时间。
+- 模型预热时间。
+- 模板预加载时间。
+
+结果写入 `online_unlock_summary.json`。
+
+**原理**
+
+配置写着 CUDA FP16，不代表运行时一定成功使用 CUDA FP16。CUDA 不可用、显存不足或推理失败时，推理器可能回退为 CPU FP32。记录运行结束时的实际状态，才能正确解释性能数据。
+
+**目的**
+
+- 防止把 CPU 回退结果误认为 GPU 性能。
+- 确认 FP16 和 channels-last 是否实际生效。
+- 区分启动耗时和正式推理耗时。
+- 让不同优化方案的基准结果可追溯、可比较。
+
+## 三、整体流水线
+
+训练流水线：
+
+`磁盘 PNG → 4 个常驻 worker 并行读取/解码 → 预取 → 锁页内存 → 异步传输到 GPU → channels-last → FP16 autocast CNN 前向 → FP32 距离与 loss → GradScaler 保护梯度 → SGD 更新参数`
+
+推理流水线：
+
+`CPU patch 数组 → 锁页内存 → 分 batch 异步传入 GPU → FP16/BF16/FP32 autocast → 描述子保留在 GPU → GPU 合并 → 一次性回传 CPU → 在线基准记录实际运行状态`
+
+这些优化的共同目标不是单独让某一个算子更快，而是减少整条流程中的等待：CPU 尽量不等磁盘，GPU 尽量不等 CPU，数据传输尽量和计算重叠，大计算使用低精度加速，对排序敏感的距离和 loss 保持较高精度。

@@ -2,19 +2,19 @@
 
 作用：
     1. 读取 YAML 配置与命令行覆盖参数。
-    2. 构造训练/验证 DataLoader。
-    3. 构造 HardNet 网络、top-k hardest-in-batch triplet loss 和 SGD 优化器。
-    4. 按论文设置执行线性学习率衰减训练。
-    5. 每个 epoch 输出训练日志、验证指标、checkpoint 和 metrics.csv。
+    2. 构造训练随机 sampler 与确定性固定验证协议。
+    3. 构造描述子网络、top-k hardest-in-batch triplet loss 和可配置优化器。
+    4. 执行带预热的余弦学习率调度训练。
+    5. 每个 epoch 输出固定验证指标、checkpoint 和 metrics.csv。
 
 典型用法：
     python -m hardnet_train.train --config hardnet_train/config.yaml --device cuda
 
 输出：
     outputs/hardnet_train/
-        best.pt              验证 FPR95 最好的模型
+        best.pt              固定协议 `val_fpr_at_tpr95` 最好的模型
         last.pt              最后一个 epoch 的模型
-        metrics.csv          每个 epoch 的训练/验证指标
+        metrics.csv          每个 epoch 的训练/固定验证指标
         resolved_config.json 实际使用的配置快照
 """
 
@@ -42,13 +42,19 @@ from torch.utils.data import DataLoader
 
 from hardnet_train.data import FingerImagePairBatchSampler, FingerprintPairDataset
 from hardnet_train.loss import HardNetLoss, normalize_hard_negative_strategy
-from hardnet_train.metrics import RunningMean, fpr_at_recall
+from hardnet_train.metrics import RunningMean
 from hardnet_train.model import (
     build_descriptor_model,
     checkpoint_model_architecture,
     count_parameters,
     model_architecture,
     normalize_model_architecture,
+)
+from hardnet_train.optim import build_optimizer, normalize_optimizer_name, optimizer_name
+from hardnet_train.validation import (
+    build_fixed_validation_protocol,
+    evaluate_fixed_protocol,
+    make_validation_patch_loader,
 )
 
 
@@ -84,10 +90,9 @@ def set_seed(seed: int) -> None:
 
 
 def make_loader(config: dict[str, Any], split: str, batch_size: int, steps: int, seed: int) -> DataLoader:
-    """构造某个 split 的 DataLoader。
+    """构造使用随机 hardest-in-batch sampler 的训练 DataLoader。
 
-    split 可取 train/val/test。这里训练和验证都使用同一个 batch sampler，
-    目的是让验证指标和训练时 hardest-in-batch 的负样本定义一致。
+    固定验证协议不调用此函数，避免验证距离对随 epoch 改变。
     """
     data_cfg = config["data"]
     train_cfg = config["training"]
@@ -227,7 +232,7 @@ def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 
 
 def train_one_epoch(
-    model: HardNet,
+    model: torch.nn.Module,
     criterion: HardNetLoss,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -317,59 +322,6 @@ def train_one_epoch(
     return {"loss": loss_meter.value, "pos_dist": pos_meter.value, "neg_dist": neg_meter.value, "lr": lr}, global_step
 
 
-@torch.inference_mode()
-def evaluate(
-    model: HardNet,
-    criterion: HardNetLoss,
-    loader: DataLoader,
-    device: torch.device,
-    amp_enabled: bool,
-    amp_dtype: torch.dtype | None,
-    channels_last: bool,
-) -> dict[str, float]:
-    """在验证集上评估 loss、正负距离和 FPR95。"""
-    model.eval()
-    loss_meter = RunningMean()
-    positives: list[torch.Tensor] = []
-    negatives: list[torch.Tensor] = []
-
-    for batch in loader:
-        anchor = batch["anchor"].to(device, non_blocking=True)
-        positive = batch["positive"].to(device, non_blocking=True)
-        point_group = batch["point_group"].to(device, non_blocking=True)
-        finger_group = batch["finger_group"].to(device, non_blocking=True)
-        if channels_last:
-            anchor = anchor.contiguous(memory_format=torch.channels_last)
-            positive = positive.contiguous(memory_format=torch.channels_last)
-        with torch.autocast(
-            device_type=device.type,
-            dtype=amp_dtype,
-            enabled=amp_enabled,
-        ):
-            anchor_desc = model(anchor)
-            positive_desc = model(positive)
-        loss, stats = criterion(
-            anchor_desc.float(),
-            positive_desc.float(),
-            point_group=point_group,
-            finger_group=finger_group,
-        )
-        batch_size = anchor.size(0)
-        loss_meter.update(float(loss.item()), batch_size)
-        valid = stats["valid_triplets"].cpu()
-        positives.append(stats["pos_dist"].cpu())
-        negatives.append(stats["neg_dist"].cpu()[valid])
-
-    pos = torch.cat(positives) if positives else torch.empty(0)
-    neg = torch.cat(negatives) if negatives else torch.empty(0)
-    return {
-        "loss": loss_meter.value,
-        "pos_dist": float(pos.mean().item()) if pos.numel() else 0.0,
-        "neg_dist": float(neg.mean().item()) if neg.numel() else 0.0,
-        "fpr95": fpr_at_recall(pos, neg, recall=0.95),
-    }
-
-
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -388,6 +340,7 @@ def save_checkpoint(
         "model_architecture": model_architecture(model),
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "optimizer_name": optimizer_name(optimizer),
         "metrics": metrics,
         "config": {key: value for key, value in config.items() if key != "_config_path"},
     }
@@ -425,8 +378,23 @@ def load_checkpoint(
             f"checkpoint={saved_architecture}, model={current_architecture}."
         )
     model.load_state_dict(checkpoint["model"])
+    saved_optimizer_name = checkpoint.get("optimizer_name")
+    if saved_optimizer_name is not None:
+        normalized_saved_optimizer = normalize_optimizer_name(str(saved_optimizer_name))
+        if normalized_saved_optimizer != optimizer_name(optimizer):
+            raise ValueError(
+                "Checkpoint optimizer mismatch: "
+                f"checkpoint={normalized_saved_optimizer}, configured={optimizer_name(optimizer)}. "
+                "Changing optimizer requires a new output directory and training from scratch."
+            )
     if "optimizer" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        except ValueError as exc:
+            raise ValueError(
+                "Checkpoint optimizer state is incompatible with the configured decay/no-decay groups. "
+                "Start a new experiment instead of restoring the old optimizer state."
+            ) from exc
         move_optimizer_state_to_device(optimizer, device)
     if scaler is not None and scaler.is_enabled() and "amp_scaler" in checkpoint:
         scaler.load_state_dict(checkpoint["amp_scaler"])
@@ -435,8 +403,8 @@ def load_checkpoint(
     return finished_epoch + 1, global_step
 
 
-def best_fpr95_from_metrics(metrics_path: Path) -> tuple[float, float, int]:
-    """从已有 metrics.csv 中恢复 best_fpr95、早停 best 和 no_improve 计数。"""
+def best_fpr_at_tpr95_from_metrics(metrics_path: Path) -> tuple[float, float, int]:
+    """从当前指标 CSV 恢复主选模指标和早停状态。"""
     if not metrics_path.exists():
         return float("inf"), float("inf"), 0
     rows: list[dict[str, str]] = []
@@ -445,20 +413,34 @@ def best_fpr95_from_metrics(metrics_path: Path) -> tuple[float, float, int]:
         rows = [row for row in reader]
     if not rows:
         return float("inf"), float("inf"), 0
-    fprs = [float(row["val_fpr95"]) for row in rows if row.get("val_fpr95")]
-    best_fpr95 = min(fprs) if fprs else float("inf")
+
+    fprs = [
+        float(row["val_fpr_at_tpr95"])
+        for row in rows
+        if row.get("val_fpr_at_tpr95")
+    ]
+    best_fpr = min(fprs) if fprs else float("inf")
     last = rows[-1]
-    early_best = float(last.get("early_stop_best_fpr95") or best_fpr95)
+    early_best = float(last.get("early_stop_best_fpr_at_tpr95") or best_fpr)
     no_improve = int(float(last.get("no_improve_epochs") or 0))
-    return best_fpr95, early_best, no_improve
+    return best_fpr, early_best, no_improve
 
 
 def append_metrics(path: Path, row: dict[str, Any]) -> None:
-    """把一个 epoch 的指标追加写入 CSV。"""
+    """把一个 epoch 的指标追加写入 CSV，并拒绝混写不同验证协议的 schema。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
+    fieldnames = list(row.keys())
+    if not write_header:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            existing_fields = csv.DictReader(handle).fieldnames
+        if existing_fields != fieldnames:
+            raise ValueError(
+                "metrics.csv schema does not match the fixed validation protocol. "
+                "Use a new output directory instead of appending to an old experiment."
+            )
     with path.open("a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
         writer.writerow(row)
@@ -467,7 +449,7 @@ def append_metrics(path: Path, row: dict[str, Any]) -> None:
 def plot_training_curves(metrics_path: Path, output_path: Path) -> None:
     """根据 metrics.csv 输出训练曲线图。
 
-    图中包含 loss、正负样本距离、val_fpr95 和学习率曲线。
+    图中包含 loss、正负样本距离、`val_fpr_at_tpr95` 和学习率曲线。
     如果 matplotlib 不可用，则跳过绘图，不影响训练结果。
     """
     if not metrics_path.exists():
@@ -487,8 +469,14 @@ def plot_training_curves(metrics_path: Path, output_path: Path) -> None:
     if not rows:
         return
 
-    def values(name: str) -> list[float]:
-        return [float(row[name]) for row in rows if row.get(name) not in (None, "")]
+    def values(name: str, *fallback_names: str) -> list[float]:
+        names = (name, *fallback_names)
+        result: list[float] = []
+        for row in rows:
+            value = next((row.get(candidate) for candidate in names if row.get(candidate) not in (None, "")), None)
+            if value is not None:
+                result.append(float(value))
+        return result
 
     epochs = values("epoch")
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=140)
@@ -502,15 +490,20 @@ def plot_training_curves(metrics_path: Path, output_path: Path) -> None:
 
     axes[0, 1].plot(epochs, values("train_pos_dist"), label="train_pos")
     axes[0, 1].plot(epochs, values("train_neg_dist"), label="train_neg")
-    axes[0, 1].plot(epochs, values("val_pos_dist"), label="val_pos")
-    axes[0, 1].plot(epochs, values("val_neg_dist"), label="val_neg")
+    axes[0, 1].plot(epochs, values("val_pos_mean", "val_pos_dist"), label="val_pos")
+    axes[0, 1].plot(epochs, values("val_neg_mean", "val_neg_dist"), label="val_neg")
     axes[0, 1].set_title("Descriptor Distances")
     axes[0, 1].set_xlabel("Epoch")
     axes[0, 1].grid(True, alpha=0.3)
     axes[0, 1].legend()
 
-    axes[1, 0].plot(epochs, values("val_fpr95"), label="val_fpr95", color="tab:red")
-    axes[1, 0].set_title("FPR@95% Recall")
+    axes[1, 0].plot(
+        epochs,
+        values("val_fpr_at_tpr95"),
+        label="val_fpr_at_tpr95",
+        color="tab:red",
+    )
+    axes[1, 0].set_title("FPR@TPR=95%")
     axes[1, 0].set_xlabel("Epoch")
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].legend()
@@ -537,10 +530,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="hardnet_train/config.yaml")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
-    parser.add_argument("--val-steps", type=int, default=None)
+    parser.add_argument(
+        "--val-steps",
+        type=int,
+        default=None,
+        help="Deprecated: fixed validation size is configured under validation.",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--fingers-per-batch", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--optimizer", choices=["sgd", "adamw"], default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--margin", type=float, default=None)
     parser.add_argument("--hard-negative-strategy", choices=["same_finger_allowed", "different_finger"], default=None)
@@ -567,9 +566,10 @@ def main() -> None:
     """训练主流程。"""
     args = parse_args()
     config = load_config(args.config)
-    train_cfg = config["training"]
-    model_cfg = config.get("model", {})
-    optim_cfg = config.get("optimizer", {})
+    train_cfg = config.setdefault("training", {})
+    model_cfg = config.setdefault("model", {})
+    optim_cfg = config.setdefault("optimizer", {})
+    validation_cfg = config.setdefault("validation", {})
     seed = int(config.get("seed", 42))
     set_seed(seed)
 
@@ -586,14 +586,22 @@ def main() -> None:
         enabled=amp_enabled and amp_dtype == torch.float16,
     )
 
-    epochs = int(args.epochs or train_cfg.get("epochs", 10))
-    steps_per_epoch = int(args.steps_per_epoch or train_cfg.get("steps_per_epoch", 1000))
-    val_steps = int(args.val_steps or train_cfg.get("val_steps", 100))
-    batch_size = int(args.batch_size or train_cfg.get("batch_size", 128))
+    if args.epochs is not None:
+        train_cfg["epochs"] = int(args.epochs)
+    if args.steps_per_epoch is not None:
+        train_cfg["steps_per_epoch"] = int(args.steps_per_epoch)
+    if args.val_steps is not None:
+        raise ValueError("--val-steps is no longer used; fixed validation size is configured under validation.")
+    if args.batch_size is not None:
+        train_cfg["batch_size"] = int(args.batch_size)
+    if args.device is not None:
+        train_cfg["device"] = str(args.device)
     if args.fingers_per_batch is not None:
         train_cfg["fingers_per_batch"] = int(args.fingers_per_batch)
     if args.lr is not None:
         optim_cfg["lr"] = float(args.lr)
+    if args.optimizer is not None:
+        optim_cfg["name"] = args.optimizer
     if args.dropout is not None:
         model_cfg["dropout"] = float(args.dropout)
     if args.margin is not None:
@@ -612,6 +620,33 @@ def main() -> None:
         train_cfg["warmup_epochs"] = float(args.warmup_epochs)
     if args.eta_min is not None:
         train_cfg["eta_min"] = float(args.eta_min)
+    if args.output_dir is not None:
+        config["output_dir"] = args.output_dir
+
+    epochs = int(train_cfg.get("epochs", 10))
+    steps_per_epoch = int(train_cfg.get("steps_per_epoch", 1000))
+    batch_size = int(train_cfg.get("batch_size", 128))
+    train_cfg["epochs"] = epochs
+    train_cfg["steps_per_epoch"] = steps_per_epoch
+    train_cfg["batch_size"] = batch_size
+    optim_cfg["name"] = normalize_optimizer_name(optim_cfg.get("name"))
+    optim_cfg["lr"] = float(optim_cfg.get("lr", 0.1))
+    optim_cfg["weight_decay"] = float(optim_cfg.get("weight_decay", 1e-4))
+    validation_protocol_name = str(validation_cfg.get("protocol", "fixed_pairs_v1")).strip().lower()
+    if validation_protocol_name != "fixed_pairs_v1":
+        raise ValueError(
+            f"Unsupported validation.protocol: {validation_protocol_name!r}. Expected 'fixed_pairs_v1'."
+        )
+    validation_cfg["protocol"] = validation_protocol_name
+    validation_cfg["seed"] = int(validation_cfg.get("seed", seed + 10_000))
+    validation_cfg["positive_count"] = int(validation_cfg.get("positive_count", 16_384))
+    validation_cfg["same_finger_negatives_per_anchor"] = int(
+        validation_cfg.get("same_finger_negatives_per_anchor", 32)
+    )
+    validation_cfg["cross_finger_negatives_per_anchor"] = int(
+        validation_cfg.get("cross_finger_negatives_per_anchor", 32)
+    )
+    validation_cfg["batch_size"] = int(validation_cfg.get("batch_size", batch_size))
 
     model_cfg["architecture"] = normalize_model_architecture(
         model_cfg.get("architecture")
@@ -624,18 +659,41 @@ def main() -> None:
             f"training.hard_negative_top_k must be >= 1, got {train_cfg['hard_negative_top_k']}."
         )
 
-    output_dir = resolve_path(config, args.output_dir or config.get("output_dir", "../outputs/hardnet_train"))
+    output_dir = resolve_path(config, config.get("output_dir", "../outputs/hardnet_train"))
+    resume_arg = "auto" if args.resume_auto else args.resume
+    metrics_path = output_dir / "metrics.csv"
+    if metrics_path.exists() and not resume_arg:
+        raise FileExistsError(
+            f"Output directory already contains metrics: {metrics_path}. "
+            "Use a new output directory for a fresh fixed-protocol experiment, or explicitly resume it."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
-    # 保存实际配置，避免训练结束后忘记当时使用的 batch_size/lr/dropout 等参数。
-    (output_dir / "resolved_config.json").write_text(
-        json.dumps({key: value for key, value in config.items() if key != "_config_path"}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
 
-    # 注意：构造 loader 会扫描 CSV，但不会把 patch 图像读入内存。
+    # 训练 sampler 保持随机；验证数据流独立扫描 val CSV 并固化索引。
     train_loader = make_loader(config, "train", batch_size=batch_size, steps=steps_per_epoch, seed=seed)
-    val_loader = make_loader(config, "val", batch_size=batch_size, steps=val_steps, seed=seed + 10_000)
-
+    data_cfg = config["data"]
+    validation_dataset = FingerprintPairDataset(
+        csv_path=resolve_path(config, data_cfg["val_csv"]),
+        max_rows=data_cfg.get("max_val_rows"),
+        max_rows_per_finger=data_cfg.get("max_val_rows_per_finger"),
+        normalize=bool(data_cfg.get("normalize", True)),
+    )
+    validation_protocol = build_fixed_validation_protocol(
+        records=validation_dataset.records,
+        positive_count=int(validation_cfg["positive_count"]),
+        same_finger_negatives_per_anchor=int(validation_cfg["same_finger_negatives_per_anchor"]),
+        cross_finger_negatives_per_anchor=int(validation_cfg["cross_finger_negatives_per_anchor"]),
+        seed=int(validation_cfg["seed"]),
+    )
+    validation_loader, validation_patch_refs = make_validation_patch_loader(
+        dataset=validation_dataset,
+        protocol=validation_protocol,
+        batch_size=int(validation_cfg["batch_size"]),
+        num_workers=int(data_cfg.get("num_workers", 0)),
+        pin_memory=bool(data_cfg.get("pin_memory", False)),
+        persistent_workers=bool(data_cfg.get("persistent_workers", True)),
+        prefetch_factor=int(data_cfg.get("prefetch_factor", 2)),
+    )
     model = build_descriptor_model(model_cfg).to(device)
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -644,13 +702,7 @@ def main() -> None:
         hard_negative_strategy=str(train_cfg.get("hard_negative_strategy", "same_finger_allowed")),
         hard_negative_top_k=int(train_cfg.get("hard_negative_top_k", 3)),
     )
-    # 按论文默认：SGD + momentum=0.9 + weight_decay=1e-4。
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=float(optim_cfg.get("lr", 0.1)),
-        momentum=float(optim_cfg.get("momentum", 0.9)),
-        weight_decay=float(optim_cfg.get("weight_decay", 0.0001)),
-    )
+    optimizer = build_optimizer(model, optim_cfg)
 
     scheduler = str(train_cfg.get("scheduler", "warmup_cosine"))
     warmup_epochs = float(train_cfg.get("warmup_epochs", 2.0))
@@ -659,25 +711,34 @@ def main() -> None:
     total_steps = max(1, epochs * steps_per_epoch)
     early_stop_patience = int(train_cfg.get("early_stop_patience", 3))
     early_stop_min_relative = float(train_cfg.get("early_stop_min_relative_improvement", 0.01))
+    optimizer_detail = (
+        f"momentum={optim_cfg.get('momentum', 0.9)} nesterov={optim_cfg.get('nesterov', True)}"
+        if optimizer_name(optimizer) == "sgd"
+        else f"betas={optim_cfg.get('betas', [0.9, 0.999])} eps={optim_cfg.get('eps', 1e-8)}"
+    )
     print(
         f"device={device} architecture={model_architecture(model)} "
         f"params={count_parameters(model)} batch={batch_size} "
         f"fingers_per_batch={train_cfg.get('fingers_per_batch', 8)} "
-        f"dropout={model_cfg.get('dropout', 0.1)} lr={optim_cfg.get('lr', 0.1)} "
+        f"dropout={model_cfg.get('dropout', 0.1)} optimizer={optimizer_name(optimizer)} "
+        f"lr={optim_cfg.get('lr', 0.1)} {optimizer_detail} "
         f"margin={train_cfg.get('margin', 1.0)} steps_per_epoch={steps_per_epoch} epochs={epochs} "
         f"hard_negative_strategy={train_cfg.get('hard_negative_strategy', 'same_finger_allowed')} "
         f"hard_negative_top_k={train_cfg.get('hard_negative_top_k', 3)} "
         f"scheduler={scheduler} warmup_epochs={warmup_epochs} eta_min={eta_min} "
         f"early_stop_patience={early_stop_patience} early_stop_min_delta={early_stop_min_relative} "
         f"mixed_precision={train_cfg.get('mixed_precision', 'fp16') if amp_enabled else 'fp32'} "
-        f"channels_last={channels_last}",
+        f"channels_last={channels_last} "
+        f"validation_positives={validation_protocol.positive_count} "
+        f"validation_unique_patches={validation_patch_refs.size}",
         flush=True,
     )
 
-    best_fpr95, early_stop_best_fpr95, no_improve_epochs = best_fpr95_from_metrics(output_dir / "metrics.csv")
+    best_fpr_at_tpr95, early_stop_best_fpr_at_tpr95, no_improve_epochs = (
+        best_fpr_at_tpr95_from_metrics(metrics_path) if resume_arg else (float("inf"), float("inf"), 0)
+    )
     start_epoch = 1
     global_step = 0
-    resume_arg = "auto" if args.resume_auto else args.resume
     if resume_arg:
         resume_path = output_dir / "last.pt" if resume_arg == "auto" else Path(resume_arg).expanduser()
         if not resume_path.is_absolute():
@@ -696,6 +757,12 @@ def main() -> None:
             print(f"resume auto skipped: checkpoint not found at {resume_path}", flush=True)
         else:
             raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+
+    # 只有初始化/恢复检查全部通过后才写实际配置，避免失败命令污染既有目录。
+    (output_dir / "resolved_config.json").write_text(
+        json.dumps({key: value for key, value in config.items() if key != "_config_path"}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     if start_epoch > epochs:
         print(f"nothing to train: start_epoch={start_epoch} > epochs={epochs}", flush=True)
@@ -720,11 +787,14 @@ def main() -> None:
             amp_dtype=amp_dtype,
             channels_last=channels_last,
         )
-        val_metrics = evaluate(
-            model,
-            criterion,
-            val_loader,
-            device,
+        val_metrics = evaluate_fixed_protocol(
+            model=model,
+            loader=validation_loader,
+            unique_refs=validation_patch_refs,
+            protocol=validation_protocol,
+            device=device,
+            margin=float(train_cfg.get("margin", 1.0)),
+            hard_negative_top_k=int(train_cfg.get("hard_negative_top_k", 3)),
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             channels_last=channels_last,
@@ -739,9 +809,10 @@ def main() -> None:
             val_metrics,
             scaler=scaler,
         )
-        # FPR95 越低越好，因此用它选择 best checkpoint。
-        if val_metrics["fpr95"] <= best_fpr95:
-            best_fpr95 = val_metrics["fpr95"]
+        # 固定协议的 FPR@TPR=95% 越低越好，以它选择 best checkpoint。
+        current_fpr_at_tpr95 = val_metrics["fpr_at_tpr95"]
+        if current_fpr_at_tpr95 <= best_fpr_at_tpr95:
+            best_fpr_at_tpr95 = current_fpr_at_tpr95
             save_checkpoint(
                 output_dir / "best.pt",
                 model,
@@ -753,18 +824,15 @@ def main() -> None:
                 scaler=scaler,
             )
 
-        # 早停规则：
-        #   只有当 val_fpr95 相比早停历史 best 至少相对下降 min_delta 时，
-        #   才认为“显著改善”并重置计数；否则累计 no_improve_epochs。
-        #   例如 best=0.9868、min_delta=0.01，则新值必须 < 0.976932。
-        if early_stop_best_fpr95 == float("inf"):
-            early_stop_best_fpr95 = val_metrics["fpr95"]
+        # 只有相对下降达到 min_delta，才重置早停计数。
+        if early_stop_best_fpr_at_tpr95 == float("inf"):
+            early_stop_best_fpr_at_tpr95 = current_fpr_at_tpr95
             no_improve_epochs = 0
             early_stop_message = "early_stop=init"
         else:
-            improvement_threshold = early_stop_best_fpr95 * (1.0 - early_stop_min_relative)
-            if val_metrics["fpr95"] < improvement_threshold:
-                early_stop_best_fpr95 = val_metrics["fpr95"]
+            improvement_threshold = early_stop_best_fpr_at_tpr95 * (1.0 - early_stop_min_relative)
+            if current_fpr_at_tpr95 < improvement_threshold:
+                early_stop_best_fpr_at_tpr95 = current_fpr_at_tpr95
                 no_improve_epochs = 0
                 early_stop_message = "early_stop=improved"
             else:
@@ -776,25 +844,25 @@ def main() -> None:
             "train_loss": train_metrics["loss"],
             "train_pos_dist": train_metrics["pos_dist"],
             "train_neg_dist": train_metrics["neg_dist"],
-            "val_loss": val_metrics["loss"],
-            "val_pos_dist": val_metrics["pos_dist"],
-            "val_neg_dist": val_metrics["neg_dist"],
-            "val_fpr95": val_metrics["fpr95"],
+            **{f"val_{name}": value for name, value in val_metrics.items()},
             "lr": train_metrics["lr"],
-            "early_stop_best_fpr95": early_stop_best_fpr95,
+            "early_stop_best_fpr_at_tpr95": early_stop_best_fpr_at_tpr95,
             "no_improve_epochs": no_improve_epochs,
         }
         append_metrics(output_dir / "metrics.csv", metric_row)
 
         print(
             f"epoch={epoch} done train_loss={train_metrics['loss']:.4f} "
-            f"val_loss={val_metrics['loss']:.4f} val_fpr95={val_metrics['fpr95']:.4f} "
-            f"best_for_stop={early_stop_best_fpr95:.4f} {early_stop_message}",
+            f"val_loss={val_metrics['loss']:.4f} "
+            f"val_fpr_at_tpr95={current_fpr_at_tpr95:.6f} "
+            f"val_tpr_at_fpr_1e_4={val_metrics['tpr_at_fpr_1e_4']:.6f} "
+            f"val_recall_at_1={val_metrics['recall_at_1']:.4f} "
+            f"best_for_stop={early_stop_best_fpr_at_tpr95:.6f} {early_stop_message}",
             flush=True,
         )
         if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
             print(
-                f"early stopping: val_fpr95 has not improved by "
+                f"early stopping: val_fpr_at_tpr95 has not improved by "
                 f"{early_stop_min_relative * 100:.2f}% for {early_stop_patience} epochs.",
                 flush=True,
             )

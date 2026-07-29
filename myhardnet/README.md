@@ -44,11 +44,7 @@ python -m hardnet_train.train `
 
 训练完成后会在输出目录生成 `training_curves.png`。
 
-当前训练默认使用 `margin=0.5`，并监控 `val_fpr95` 做早停：
-
-```text
-连续 3 个 epoch 没有相对下降 1%，停止训练。
-```
+当前训练默认使用 `margin=1.0`，best checkpoint 监控固定协议的 `val_fpr_at_tpr95`。正式配置当前关闭 early stopping；启用时按相对改善比例累计耐心轮数。
 
 快速自检：
 
@@ -58,7 +54,9 @@ python -m hardnet_train.train --config hardnet_train/smoke_config.yaml
 
 ## 关键设计
 
-- 网络结构尽量复现 HardNet/L2Net：输入 `1x32x32`，输出 128 维单位描述子。
+- 同时保留原 HardNet 和轻量 MobileHardNet；输入 `1x32x32`，输出 128 维单位描述子。
 - loss 使用 HardNet 论文的 hardest-in-batch triplet margin。
 - batch 采样结合指纹数据特点：每个 batch 包含多个手指，每个手指只使用一个两图组合。
 - 使用 union-find 合并跨图正样本连通的关键点，避免同一物理点被误当负样本。
+- 验证使用由 seed 确定的固定正样本、同指纹负样本和跨指纹负样本协议。
+- 默认优化器为 SGD + Nesterov，并对 BatchNorm 参数和 bias 禁用 weight decay。

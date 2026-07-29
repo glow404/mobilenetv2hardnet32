@@ -4,7 +4,7 @@
 # 便于独立评估移动端结构带来的精度与速度变化。
 
 seed: 42
-output_dir: ../outputs/hardnet_train_mobile_v2
+output_dir: ../outputs/hardnet_train_mobile_fixed_v1
 
 data:
   train_csv: ../hardnet_dataset/train_pairs.csv
@@ -36,10 +36,9 @@ training:
   channels_last: true
   cudnn_benchmark: true
   allow_tf32: true
-  # 指纹数据比 Brown patch 更难，最大训练 100 epoch，并支持从 last.pt 续训。
+  # 允许长程训练并保留 last.pt 续训；当前固定协议可用于稳定观察过拟合拐点。
   epochs: 500
   steps_per_epoch: 1000
-  val_steps: 200
   # 单手指点数不足会从已选样本重复采样补齐；整个 batch 仍不足则丢弃。伪负样本由 point_group 屏蔽。
   batch_size: 256
   # fingers_per_batch=1 时，每 batch 只选 1 根手指，全部 256 对来自同一手指的一个两图组合。
@@ -60,8 +59,25 @@ training:
   eta_min: 0.0001
   log_interval: 50
 
+validation:
+  # 与训练 sampler 完全解耦；seed 决定索引，跨 epoch/运行保持相同。
+  protocol: fixed_pairs_v1
+  seed: 10042
+  positive_count: 16384
+  same_finger_negatives_per_anchor: 32
+  cross_finger_negatives_per_anchor: 32
+  # 这里只控制唯一 patch 的前向批量，不改变验证距离对。
+  batch_size: 256
+
 optimizer:
-  # MobileNetV2 风格网络从常规 SGD 学习率开始，后续根据短程实验再搜索。
+  # 默认使用 SGD + Nesterov。切换为 adamw 时也要显式设置对应学习率，
+  # 不会静默改写 lr，确保 resolved_config 能准确记录实验变量。
+  name: sgd
   lr: 0.1
   momentum: 0.9
+  nesterov: true
+  # 仅 Conv/Linear 权重衰减；BatchNorm 参数和所有 bias 固定为 no-decay。
   weight_decay: 0.0001
+  # 仅 AdamW 使用。
+  betas: [0.9, 0.999]
+  eps: 1.0e-8

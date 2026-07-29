@@ -5,31 +5,33 @@
 
 ## 文件说明
 
-- `model.py`：HardNet/L2Net 网络结构。输入 `[B, 1, 32, 32]`，输出 `[B, 128]`。
-- `loss.py`：HardNet 论文中的 hardest-in-batch triplet margin loss。
-- `data.py`：CSV 数据集、PIL patch 读取、union-find 物理点分组、按手指/两图组合采样的 batch sampler。
-- `metrics.py`：运行均值和 `FPR@95TPR` 指标。
-- `train.py`：训练主入口，负责配置解析、训练、验证、checkpoint、metrics 输出。
+- `model.py`：原 HardNet 与 MobileHardNet。输入 `[B, 1, 32, 32]`，输出 `[B, 128]`。
+- `loss.py`：top-k hardest-in-batch triplet margin loss。
+- `data.py`：CSV 数据集、PIL patch 读取、union-find 物理点分组和训练 batch sampler。
+- `validation.py`：固定正样本、同指纹负样本和跨指纹负样本协议。
+- `metrics.py`：运行均值、ROC/ranking、距离分位数和 active-triplet 指标。
+- `optim.py`：SGD/AdamW 工厂与 decay/no-decay 参数分组。
+- `train.py`：训练主入口，负责配置解析、训练、固定验证、checkpoint 和 metrics 输出。
 - `config.yaml`：正式训练默认配置。
 - `smoke_config.yaml`：快速自检配置，只跑极少 step。
 
 ## 输出文件
 
-训练结果默认写入 `../outputs/hardnet_train/`：
+训练结果默认写入 `../outputs/hardnet_train_mobile_fixed_v1/`：
 
-- `best.pt`：验证集 `val_fpr95` 最低的 checkpoint。
+- `best.pt`：固定协议 `val_fpr_at_tpr95` 最低的 checkpoint。
 - `last.pt`：最后一个 epoch 的 checkpoint。
-- `metrics.csv`：每个 epoch 的训练/验证指标。
-- `resolved_config.json`：本次训练实际使用的配置快照。
+- `metrics.csv`：每个 epoch 的训练指标、总体验证指标及 `same_finger` / `cross_finger` 分项。
+- `resolved_config.json`：包含命令行覆盖后的实际配置快照。
 
 ## 早停规则
 
-训练默认监控 `val_fpr95`，即验证集上的 `FPR@95%` 召回率。该指标越低越好。
+训练监控固定协议上的 `val_fpr_at_tpr95`：阈值达到 95% 正样本 TPR 时，负样本被误接受的比例。该指标越低越好。
 
-默认终止条件：
+当前正式配置将 `early_stop_patience` 设为 `0`，即关闭早停。启用后，规则为：
 
 ```text
-连续 3 个 epoch 没有让 val_fpr95 相对历史 best 下降至少 1%，则停止训练。
+连续 patience 个 epoch 没有让 val_fpr_at_tpr95 相对历史 best 达到配置的下降比例，则停止训练。
 ```
 
 例如历史 best 为 `0.9868`，那么下一次必须低于：
@@ -152,7 +154,9 @@ python -m hardnet_train.train `
 - optimizer 状态；
 - epoch；
 - global step；
-- 既有 `metrics.csv` 中的 best FPR95 和早停计数。
+- 既有 `metrics.csv` 中的 best `val_fpr_at_tpr95` 和早停计数。
+
+只有模型架构、优化器名称和参数分组兼容时才允许恢复训练。旧模型 checkpoint 仍可用于推理；旧指标 CSV 不兼容当前 schema，不能继续写入。
 
 ## 学习率调度
 
@@ -196,7 +200,7 @@ training_curves.png
 
 - train/val loss；
 - train/val 正负样本距离；
-- val_fpr95；
+- `val_fpr_at_tpr95`；
 - 学习率曲线。
 
 如不需要绘图，可加：

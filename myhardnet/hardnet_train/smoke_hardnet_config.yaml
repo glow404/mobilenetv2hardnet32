@@ -1,6 +1,6 @@
 # 原 HardNet CPU 对照配置；与 MobileHardNet smoke 使用相同数据和训练预算。
 seed: 42
-output_dir: ../outputs/hardnet_train_original_smoke
+output_dir: ../outputs/hardnet_train_original_fixed_v1_smoke
 
 data:
   train_csv: ../hardnet_dataset/train_pairs.csv
@@ -10,9 +10,9 @@ data:
   num_workers: 0
   pin_memory: false
   max_train_rows: 4096
-  max_val_rows: 1024
+  max_val_rows:
   max_train_rows_per_finger:
-  max_val_rows_per_finger:
+  max_val_rows_per_finger: 64
 
 model:
   architecture: hardnet
@@ -28,7 +28,6 @@ training:
   allow_tf32: false
   epochs: 3
   steps_per_epoch: 30
-  val_steps: 10
   batch_size: 64
   fingers_per_batch: 1
   hard_negative_strategy: same_finger_allowed
@@ -41,7 +40,17 @@ training:
   eta_min: 0.0001
   log_interval: 10
 
+validation:
+  protocol: fixed_pairs_v1
+  seed: 10042
+  positive_count: 96
+  same_finger_negatives_per_anchor: 8
+  cross_finger_negatives_per_anchor: 8
+  batch_size: 64
+
 optimizer:
+  name: sgd
   lr: 0.05
   momentum: 0.9
+  nesterov: true
   weight_decay: 0.0001

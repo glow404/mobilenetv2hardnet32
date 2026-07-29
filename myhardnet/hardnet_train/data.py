@@ -177,15 +177,28 @@ class FingerprintPairDataset(Dataset):
         std = max(float(patch.std()), 1e-6)
         return (patch - mean) / std
 
+    def load_patch(self, index: int, side: str) -> torch.Tensor:
+        """按记录索引和分支读取一个标准化 patch。
+
+        固定验证协议通过 `(record_index, side)` 引用 patch，因此把图像读取集中在
+        数据集内，确保训练与验证使用完全相同的归一化规则。
+        """
+        record = self.records[index]
+        if side == "anchor":
+            path = record.patch_a_path
+        elif side == "positive":
+            path = record.patch_p_path
+        else:
+            raise ValueError(f"Unsupported patch side: {side!r}")
+        patch = self._normalize_patch(self._read_patch(path))[None, :, :]
+        return torch.from_numpy(np.ascontiguousarray(patch, dtype=np.float32))
+
     def __getitem__(self, index: int) -> dict[str, object]:
         """返回 DataLoader 需要的一条训练样本。"""
         record = self.records[index]
-        # 增加 channel 维度，形成 `[1, 32, 32]`。
-        anchor = self._normalize_patch(self._read_patch(record.patch_a_path))[None, :, :]
-        positive = self._normalize_patch(self._read_patch(record.patch_p_path))[None, :, :]
         return {
-            "anchor": torch.from_numpy(np.ascontiguousarray(anchor, dtype=np.float32)),
-            "positive": torch.from_numpy(np.ascontiguousarray(positive, dtype=np.float32)),
+            "anchor": self.load_patch(index, "anchor"),
+            "positive": self.load_patch(index, "positive"),
             "point_group": torch.tensor(record.point_group, dtype=torch.long),
             "finger_group": torch.tensor(record.finger_group, dtype=torch.long),
             "finger_id": record.finger_id,

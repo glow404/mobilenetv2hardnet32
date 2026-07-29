@@ -32,13 +32,15 @@ python -m hardnet_train.train `
   --output-dir ../outputs/hardnet_train_cuda_b512
 ```
 
-长训练续训：
+长训练续训时，应继续使用原训练的有效参数和输出目录。当前 `hardnet_train_cuda_b512` 模型的命令为：
 
 ```powershell
 python -m hardnet_train.train `
-  --config hardnet_train/post_nips_config.yaml `
+  --config hardnet_train/config.yaml `
   --device cuda `
-  --output-dir ../outputs/hardnet_train_post_nips `
+  --batch-size 512 `
+  --fingers-per-batch 64 `
+  --output-dir ../outputs/hardnet_train_cuda_b512 `
   --resume auto
 ```
 

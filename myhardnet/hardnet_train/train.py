@@ -80,6 +80,28 @@ def resolve_path(config: dict[str, Any], raw_path: str | Path) -> Path:
     return (Path(config["_config_path"]).parent / path).resolve()
 
 
+def resolve_resume_checkpoint(
+    output_dir: Path,
+    resume_arg: str | None,
+    allow_missing: bool,
+) -> Path | None:
+    """在构建数据流前解析续训 checkpoint，并区分强制恢复与可选恢复。"""
+    if not resume_arg:
+        return None
+    checkpoint_path = (
+        output_dir / "last.pt"
+        if resume_arg == "auto"
+        else Path(resume_arg).expanduser()
+    )
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = (Path.cwd() / checkpoint_path).resolve()
+    if checkpoint_path.exists():
+        return checkpoint_path
+    if allow_missing:
+        return None
+    raise FileNotFoundError(f"resume checkpoint not found: {checkpoint_path}")
+
+
 def set_seed(seed: int) -> None:
     """固定 Python / numpy / PyTorch 随机种子，便于复现实验。"""
     random.seed(seed)
@@ -554,7 +576,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler", choices=["linear", "warmup_cosine"], default=None)
     parser.add_argument("--warmup-epochs", type=float, default=None)
     parser.add_argument("--eta-min", type=float, default=None)
-    parser.add_argument("--resume", default=None, help="Checkpoint path to resume from, or 'auto' for output_dir/last.pt.")
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Checkpoint path to resume from, or 'auto' to require output_dir/last.pt.",
+    )
     parser.add_argument("--resume-auto", action="store_true", help="Resume from output_dir/last.pt if it exists.")
     parser.add_argument("--no-plot", action="store_true", help="Do not generate training_curves.png after training.")
     parser.add_argument("--device", default=None)
@@ -661,8 +687,15 @@ def main() -> None:
 
     output_dir = resolve_path(config, config.get("output_dir", "../outputs/hardnet_train"))
     resume_arg = "auto" if args.resume_auto else args.resume
+    resume_path = resolve_resume_checkpoint(
+        output_dir=output_dir,
+        resume_arg=resume_arg,
+        allow_missing=args.resume_auto,
+    )
+    if args.resume_auto and resume_path is None:
+        print(f"resume auto skipped: checkpoint not found at {output_dir / 'last.pt'}", flush=True)
     metrics_path = output_dir / "metrics.csv"
-    if metrics_path.exists() and not resume_arg:
+    if metrics_path.exists() and resume_path is None:
         raise FileExistsError(
             f"Output directory already contains metrics: {metrics_path}. "
             "Use a new output directory for a fresh fixed-protocol experiment, or explicitly resume it."
@@ -735,28 +768,22 @@ def main() -> None:
     )
 
     best_fpr_at_tpr95, early_stop_best_fpr_at_tpr95, no_improve_epochs = (
-        best_fpr_at_tpr95_from_metrics(metrics_path) if resume_arg else (float("inf"), float("inf"), 0)
+        best_fpr_at_tpr95_from_metrics(metrics_path)
+        if resume_path is not None
+        else (float("inf"), float("inf"), 0)
     )
     start_epoch = 1
     global_step = 0
-    if resume_arg:
-        resume_path = output_dir / "last.pt" if resume_arg == "auto" else Path(resume_arg).expanduser()
-        if not resume_path.is_absolute():
-            resume_path = (Path.cwd() / resume_path).resolve()
-        if resume_path.exists():
-            start_epoch, global_step = load_checkpoint(
-                resume_path,
-                model,
-                optimizer,
-                device,
-                steps_per_epoch,
-                scaler=scaler,
-            )
-            print(f"resumed from {resume_path} | start_epoch={start_epoch} global_step={global_step}", flush=True)
-        elif args.resume_auto or resume_arg == "auto":
-            print(f"resume auto skipped: checkpoint not found at {resume_path}", flush=True)
-        else:
-            raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+    if resume_path is not None:
+        start_epoch, global_step = load_checkpoint(
+            resume_path,
+            model,
+            optimizer,
+            device,
+            steps_per_epoch,
+            scaler=scaler,
+        )
+        print(f"resumed from {resume_path} | start_epoch={start_epoch} global_step={global_step}", flush=True)
 
     # 只有初始化/恢复检查全部通过后才写实际配置，避免失败命令污染既有目录。
     (output_dir / "resolved_config.json").write_text(

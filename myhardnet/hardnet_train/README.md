@@ -130,23 +130,33 @@ python -m hardnet_train.train `
 
 ## 续训
 
-长训练可以从上一次 `last.pt` 继续：
+续训必须继续使用原训练的有效配置和输出目录。命令行覆盖后的完整配置可在输出目录的 `resolved_config.json` 中确认。
+
+当前 `hardnet_train_cuda_b512` 模型从 `last.pt` 续训：
 
 ```powershell
 python -m hardnet_train.train `
-  --config hardnet_train/post_nips_config.yaml `
+  --config hardnet_train/config.yaml `
   --device cuda `
-  --output-dir ../outputs/hardnet_train_post_nips `
+  --batch-size 512 `
+  --fingers-per-batch 64 `
+  --output-dir ../outputs/hardnet_train_cuda_b512 `
   --resume auto
 ```
 
-也可以指定 checkpoint：
+也可以显式指定同一个 checkpoint：
 
 ```powershell
 python -m hardnet_train.train `
-  --config hardnet_train/post_nips_config.yaml `
-  --resume ../outputs/hardnet_train_post_nips/last.pt
+  --config hardnet_train/config.yaml `
+  --device cuda `
+  --batch-size 512 `
+  --fingers-per-batch 64 `
+  --output-dir ../outputs/hardnet_train_cuda_b512 `
+  --resume ../outputs/hardnet_train_cuda_b512/last.pt
 ```
+
+`--resume auto` 表示必须找到当前输出目录的 `last.pt`，否则直接报错。`--resume-auto` 适合脚本化启动：checkpoint 存在时恢复，不存在时仅在空输出目录中从头训练。
 
 续训会恢复：
 

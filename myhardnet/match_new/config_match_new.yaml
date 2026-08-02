@@ -7,11 +7,17 @@
 #   4. 使用 HardNet L2/top-k/RANSAC/脊线纹理融合 match score 输出 FAR、FRR、EER 和推荐阈值；
 #   5. 在目标阈值下导出 false reject / false accept 原图，方便人工排查失败原因。
 
-# ---------------------------------------------------------------------------   
+# ---------------------------------------------------------------------------
+experiment:
+  id: A0_hardnet128_ysjz_V4
+  dataset: ysjz_V4
+  protocol: identity_verification_v1
+  descriptor_variant: hardnet_128
+
 output:
   # 实验结果根目录。相对路径相对本配置文件所在目录解析。
-  # 其下会生成 image_templates/、eval_hardnet_l2/、各类 CSV/JSON 等。
-  output_dir: ysjz_V4
+  # A0 与后续 Strong-256 使用不同目录，禁止复用模板和阈值产物。
+  output_dir: ../outputs/ysjz_V4/A0_hardnet128
 
 runtime:
   skip_template_build: false
@@ -36,18 +42,19 @@ data:
 
   image_extensions: [.bmp, .png, .jpg, .jpeg, .tif, .tiff]
 
-  # 启动时检查所有输入图像是否能够正常解码。
+  # 启动时检查所有输入图像是否能够正常解码；正式指标不能静默跳过坏图。
   validate_readable: true
 
 model:
-  # 模型架构默认从 checkpoint 元数据读取；旧 checkpoint 自动识别为 hardnet。
+  # 模型架构和描述子维度默认从 checkpoint 元数据读取；旧 checkpoint 自动识别为 HardNet-128。
   architecture: auto
-  descriptor_dim: 128
+  descriptor_dim: auto
 
   # checkpoint 相对路径按本配置文件所在目录解析。
   checkpoint: ../outputs/models/hardnet_train_post_nips_lr10/best.pt
 
   # 显式值会覆盖 checkpoint 中对应的模型参数，必须与训练结构兼容。
+  # A0 保持旧 checkpoint 的训练配置；Strong-256 使用独立配置/命令行覆盖。
   dropout: 0.3
   final_bn_affine: false
 
@@ -58,15 +65,19 @@ model:
   # 建模版时，HardNet patch 一次批量推理 batch size个patch。
   batch_size: 512
 
+  # 在线动态关键点统一补齐到该 batch，避免每种关键点数触发一次 CUDA shape 初始化。
+  # 0 表示保留动态 batch；当前最多 500 个关键点，因此固定为 512。
+  fixed_inference_batch_size: 512
+
   # GPU 推理优化。FP16 仅用于 CNN 前向，返回的描述子仍转换为 FP32。
   inference_precision: fp16
   channels_last: true
-  pin_memory: true
-  cudnn_benchmark: true
+  pin_memory: false
+  cudnn_benchmark: false
   allow_tf32: true
 
 sift:
-  # SIFT 在 HardNet 主实验中只负责提供关键点位置和方向；
+  # SIFT 在 HardNet 主实验中只负责提供关键点位置和方向； 这里的参数与邓宇的sift，训练时用的sift保持一致，可试着修改。
   nfeatures: 500    #每层最多检测的关键点数。越大检测越密集
   nOctaveLayers: 3   #尺度层数。越大尺度采样越细，关键点更多
   contrastThreshold: 0.03  #对比度阈值，低于此值的点不作为关键点。越小越容易保留弱纹理 0.02-0.04
@@ -116,7 +127,7 @@ matching:
 
   # 是否启用双向 Lowe 比值验证。
   # 仅影响 ratio_only 和 topk_or_ratio 的 ratio 分支；topk_only 不使用该参数。
-  bidirectional_ratio_test: false
+  bidirectional_ratio_test: true
 
   # 绝对距离上限。最近邻距离仍必须不超过该值
   abs_distance_threshold: 1.5
@@ -127,7 +138,7 @@ matching:
 
   # RANSAC 前允许一对多候选，避免局部纹理重复时过早删掉真匹配；
   # RANSAC 后再做 one-to-one 去重。  开启双向验证时，这个参数不起作用。
-  allow_many_to_one_before_ransac: true
+  allow_many_to_one_before_ransac: false
 
   # 候选过多会拖慢 RANSAC，也容易引入噪声，所以进入 RANSAC 前截断。
   max_candidates_for_ransac: 300
@@ -149,8 +160,8 @@ matching:
 
   # 指纹图像主要是平移/旋转，只有极少量尺度变化。
   # RANSAC 得到 partial affine 后，只约束 scale，不限制旋转角。
-  min_scale: 0.90
-  max_scale: 1.10
+  min_scale: 0.80
+  max_scale: 1.20
 
 texture_verification:
   # C 方案：先用几何内点保证仿射可用，再融合几何分数和局部脊线纹理分数。
@@ -270,6 +281,10 @@ evaluation:
   # 正式手机解锁目标：FAR < 1/50000，FRR < 2%。
   target_far: 0.00002
   target_frr: 0.02
+
+  # query pool 在每个 identity 内固定拆分；validation 只选阈值，test 只报告冻结阈值。
+  validation_query_fraction: 0.5
+  query_partition_seed: 100042
 
   # 额外报告 TAR/FRR@FAR 的点。
   far_points: [0.001, 0.0001, 0.00002]

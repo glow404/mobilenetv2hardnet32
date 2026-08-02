@@ -80,9 +80,9 @@ class HardNetLoss(nn.Module):
 
         参数：
             anchor:
-                anchor 分支输出的描述子，形状 `[B, 128]`。
+                anchor 分支输出的描述子，形状 `[B, D]`。
             positive:
-                positive 分支输出的描述子，形状 `[B, 128]`。
+                positive 分支输出的描述子，形状 `[B, D]`，且 D 必须与 anchor 一致。
             point_group:
                 每条正样本对应的物理点组编号。同组样本不能互相当负样本。
             finger_group:

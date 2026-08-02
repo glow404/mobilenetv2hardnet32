@@ -22,8 +22,15 @@ import torch
 
 from hardnet_train.model import (
     build_descriptor_model,
+    checkpoint_descriptor_dim,
     checkpoint_model_architecture,
+    checkpoint_model_config,
+    model_descriptor_dim,
     normalize_model_architecture,
+)
+from match_new.descriptor_contract import (
+    FLOAT_DESCRIPTOR_KIND,
+    L2_DISTANCE_METRIC,
 )
 from match_new.utils import resolve_path
 
@@ -295,6 +302,25 @@ class HardNetDescriptor:
         self.batch_size = int(
             get_nested(config, "model", "batch_size", default=512)
         )
+        if self.batch_size <= 0:
+            raise ValueError("model.batch_size 必须大于 0")
+        self.fixed_inference_batch_size = int(
+            get_nested(
+                config,
+                "model",
+                "fixed_inference_batch_size",
+                default=0,
+            )
+        )
+        if self.fixed_inference_batch_size < 0:
+            raise ValueError(
+                "model.fixed_inference_batch_size 不能小于 0"
+            )
+        self.patch_size = int(
+            get_nested(config, "patch", "out_size", default=32)
+        )
+        if self.patch_size <= 0:
+            raise ValueError("patch.out_size 必须大于 0")
         self.pin_memory = (
             self.device.type == "cuda"
             and bool(
@@ -317,6 +343,20 @@ class HardNetDescriptor:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         if not isinstance(checkpoint, Mapping):
             raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
+        descriptor_kind = str(
+            checkpoint.get("descriptor_kind", FLOAT_DESCRIPTOR_KIND)
+        ).strip().lower()
+        descriptor_metric = str(
+            checkpoint.get("descriptor_metric", L2_DISTANCE_METRIC)
+        ).strip().lower()
+        if (
+            descriptor_kind != FLOAT_DESCRIPTOR_KIND
+            or descriptor_metric != L2_DISTANCE_METRIC
+        ):
+            raise ValueError(
+                "HardNetDescriptor only loads continuous float/L2 checkpoints: "
+                f"kind={descriptor_kind}, metric={descriptor_metric}, path={checkpoint_path}."
+            )
 
         saved_architecture = checkpoint_model_architecture(checkpoint)
         requested_architecture = str(
@@ -332,19 +372,34 @@ class HardNetDescriptor:
                     f"config={architecture}, checkpoint={saved_architecture}."
                 )
 
-        saved_config = checkpoint.get("config")
-        saved_model_config: dict[str, Any] = {}
-        if isinstance(saved_config, Mapping):
-            checkpoint_model_config = saved_config.get("model")
-            if isinstance(checkpoint_model_config, Mapping):
-                saved_model_config.update(checkpoint_model_config)
+        saved_descriptor_dim = checkpoint_descriptor_dim(checkpoint)
+        requested_descriptor_dim = get_nested(
+            config,
+            "model",
+            "descriptor_dim",
+            default="auto",
+        )
+        requested_descriptor_dim_text = str(
+            requested_descriptor_dim if requested_descriptor_dim is not None else ""
+        ).strip().lower()
+        if requested_descriptor_dim_text not in {"", "auto"}:
+            configured_descriptor_dim = int(requested_descriptor_dim_text)
+            if configured_descriptor_dim != saved_descriptor_dim:
+                raise ValueError(
+                    "Configured descriptor dimension does not match checkpoint: "
+                    f"config={configured_descriptor_dim}, checkpoint={saved_descriptor_dim}."
+                )
+
+        saved_model_config = checkpoint_model_config(checkpoint)
         runtime_model_config = config.get("model")
         if isinstance(runtime_model_config, Mapping):
-            for key in ("dropout", "descriptor_dim", "final_bn_affine"):
+            for key in ("dropout", "final_bn_affine"):
                 if key in runtime_model_config:
                     saved_model_config[key] = runtime_model_config[key]
         saved_model_config["architecture"] = architecture
+        saved_model_config["descriptor_dim"] = saved_descriptor_dim
         self.model = build_descriptor_model(saved_model_config)
+        self.descriptor_dim = model_descriptor_dim(self.model)
 
         state = checkpoint["model"] if "model" in checkpoint else checkpoint
         self.model.load_state_dict(state)
@@ -470,11 +525,25 @@ class HardNetDescriptor:
             self._activate_cpu_fallback()
             return self._describe_impl(patches)
 
+    def warmup(self, runs: int) -> None:
+        """按真实推理 batch 形状预热模型，耗时由调用方单独统计。"""
+
+        warmup_runs = max(0, int(runs))
+        if warmup_runs == 0:
+            return
+        warmup_batch_size = self.fixed_inference_batch_size or 1
+        patches = np.zeros(
+            (warmup_batch_size, self.patch_size, self.patch_size),
+            dtype=np.float32,
+        )
+        for _ in range(warmup_runs):
+            self.describe(patches)
+
     def _describe_impl(self, patches: np.ndarray) -> np.ndarray:
-        """在当前设备上执行一次描述子批量推理。"""
+        """在当前设备上执行描述子推理，并隐藏固定 batch 的 padding。"""
 
         if len(patches) == 0:
-            return np.zeros((0, 128), dtype=np.float32)
+            return np.zeros((0, self.descriptor_dim), dtype=np.float32)
         patch_array = np.ascontiguousarray(
             patches,
             dtype=np.float32,
@@ -482,14 +551,30 @@ class HardNetDescriptor:
         if patch_array.ndim == 3:
             patch_array = patch_array[:, None, :, :]
         host_tensor = torch.from_numpy(patch_array)
-        if self.pin_memory:
-            host_tensor = host_tensor.pin_memory()
 
+        inference_batch_size = (
+            self.fixed_inference_batch_size or self.batch_size
+        )
         outputs: list[torch.Tensor] = []
-        for start in range(0, len(patch_array), self.batch_size):
-            batch = host_tensor[
-                start : start + self.batch_size
-            ].to(
+        for start in range(0, len(patch_array), inference_batch_size):
+            source_batch = host_tensor[
+                start : start + inference_batch_size
+            ]
+            valid_count = len(source_batch)
+            if (
+                self.fixed_inference_batch_size
+                and valid_count < inference_batch_size
+            ):
+                padded_batch = torch.zeros(
+                    (inference_batch_size, *source_batch.shape[1:]),
+                    dtype=source_batch.dtype,
+                )
+                padded_batch[:valid_count].copy_(source_batch)
+                source_batch = padded_batch
+            if self.pin_memory:
+                source_batch = source_batch.pin_memory()
+
+            batch = source_batch.to(
                 self.device,
                 non_blocking=self.pin_memory,
             )
@@ -502,7 +587,14 @@ class HardNetDescriptor:
                 dtype=self.amp_dtype,
                 enabled=self.amp_enabled,
             ):
-                outputs.append(self.model(batch))
+                batch_output = self.model(batch)
+            outputs.append(batch_output[:valid_count])
         if not outputs:
-            return np.zeros((0, 128), dtype=np.float32)
-        return torch.cat(outputs, dim=0).float().cpu().numpy()
+            return np.zeros((0, self.descriptor_dim), dtype=np.float32)
+        descriptors = torch.cat(outputs, dim=0).float().cpu().numpy()
+        if descriptors.ndim != 2 or descriptors.shape[1] != self.descriptor_dim:
+            raise ValueError(
+                "Descriptor model output shape mismatch: "
+                f"expected [N,{self.descriptor_dim}], got {descriptors.shape}."
+            )
+        return descriptors

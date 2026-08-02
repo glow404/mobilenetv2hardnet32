@@ -14,6 +14,50 @@ from typing import Any
 import yaml
 
 
+def _merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """递归合并配置；mapping 深合并，其他值由子配置完整覆盖。"""
+
+    merged = dict(base)
+    for key, value in override.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(value, dict):
+            merged[key] = _merge_config(base_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_config_mapping(
+    config_path: Path,
+    stack: tuple[Path, ...] = (),
+) -> tuple[dict[str, Any], list[str]]:
+    """读取单个 YAML，并解析同目录下可选的 ``extends`` 父配置。"""
+
+    if config_path in stack:
+        chain = " -> ".join(str(path) for path in (*stack, config_path))
+        raise ValueError(f"Circular config inheritance: {chain}")
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config must be a mapping: {config_path}")
+    parent_value = raw.pop("extends", None)
+    if parent_value is None or parent_value == "":
+        return raw, [str(config_path)]
+    if not isinstance(parent_value, (str, Path)):
+        raise ValueError(
+            f"Config extends must be a path string, got {type(parent_value).__name__}: {config_path}"
+        )
+    parent_path = Path(parent_value).expanduser()
+    if not parent_path.is_absolute():
+        parent_path = (config_path.parent / parent_path).resolve()
+    if parent_path.parent != config_path.parent:
+        raise ValueError(
+            "Inherited match configs must be in the same directory so relative data/model "
+            f"paths keep one origin: child={config_path}, parent={parent_path}"
+        )
+    parent, sources = _load_config_mapping(parent_path, (*stack, config_path))
+    return _merge_config(parent, raw), [*sources, str(config_path)]
+
+
 def ensure_dir(path: str | Path) -> Path:
     """确保目录存在，并返回 Path 对象。"""
 
@@ -23,13 +67,12 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
-    """读取 YAML 配置，并记录 `_config_path` 供相对路径解析使用。"""
+    """读取 YAML，解析可选继承，并记录路径供相对路径与运行清单使用。"""
 
     config_path = Path(path).expanduser().resolve()
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    if not isinstance(config, dict):
-        raise ValueError(f"Config must be a mapping: {config_path}")
+    config, sources = _load_config_mapping(config_path)
     config["_config_path"] = str(config_path)
+    config["_config_sources"] = sources
     return config
 
 

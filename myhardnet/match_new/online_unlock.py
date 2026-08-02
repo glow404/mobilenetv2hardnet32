@@ -183,8 +183,7 @@ class OnlineUnlockEngine:
 
         warmup_runs = max(0, int(online_cfg.get("model_warmup_runs", 0)))
         warmup_started = time.perf_counter()
-        for _ in range(warmup_runs):
-            self.hardnet.describe(np.zeros((1, 32, 32), dtype=np.float32))
+        self.hardnet.warmup(warmup_runs)
         self.model_warmup_ms = (time.perf_counter() - warmup_started) * 1000.0
 
         self.preload_templates = bool(online_cfg.get("preload_templates", True))
@@ -200,7 +199,17 @@ class OnlineUnlockEngine:
 
         identity = self.get_identity(identity_id)
         for path in identity.get("template_paths", []):
-            load_template_cached(path, self.template_cache, require="hardnet")
+            template = load_template_cached(
+                path,
+                self.template_cache,
+                require="hardnet",
+            )
+            template_dim = int(template["hardnet_descriptor_dim"])
+            if template_dim != self.hardnet.descriptor_dim:
+                raise ValueError(
+                    "Registered template/model descriptor dimension mismatch: "
+                    f"template={template_dim}, model={self.hardnet.descriptor_dim}, path={path}."
+                )
 
     def get_identity(self, identity_id: str) -> dict[str, Any]:
         """返回指定已注册手指的模板集合；未注册时给出可用 ID 示例。"""
@@ -387,6 +396,9 @@ class OnlineUnlockEngine:
                 "device": str(self.hardnet.device),
                 "inference_precision": self.hardnet.inference_precision,
                 "channels_last": self.hardnet.channels_last,
+                "fixed_inference_batch_size": (
+                    self.hardnet.fixed_inference_batch_size
+                ),
                 "model_initialization_ms": self.model_initialization_ms,
                 "model_warmup_ms": self.model_warmup_ms,
                 "template_preload_ms": self.preload_ms,

@@ -5,24 +5,44 @@
 
 ## 文件说明
 
-- `model.py`：原 HardNet 与 MobileHardNet。输入 `[B, 1, 32, 32]`，输出 `[B, 128]`。
+- `model.py`：保留原 HardNet、MobileHardNet 与 HardNet Strong V2，统一接收 `[B, 1, 32, 32]` patch。
 - `loss.py`：top-k hardest-in-batch triplet margin loss。
 - `data.py`：CSV 数据集、PIL patch 读取、union-find 物理点分组和训练 batch sampler。
 - `validation.py`：固定正样本、同指纹负样本和跨指纹负样本协议。
 - `metrics.py`：运行均值、ROC/ranking、距离分位数和 active-triplet 指标。
 - `optim.py`：SGD/AdamW 工厂与 decay/no-decay 参数分组。
 - `train.py`：训练主入口，负责配置解析、训练、固定验证、checkpoint 和 metrics 输出。
-- `config.yaml`：正式训练默认配置。
+- `config.yaml`：唯一的正式训练配置，默认训练 Strong V2。
 - `smoke_config.yaml`：快速自检配置，只跑极少 step。
 
 ## 输出文件
 
-训练结果默认写入 `../outputs/hardnet_train_mobile_fixed_v1/`：
+训练结果默认写入 `../outputs/models/hardnet_train_strong_v2_256/`：
 
 - `best.pt`：固定协议 `val_fpr_at_tpr95` 最低的 checkpoint。
 - `last.pt`：最后一个 epoch 的 checkpoint。
 - `metrics.csv`：每个 epoch 的训练指标、总体验证指标及 `same_finger` / `cross_finger` 分项。
 - `resolved_config.json`：包含命令行覆盖后的实际配置快照。
+
+## 网络架构切换
+
+`config.yaml` 使用 `descriptor_dim: auto` 和 `output_dir: auto`，会按架构选择兼容维度及独立输出目录：
+
+| `model.architecture` | 自动维度 | 自动输出目录 | 网络状态 |
+| --- | ---: | --- | --- |
+| `hardnet_strong_v2` | 256 | `outputs/models/hardnet_train_strong_v2_256` | 默认高精度主干 |
+| `mobile_hardnet` | 128 | `outputs/models/hardnet_train_mobile_128` | 保留的 MobileHardNet 轻量主干 |
+| `hardnet` | 128 | `outputs/models/hardnet_train_hardnet_128` | 论文版 HardNet 主干 |
+
+因此，只把下面一行改为 `mobile_hardnet`，即可使用原先的 MobileHardNet 网络结构训练：
+
+```yaml
+model:
+  architecture: mobile_hardnet
+  descriptor_dim: auto
+```
+
+该切换会自动改变网络结构、描述子维度和输出目录。当前 `dropout: 0.12`、`warmup_epochs: 3`、`lr: 0.08` 是 Strong V2 默认训练参数；若要严格复现旧 Mobile 配置，还应改回 `dropout: 0.1`、`warmup_epochs: 2`、`lr: 0.1`。
 
 ## 早停规则
 

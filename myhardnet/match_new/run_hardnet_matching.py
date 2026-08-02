@@ -23,13 +23,24 @@ import argparse
 import json
 import sys
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hardnet_train.model import (
+    checkpoint_descriptor_dim,
+    checkpoint_model_architecture,
+)
+from match_new.descriptor_contract import (
+    require_l2_float_contract,
+    resolve_descriptor_contract,
+)
 from match_new.evaluation import run_hardnet_evaluation, summary_row
 from match_new.input_loader import load_raw_image_metadata, validate_identity_image_counts
 from match_new.template_builder import build_hardnet_templates, build_identity_templates, load_image_template
@@ -296,17 +307,69 @@ def limit_rows_for_debug(rows: list[dict[str, str]], limit_identities: int, limi
     return selected
 
 
+def resolve_expected_descriptor_dim(
+    config: dict[str, Any],
+    checkpoint_path: str | Path,
+) -> int:
+    """从 checkpoint 解析 HardNet 维度，并校验可选的显式配置。"""
+
+    target = Path(checkpoint_path).expanduser()
+    configured = dict(config.get("model", {})).get("descriptor_dim", "auto")
+    configured_text = str(configured if configured is not None else "").strip().lower()
+    if not target.exists():
+        if configured_text in {"", "auto"}:
+            raise FileNotFoundError(
+                "Cannot infer descriptor dimension without checkpoint or explicit "
+                f"model.descriptor_dim: {target}"
+            )
+        return int(configured_text)
+
+    checkpoint = torch.load(target, map_location="cpu")
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"Unsupported checkpoint format: {target}")
+    descriptor_kind = str(checkpoint.get("descriptor_kind", "float")).strip().lower()
+    descriptor_metric = str(checkpoint.get("descriptor_metric", "l2")).strip().lower()
+    if descriptor_kind != "float" or descriptor_metric != "l2":
+        raise ValueError(
+            "HardNet L2 matching requires a float/L2 checkpoint: "
+            f"kind={descriptor_kind}, metric={descriptor_metric}, path={target}."
+        )
+    checkpoint_dim = checkpoint_descriptor_dim(checkpoint)
+    if configured_text not in {"", "auto"} and int(configured_text) != checkpoint_dim:
+        raise ValueError(
+            "Configured descriptor dimension does not match checkpoint: "
+            f"config={int(configured_text)}, checkpoint={checkpoint_dim}."
+        )
+    return checkpoint_dim
+
+
+def resolve_checkpoint_metadata(checkpoint_path: str | Path) -> dict[str, Any]:
+    """读取 checkpoint 的架构与维度元数据，并兼容旧 HardNet checkpoint。"""
+
+    target = Path(checkpoint_path).expanduser()
+    checkpoint = torch.load(target, map_location="cpu")
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"Unsupported checkpoint format: {target}")
+    return {
+        "model_architecture": checkpoint_model_architecture(checkpoint),
+        "descriptor_kind": str(checkpoint.get("descriptor_kind", "float")),
+        "descriptor_metric": str(checkpoint.get("descriptor_metric", "l2")),
+        "descriptor_dim": checkpoint_descriptor_dim(checkpoint),
+        "epoch": checkpoint.get("epoch"),
+        "global_step": checkpoint.get("global_step"),
+        "model_parameter_count": checkpoint.get("model_parameter_count"),
+        "model_macs_per_patch": checkpoint.get("model_macs_per_patch"),
+    }
+
+
 def validate_templates(
     template_dir: str | Path,
     rows: list[dict[str, str]],
     config: dict[str, Any],
+    descriptor_dim: int,
     max_checks: int = 10,
 ) -> dict[str, Any]:
-    """抽样检查模板字段是否和 keypoints 对齐。
-
-    这里主要检查 HardNet descriptor 行数是否等于 keypoint 数，并确认维度为 128。
-    如果模板构建阶段出现 keypoint/descriptor 错位，后续匹配指标会完全不可信。
-    """
+    """抽样检查模板字段是否与 keypoints 和 checkpoint 维度一致。"""
 
     require_overlap_image = bool(dict(config.get("texture_verification", {})).get("enabled", False))
     checked = 0
@@ -314,19 +377,38 @@ def validate_templates(
         template = load_image_template(Path(template_dir) / template_filename(row["identity_id"], row["image_id"]), require="hardnet")
         n = int(template["keypoints_xy"].shape[0])
         hardnet = template["hardnet_descriptors"]
-        if hardnet.shape != (n, 128):
-            raise ValueError(f"HardNet shape mismatch for {row['image_id']}: {hardnet.shape} vs {(n, 128)}")
+        contract = resolve_descriptor_contract(template, "hardnet")
+        require_l2_float_contract(contract, label=str(template.get("template_path", row["image_id"])))
+        if contract.dimension != int(descriptor_dim):
+            raise ValueError(
+                f"HardNet dimension metadata mismatch for {row['image_id']}: "
+                f"template={contract.dimension}, checkpoint={descriptor_dim}"
+            )
+        expected_shape = (n, contract.dimension)
+        if hardnet.shape != expected_shape:
+            raise ValueError(
+                f"HardNet shape mismatch for {row['image_id']}: "
+                f"{hardnet.shape} vs {expected_shape}"
+            )
         if require_overlap_image and not bool(template.get("has_overlap_image", False)):
             raise ValueError(
                 f"Template {row['image_id']} has no overlap_image required by texture verification. "
                 "Rebuild templates without --skip-template-build."
             )
         checked += 1
+    patch_cfg = dict(config.get("patch", {}))
+    data_cfg = dict(config.get("data", {}))
+    image_root = resolve_path(config, data_cfg.get("image_root", ""))
     return {
         "checked_templates": checked,
-        "patch_crop_size": 32,
-        "patch_out_size": 32,
+        "patch_crop_size": int(patch_cfg.get("crop_size", 32)),
+        "patch_out_size": int(patch_cfg.get("out_size", 32)),
         "descriptor_type": "hardnet",
+        "descriptor_kind": "float",
+        "descriptor_metric": "l2",
+        "descriptor_dim": int(descriptor_dim),
+        "evaluation_dataset": image_root.name,
+        "image_root": str(image_root),
         "overlap_image_required": require_overlap_image,
     }
 
@@ -341,6 +423,30 @@ def main() -> None:
     checkpoint = resolve_path(config, dict(config.get("model", {}))["checkpoint"])
     if not checkpoint.exists() and not settings["skip_template_build"]:
         raise FileNotFoundError(f"HardNet checkpoint does not exist: {checkpoint}")
+    descriptor_dim = resolve_expected_descriptor_dim(config, checkpoint)
+    checkpoint_metadata = (
+        resolve_checkpoint_metadata(checkpoint)
+        if checkpoint.exists()
+        else {
+            "model_architecture": dict(config.get("model", {})).get("architecture", "unavailable"),
+            "descriptor_kind": "float",
+            "descriptor_metric": "l2",
+            "descriptor_dim": int(descriptor_dim),
+            "epoch": None,
+            "global_step": None,
+            "model_parameter_count": None,
+            "model_macs_per_patch": None,
+        }
+    )
+
+    # 评估数据集名称是实验契约的一部分，避免配置文件指向了同结构但不同来源的数据。
+    image_root = resolve_path(config, dict(config.get("data", {})).get("image_root", ""))
+    expected_dataset = str(dict(config.get("experiment", {})).get("dataset", "")).strip()
+    if expected_dataset and image_root.name != expected_dataset:
+        raise ValueError(
+            "Configured evaluation dataset does not match data.image_root: "
+            f"expected={expected_dataset!r}, actual={image_root.name!r}, root={image_root}"
+        )
 
     # 1. 直接扫描原始图像；调试时可按 identity 数和每个 identity 的图像数裁剪数据。
     output_dir = ensure_dir(settings["output_dir"])
@@ -359,12 +465,18 @@ def main() -> None:
     if settings["skip_template_build"]:
         candidate_rows = read_csv_rows(metadata_success_path) if metadata_success_path.exists() else rows
         raw_keys = {(row["identity_id"], row["image_id"]) for row in rows}
-        success_rows = [
-            row
-            for row in candidate_rows
-            if (row["identity_id"], row["image_id"]) in raw_keys
-            and (template_dir / template_filename(row["identity_id"], row["image_id"])).exists()
-        ]
+        success_rows = []
+        for candidate in candidate_rows:
+            key = (candidate["identity_id"], candidate["image_id"])
+            template_path = template_dir / template_filename(*key)
+            if key not in raw_keys or not template_path.exists():
+                continue
+            # 复用模板时统一使用本次 output 下的路径，避免把旧实验的路径
+            # 泄漏到 identity_templates 和后续评估产物中。
+            row = dict(candidate)
+            row["template_path"] = str(template_path)
+            row.setdefault("status", "success")
+            success_rows.append(row)
         if not success_rows:
             raise RuntimeError("skip_template_build was set but no image templates were found.")
     else:
@@ -376,7 +488,15 @@ def main() -> None:
             raise RuntimeError("No templates were built successfully.")
     write_csv_rows(metadata_success_path, success_rows)
     validate_identity_image_counts(success_rows, enrollment_count + 1, context="successfully built templates")
-    write_json(output_dir / "template_validation.json", validate_templates(template_dir, success_rows, config))
+    write_json(
+        output_dir / "template_validation.json",
+        validate_templates(
+            template_dir,
+            success_rows,
+            config,
+            descriptor_dim=descriptor_dim,
+        ),
+    )
 
     # 3. 固定随机种子，为每个 identity 选择注册模板，其余作为 query。
     identity_templates_path = output_dir / f"identity_templates_{enrollment_count}.json"
@@ -403,9 +523,46 @@ def main() -> None:
         max_impostor_identities_per_query=int(settings["max_impostor_identities_per_query"]),
         export_failures=bool(settings["export_failures"]),
     )
+    effective_config = result["metrics"].get("effective_config") or {}
+    write_json(
+        output_dir / "run_manifest.json",
+        {
+            "experiment": config.get("experiment", {}),
+            "dataset": {
+                "name": image_root.name,
+                "image_root": str(image_root),
+                "num_indexed_rows": len(rows),
+            },
+            "checkpoint": {
+                "path": str(checkpoint),
+                **checkpoint_metadata,
+            },
+            "descriptor_source": "hardnet",
+            "descriptor_dim": int(descriptor_dim),
+            "enrollment": {
+                "images_per_identity": enrollment_count,
+                "random_seed": int(enrollment.get("random_seed", 42)),
+            },
+            "artifacts": {
+                "image_templates": str(template_dir),
+                "identity_templates": str(identity_templates_path),
+                "split_metadata": str(split_metadata_path),
+                "evaluation": str(output_dir / "eval_hardnet_l2"),
+            },
+            "effective_config": effective_config,
+        },
+    )
     # 5. 汇总一行 CSV/JSON，方便和其他实验横向比较。
     far_points = [float(point) for point in dict(config.get("evaluation", {})).get("far_points", [0.001, 0.0001])]
-    summary = [summary_row(result["metrics"], far_points)]
+    summary_record = {
+        "experiment_id": dict(config.get("experiment", {})).get("id", ""),
+        "evaluation_dataset": image_root.name,
+        "model_architecture": checkpoint_metadata.get("model_architecture", ""),
+        "descriptor_dim": int(descriptor_dim),
+        "checkpoint": str(checkpoint),
+        **summary_row(result["metrics"], far_points),
+    }
+    summary = [summary_record]
     summary_csv = output_dir / "hardnet_l2_summary.csv"
     summary_json = output_dir / "hardnet_l2_summary.json"
     write_csv_rows(summary_csv, summary)
@@ -417,6 +574,13 @@ def main() -> None:
             "identity_templates": str(identity_templates_path),
             "image_templates": str(template_dir),
             "eval_dir": str(output_dir / "eval_hardnet_l2"),
+            "checkpoint": str(checkpoint),
+            "checkpoint_metadata": checkpoint_metadata,
+            "descriptor_dim": int(descriptor_dim),
+            "evaluation_dataset": resolve_path(
+                config,
+                dict(config.get("data", {})).get("image_root", ""),
+            ).name,
             "effective_config": result["metrics"].get("effective_config"),
             "run_settings": {
                 "output_dir": str(output_dir),

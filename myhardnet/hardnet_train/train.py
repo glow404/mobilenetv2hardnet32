@@ -45,10 +45,14 @@ from hardnet_train.loss import HardNetLoss, normalize_hard_negative_strategy
 from hardnet_train.metrics import RunningMean
 from hardnet_train.model import (
     build_descriptor_model,
+    checkpoint_descriptor_dim,
     checkpoint_model_architecture,
     count_parameters,
+    estimate_macs_per_patch,
     model_architecture,
+    model_descriptor_dim,
     normalize_model_architecture,
+    resolve_descriptor_dim,
 )
 from hardnet_train.optim import build_optimizer, normalize_optimizer_name, optimizer_name
 from hardnet_train.validation import (
@@ -78,6 +82,16 @@ def resolve_path(config: dict[str, Any], raw_path: str | Path) -> Path:
     if path.is_absolute():
         return path
     return (Path(config["_config_path"]).parent / path).resolve()
+
+
+def default_output_dir(architecture: str) -> str:
+    """返回统一训练配置在各架构下互不冲突的默认输出目录。"""
+
+    return {
+        "hardnet_strong_v2": "../outputs/models/hardnet_train_strong_v2_256",
+        "mobile_hardnet": "../outputs/models/hardnet_train_mobile_128",
+        "hardnet": "../outputs/models/hardnet_train_hardnet_128",
+    }[normalize_model_architecture(architecture)]
 
 
 def resolve_resume_checkpoint(
@@ -353,18 +367,35 @@ def save_checkpoint(
     global_step: int,
     metrics: dict[str, float],
     scaler: torch.amp.GradScaler | None = None,
+    model_macs_per_patch: int | None = None,
 ) -> None:
     """保存模型、优化器、配置和当前验证指标。"""
     path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_config = {
+        key: value for key, value in config.items() if key != "_config_path"
+    }
     payload = {
         "epoch": epoch,
         "global_step": global_step,
+        "checkpoint_format_version": 2,
+        "training_task": "float_descriptor",
+        "descriptor_kind": "float",
+        "descriptor_metric": "l2",
         "model_architecture": model_architecture(model),
+        "descriptor_dim": model_descriptor_dim(model),
+        "model_parameter_count": count_parameters(model),
+        "model_macs_per_patch": (
+            estimate_macs_per_patch(model)
+            if model_macs_per_patch is None
+            else int(model_macs_per_patch)
+        ),
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "optimizer_name": optimizer_name(optimizer),
         "metrics": metrics,
-        "config": {key: value for key, value in config.items() if key != "_config_path"},
+        # ``config`` 保留旧读取方兼容；``resolved_config`` 明确表示已应用命令行覆盖。
+        "config": resolved_config,
+        "resolved_config": resolved_config,
     }
     if scaler is not None and scaler.is_enabled():
         payload["amp_scaler"] = scaler.state_dict()
@@ -398,6 +429,13 @@ def load_checkpoint(
         raise ValueError(
             "Checkpoint architecture mismatch: "
             f"checkpoint={saved_architecture}, model={current_architecture}."
+        )
+    saved_descriptor_dim = checkpoint_descriptor_dim(checkpoint)
+    current_descriptor_dim = model_descriptor_dim(model)
+    if saved_descriptor_dim != current_descriptor_dim:
+        raise ValueError(
+            "Checkpoint descriptor dimension mismatch: "
+            f"checkpoint={saved_descriptor_dim}, model={current_descriptor_dim}."
         )
     model.load_state_dict(checkpoint["model"])
     saved_optimizer_name = checkpoint.get("optimizer_name")
@@ -677,7 +715,10 @@ def main() -> None:
     model_cfg["architecture"] = normalize_model_architecture(
         model_cfg.get("architecture")
     )
-    model_cfg["descriptor_dim"] = int(model_cfg.get("descriptor_dim", 128))
+    model_cfg["descriptor_dim"] = resolve_descriptor_dim(
+        model_cfg["architecture"],
+        model_cfg.get("descriptor_dim"),
+    )
     train_cfg["hard_negative_strategy"] = normalize_hard_negative_strategy(train_cfg.get("hard_negative_strategy", "same_finger_allowed"))
     train_cfg["hard_negative_top_k"] = int(train_cfg.get("hard_negative_top_k", 3))
     if train_cfg["hard_negative_top_k"] < 1:
@@ -685,7 +726,13 @@ def main() -> None:
             f"training.hard_negative_top_k must be >= 1, got {train_cfg['hard_negative_top_k']}."
         )
 
-    output_dir = resolve_path(config, config.get("output_dir", "../outputs/hardnet_train"))
+    configured_output_dir = config.get("output_dir")
+    if configured_output_dir is None or str(configured_output_dir).strip().lower() in {
+        "",
+        "auto",
+    }:
+        config["output_dir"] = default_output_dir(model_cfg["architecture"])
+    output_dir = resolve_path(config, config["output_dir"])
     resume_arg = "auto" if args.resume_auto else args.resume
     resume_path = resolve_resume_checkpoint(
         output_dir=output_dir,
@@ -749,9 +796,12 @@ def main() -> None:
         if optimizer_name(optimizer) == "sgd"
         else f"betas={optim_cfg.get('betas', [0.9, 0.999])} eps={optim_cfg.get('eps', 1e-8)}"
     )
+    model_macs_per_patch = estimate_macs_per_patch(model)
     print(
         f"device={device} architecture={model_architecture(model)} "
-        f"params={count_parameters(model)} batch={batch_size} "
+        f"descriptor_dim={model_descriptor_dim(model)} "
+        f"params={count_parameters(model)} macs_per_patch={model_macs_per_patch} "
+        f"batch={batch_size} "
         f"fingers_per_batch={train_cfg.get('fingers_per_batch', 8)} "
         f"dropout={model_cfg.get('dropout', 0.1)} optimizer={optimizer_name(optimizer)} "
         f"lr={optim_cfg.get('lr', 0.1)} {optimizer_detail} "
@@ -835,6 +885,7 @@ def main() -> None:
             global_step,
             val_metrics,
             scaler=scaler,
+            model_macs_per_patch=model_macs_per_patch,
         )
         # 固定协议的 FPR@TPR=95% 越低越好，以它选择 best checkpoint。
         current_fpr_at_tpr95 = val_metrics["fpr_at_tpr95"]
@@ -849,6 +900,7 @@ def main() -> None:
                 global_step,
                 val_metrics,
                 scaler=scaler,
+                model_macs_per_patch=model_macs_per_patch,
             )
 
         # 只有相对下降达到 min_delta，才重置早停计数。

@@ -92,6 +92,12 @@ def score_query_against_identity(
         if not 0.0 <= early_stop_threshold <= 1.0:
             raise ValueError(f"early_stop_threshold must be in [0,1], got {early_stop_threshold}")
     require = "sift" if str(descriptor_source).lower() in {"sift", "rootsift"} else "hardnet"
+    low_unique_inliers = int(
+        dict(config.get("texture_verification", {})).get(
+            "low_unique_inliers",
+            3,
+        )
+    )
 
     results: list[dict[str, Any]] = []
     best_index = -1
@@ -167,6 +173,10 @@ def score_query_against_identity(
     )
     return {
         "score": identity_score,
+        "descriptor_source": str(best.get("descriptor_source", descriptor_source)),
+        "descriptor_kind": str(best.get("descriptor_kind", "float")),
+        "descriptor_metric": str(best.get("descriptor_metric", "l2")),
+        "descriptor_dim": int(best.get("descriptor_dim", 0)),
         "best_template_path": paths[best_index] if best_index >= 0 else "",
         "best_template_image_id": str(best_template.get("image_id", "")),
         "best_template_image_path": str(best_template.get("image_path", "")),
@@ -177,6 +187,63 @@ def score_query_against_identity(
         "best_image_score": float(best.get("score", 0.0)),
         "best_quality_score": float(best.get("quality_score", 0.0)),
         "num_raw_matches": int(best.get("num_raw_matches", 0)),
+        "num_abs_distance_pass": int(best.get("num_abs_distance_pass", 0)),
+        "num_one_way_ratio_pass": int(best.get("num_one_way_ratio_pass", 0)),
+        "num_ratio_pass": int(best.get("num_ratio_pass", 0)),
+        "num_queries_with_candidates": int(best.get("num_queries_with_candidates", 0)),
+        "candidate_query_coverage": float(best.get("candidate_query_coverage", 0.0)),
+        "templates_with_candidates": sum(
+            int(item.get("num_candidates", 0) > 0) for item in results
+        ),
+        "templates_with_abs_distance_pass": sum(
+            int(item.get("num_abs_distance_pass", 0) > 0) for item in results
+        ),
+        "templates_with_ratio_pass": sum(
+            int(item.get("num_ratio_pass", 0) > 0) for item in results
+        ),
+        "templates_with_ransac_success": sum(
+            int(bool(item.get("ransac_success", False))) for item in results
+        ),
+        "templates_with_unique_inlier_ready": sum(
+            int(int(item.get("unique_inliers", 0)) >= low_unique_inliers)
+            for item in results
+        ),
+        "templates_with_texture_evaluated": sum(
+            int(bool(item.get("texture_evaluated", False))) for item in results
+        ),
+        "templates_with_texture_available": sum(
+            int(bool(item.get("texture_available", False))) for item in results
+        ),
+        "templates_with_fused_score": sum(
+            int(str(item.get("texture_decision", "")) == "fused_score")
+            for item in results
+        ),
+        "max_candidate_query_coverage": max(
+            (float(item.get("candidate_query_coverage", 0.0)) for item in results),
+            default=0.0,
+        ),
+        "max_num_candidates": max(
+            (int(item.get("num_candidates", 0)) for item in results),
+            default=0,
+        ),
+        "max_raw_inliers": max(
+            (int(item.get("raw_inliers", 0)) for item in results),
+            default=0,
+        ),
+        "max_unique_inliers": max(
+            (int(item.get("unique_inliers", 0)) for item in results),
+            default=0,
+        ),
+        "max_geometry_similarity": max(
+            (float(item.get("geometry_similarity", 0.0)) for item in results),
+            default=0.0,
+        ),
+        "max_texture_similarity": max(
+            (float(item.get("texture_similarity", 0.0)) for item in results),
+            default=0.0,
+        ),
+        "ransac_success": int(bool(best.get("ransac_success", False))),
+        "scale_rejected": int(bool(best.get("scale_rejected", False))),
         "num_candidates": int(best.get("num_candidates", 0)),
         "num_inliers": int(best.get("num_inliers", 0)),
         "raw_inliers": int(best.get("raw_inliers", 0)),

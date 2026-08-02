@@ -41,6 +41,7 @@ SCORE_FIELDNAMES = [
     # 每一行代表一次 query 对某个 owner_identity 的验证尝试。
     "query_id",
     "query_identity",
+    "evaluation_partition",
     "owner_identity",
     "label",
     "score",
@@ -57,6 +58,27 @@ SCORE_FIELDNAMES = [
     "best_image_score",
     "best_quality_score",
     "num_raw_matches",
+    "num_abs_distance_pass",
+    "num_one_way_ratio_pass",
+    "num_ratio_pass",
+    "num_queries_with_candidates",
+    "candidate_query_coverage",
+    "templates_with_candidates",
+    "templates_with_abs_distance_pass",
+    "templates_with_ratio_pass",
+    "templates_with_ransac_success",
+    "templates_with_unique_inlier_ready",
+    "templates_with_texture_evaluated",
+    "templates_with_texture_available",
+    "templates_with_fused_score",
+    "max_candidate_query_coverage",
+    "max_num_candidates",
+    "max_raw_inliers",
+    "max_unique_inliers",
+    "max_geometry_similarity",
+    "max_texture_similarity",
+    "ransac_success",
+    "scale_rejected",
     "num_candidates",
     "num_inliers",
     "raw_inliers",
@@ -108,6 +130,60 @@ def parse_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def classify_false_reject(
+    row: dict[str, Any],
+    threshold: float,
+    config: dict[str, Any],
+) -> str:
+    """按最早失败阶段分类 genuine identity attempt，不改变任何匹配判定。"""
+
+    def integer(name: str) -> int:
+        value = parse_float(row.get(name))
+        return int(value) if value is not None else 0
+
+    def number(name: str) -> float:
+        value = parse_float(row.get(name))
+        return float(value) if value is not None else 0.0
+
+    matching_cfg = dict(config.get("matching", {}))
+    texture_cfg = dict(config.get("texture_verification", {}))
+    candidate_policy = str(
+        matching_cfg.get("candidate_policy", "topk_or_ratio")
+    ).lower()
+    if integer("templates_with_candidates") == 0:
+        if integer("templates_with_abs_distance_pass") == 0:
+            return "descriptor_distance_reject"
+        if (
+            candidate_policy in {"ratio_only", "topk_or_ratio"}
+            and integer("templates_with_ratio_pass") == 0
+        ):
+            return "ratio_reject"
+        return "candidate_insufficient"
+    if integer("templates_with_ransac_success") == 0:
+        if integer("scale_rejected") > 0:
+            return "ransac_scale_reject"
+        return "ransac_failed"
+
+    low_unique = int(texture_cfg.get("low_unique_inliers", 3))
+    if integer("templates_with_unique_inlier_ready") == 0:
+        return "unique_inlier_insufficient"
+    if bool(texture_cfg.get("enabled", False)):
+        if (
+            integer("templates_with_texture_evaluated") > 0
+            and integer("templates_with_texture_available") == 0
+        ):
+            return "texture_unavailable"
+        if (
+            integer("templates_with_fused_score") > 0
+            and number("max_geometry_similarity") >= threshold
+            and number("score") < threshold
+        ):
+            return "texture_fusion_reject"
+    if float(threshold) - number("score") <= 0.05:
+        return "threshold_edge"
+    return "score_below_threshold"
 
 
 def timing_percentile(values: list[float], q: float) -> float | None:
@@ -189,10 +265,175 @@ def summarize_score_components(score_rows: list[dict[str, str]], threshold: floa
     }
 
 
+def summarize_matching_stages(
+    score_rows: list[dict[str, str]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """汇总 identity attempt 在候选、RANSAC 和 unique-inlier 阶段的通过率。"""
+
+    low_unique = int(
+        dict(config.get("texture_verification", {})).get(
+            "low_unique_inliers",
+            3,
+        )
+    )
+    groups: dict[str, list[dict[str, str]]] = {"genuine": [], "impostor": []}
+    for row in score_rows:
+        name = "genuine" if int(row.get("label", 0)) == 1 else "impostor"
+        groups[name].append(row)
+
+    def value(row: dict[str, str], name: str) -> float:
+        parsed = parse_float(row.get(name))
+        return float(parsed) if parsed is not None else 0.0
+
+    summary: dict[str, Any] = {
+        "definition": (
+            "attempt 级覆盖率；candidate_ready 表示至少一张注册模板产生候选，"
+            "不是带点对应标注的 descriptor recall@K。"
+        ),
+        "low_unique_inliers": low_unique,
+    }
+    for name, rows in groups.items():
+        count = len(rows)
+        denominator = max(count, 1)
+        summary[name] = {
+            "count": count,
+            "candidate_ready": sum(
+                value(row, "templates_with_candidates") > 0 for row in rows
+            ),
+            "candidate_ready_rate": sum(
+                value(row, "templates_with_candidates") > 0 for row in rows
+            )
+            / denominator,
+            "ratio_ready_rate": sum(
+                value(row, "templates_with_ratio_pass") > 0 for row in rows
+            )
+            / denominator,
+            "ransac_success_rate": sum(
+                value(row, "templates_with_ransac_success") > 0 for row in rows
+            )
+            / denominator,
+            "unique_inlier_ready_rate": sum(
+                value(row, "templates_with_unique_inlier_ready") > 0 for row in rows
+            )
+            / denominator,
+            "texture_available_rate": sum(
+                value(row, "templates_with_texture_available") > 0 for row in rows
+            )
+            / denominator,
+            "fused_score_ready_rate": sum(
+                value(row, "templates_with_fused_score") > 0 for row in rows
+            )
+            / denominator,
+            "mean_best_candidates": sum(
+                value(row, "num_candidates") for row in rows
+            )
+            / denominator,
+            "mean_best_raw_inliers": sum(
+                value(row, "raw_inliers") for row in rows
+            )
+            / denominator,
+            "mean_best_unique_inliers": sum(
+                value(row, "unique_inliers") for row in rows
+            )
+            / denominator,
+            "mean_max_unique_inliers": sum(
+                value(row, "max_unique_inliers") for row in rows
+            )
+            / denominator,
+            "mean_max_candidate_query_coverage": sum(
+                value(row, "max_candidate_query_coverage") for row in rows
+            )
+            / denominator,
+            "mean_best_reprojection_error": sum(
+                value(row, "mean_reproj_error") for row in rows
+            )
+            / denominator,
+        }
+    return summary
+
+
 def select_query_rows(metadata_rows: list[dict[str, str]]) -> list[dict[str, str]]:
     """从 split metadata 中取出 query 图像行。"""
 
     return [row for row in metadata_rows if str(row.get("split", "")).lower() == "query"]
+
+
+def partition_query_rows(
+    metadata_rows: list[dict[str, str]],
+    config: dict[str, Any],
+) -> list[dict[str, str]]:
+    """把固定 enrollment/query 划分中的 query 再拆成 validation/test。
+
+    划分按 identity 独立进行，并使用稳定的 ``SeedSequence`` 子种子，避免
+    Python 进程 hash 随机化影响实验复现。genuine 与该 query 的全部 impostor
+    attempts 会继承同一个 partition，不能在 attempt 级别重新抽样。
+    """
+
+    rows = [dict(row) for row in metadata_rows]
+    query_rows = [row for row in rows if str(row.get("split", "")).lower() == "query"]
+    if not query_rows:
+        raise ValueError("No query rows found in split metadata.")
+    if all(str(row.get("evaluation_partition", "")).strip() for row in query_rows):
+        return rows
+
+    evaluation_cfg = dict(config.get("evaluation", {}))
+    fraction = float(evaluation_cfg.get("validation_query_fraction", 0.5))
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(
+            "evaluation.validation_query_fraction must be between 0 and 1, "
+            f"got {fraction}."
+        )
+    configured_count = evaluation_cfg.get("validation_query_count")
+    validation_count = None if configured_count in {None, ""} else int(configured_count)
+    if validation_count is not None and validation_count < 1:
+        raise ValueError(
+            f"evaluation.validation_query_count must be positive, got {validation_count}."
+        )
+    base_seed = int(
+        evaluation_cfg.get(
+            "query_partition_seed",
+            int(dict(config.get("enrollment", {})).get("random_seed", 42)) + 100_000,
+        )
+    )
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for row in query_rows:
+        grouped.setdefault(str(row.get("query_identity", row.get("identity_id", ""))), []).append(row)
+
+    partition_by_key: dict[tuple[str, str], str] = {}
+    for group_index, identity_id in enumerate(sorted(grouped)):
+        identity_rows = sorted(grouped[identity_id], key=lambda item: str(item.get("image_id", "")))
+        count = len(identity_rows)
+        if count < 2:
+            raise ValueError(
+                "Each identity needs at least two query images for validation/test "
+                f"partitioning: identity={identity_id!r}, count={count}."
+            )
+        count_for_validation = (
+            validation_count
+            if validation_count is not None
+            else int(round(count * fraction))
+        )
+        count_for_validation = max(1, min(count - 1, count_for_validation))
+        child_seed = np.random.SeedSequence([base_seed, group_index])
+        permutation = np.random.default_rng(child_seed).permutation(count)
+        validation_indices = set(int(index) for index in permutation[:count_for_validation])
+        for index, row in enumerate(identity_rows):
+            partition_by_key[(identity_id, str(row.get("image_id", "")))] = (
+                "validation" if index in validation_indices else "test"
+            )
+
+    for row in rows:
+        split = str(row.get("split", "")).lower()
+        if split == "query":
+            identity_id = str(row.get("query_identity", row.get("identity_id", "")))
+            image_id = str(row.get("image_id", ""))
+            row["evaluation_partition"] = partition_by_key[(identity_id, image_id)]
+        elif split == "enrollment":
+            row["evaluation_partition"] = "enrollment"
+        else:
+            row["evaluation_partition"] = split or "unknown"
+    return rows
 
 
 def rate_at_threshold(labels: np.ndarray, scores: np.ndarray, threshold: float) -> dict[str, Any]:
@@ -242,6 +483,13 @@ def build_threshold_curve(labels: np.ndarray, scores: np.ndarray, config: dict[s
         count = int(math.ceil(1.0 / step))
         auto = [min(index * step, 1.0) for index in range(count + 1)]
         thresholds.extend(auto)
+    # 网格只用于画曲线，实际分数也必须纳入候选阈值；否则低 FAR 区域可能
+    # 被 0.01 的粗粒度跳过，导致 validation 选出的阈值无法精确复现。
+    thresholds.extend(
+        float(score)
+        for score in np.asarray(scores).reshape(-1)
+        if np.isfinite(score)
+    )
     thresholds = sorted({round(value, 10) for value in thresholds if 0.0 <= value <= 1.0})
     return [rate_at_threshold(labels, scores, threshold) for threshold in thresholds]
 
@@ -347,7 +595,16 @@ def select_target_operating_threshold(curve: list[dict[str, Any]], target_far: f
     }
 
 
-def compute_metrics(labels: np.ndarray, scores: np.ndarray, selected_threshold: float, far_points: list[float], curve: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+def compute_metrics(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    selected_threshold: float,
+    far_points: list[float],
+    curve: list[dict[str, Any]],
+    config: dict[str, Any],
+    *,
+    select_operating_point: bool = True,
+) -> dict[str, Any]:
     """汇总全局指标。
 
     输出包括：
@@ -368,7 +625,11 @@ def compute_metrics(labels: np.ndarray, scores: np.ndarray, selected_threshold: 
         "eer_threshold": None,
         "tar_at_far": {str(point): None for point in far_points},
         "recommended_threshold": recommend_unlock_threshold(curve, far_points),
-        "target_operating_point": select_target_operating_threshold(curve, target_far, target_frr),
+        "target_operating_point": (
+            select_target_operating_threshold(curve, target_far, target_frr)
+            if select_operating_point
+            else None
+        ),
     }
     if labels.size == 0 or len(np.unique(labels)) < 2:
         return metrics
@@ -418,6 +679,7 @@ def build_effective_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
     snapshot: dict[str, Any] = {}
     for key in (
         "output",
+        "experiment",
         "runtime",
         "data",
         "model",
@@ -463,6 +725,8 @@ def build_effective_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
 
     if config.get("_config_path"):
         snapshot["source_config_path"] = str(config.get("_config_path"))
+    if config.get("_config_sources"):
+        snapshot["source_config_chain"] = list(config.get("_config_sources", []))
     return snapshot
 
 
@@ -592,10 +856,16 @@ def export_failure_cases(
             failure_type = "false_accept"
         if not failure_type:
             continue
+        failure_stage = (
+            classify_false_reject(row, threshold, config)
+            if failure_type == "false_reject"
+            else "impostor_score_above_threshold"
+        )
         failures.append(
             {
                 "case_index": index,
                 "failure_type": failure_type,
+                "failure_stage": failure_stage,
                 "threshold": threshold,
                 "score": score,
                 "query_id": row.get("query_id", ""),
@@ -609,12 +879,27 @@ def export_failure_cases(
                 "best_image_score": row.get("best_image_score", ""),
                 "best_quality_score": row.get("best_quality_score", ""),
                 "num_raw_matches": row.get("num_raw_matches", ""),
+                "num_abs_distance_pass": row.get("num_abs_distance_pass", ""),
+                "num_one_way_ratio_pass": row.get("num_one_way_ratio_pass", ""),
+                "num_ratio_pass": row.get("num_ratio_pass", ""),
+                "num_queries_with_candidates": row.get("num_queries_with_candidates", ""),
+                "candidate_query_coverage": row.get("candidate_query_coverage", ""),
+                "templates_with_candidates": row.get("templates_with_candidates", ""),
+                "templates_with_abs_distance_pass": row.get("templates_with_abs_distance_pass", ""),
+                "templates_with_ratio_pass": row.get("templates_with_ratio_pass", ""),
+                "templates_with_ransac_success": row.get("templates_with_ransac_success", ""),
+                "ransac_success": row.get("ransac_success", ""),
+                "scale_rejected": row.get("scale_rejected", ""),
                 "num_candidates": row.get("num_candidates", ""),
                 "raw_inliers": row.get("raw_inliers", ""),
                 "unique_inliers": row.get("unique_inliers", ""),
                 "mean_l2_distance": row.get("mean_l2_distance", ""),
                 "mean_reproj_error": row.get("mean_reproj_error", ""),
                 "orientation_consistency": row.get("orientation_consistency", ""),
+                "geometry_similarity": row.get("geometry_similarity", ""),
+                "texture_available": row.get("texture_available", ""),
+                "texture_similarity": row.get("texture_similarity", ""),
+                "texture_decision": row.get("texture_decision", ""),
             }
         )
 
@@ -659,10 +944,15 @@ def export_failure_cases(
             exported.append(enriched)
 
     write_csv_rows(root / "failure_cases_exported.csv", exported)
+    failure_stage_counts: dict[str, int] = {}
+    for item in failures:
+        stage = str(item.get("failure_stage", "unknown"))
+        failure_stage_counts[stage] = failure_stage_counts.get(stage, 0) + 1
     summary = {
         "enabled": True,
         "threshold": threshold,
         "target_satisfied": bool(threshold_info.get("satisfied", False)),
+        "failure_stage_counts": failure_stage_counts,
         "num_false_rejects": len(ordered["false_reject"]),
         "num_false_accepts": len(ordered["false_accept"]),
         "num_exported_false_rejects": min(len(ordered["false_reject"]), max_cases) if max_cases > 0 else len(ordered["false_reject"]),
@@ -820,7 +1110,8 @@ def run_descriptor_l2_evaluation(
     if source not in {"hardnet", "sift"}:
         raise ValueError(f"unsupported descriptor_source: {descriptor_source}")
     identities = load_identity_templates(identity_templates_path)
-    rows = read_csv_rows(metadata_path)
+    rows = partition_query_rows(read_csv_rows(metadata_path), config)
+    write_csv_rows(out / "metadata_with_eval_partition.csv", rows)
     query_rows = select_query_rows(rows)
     identification_cfg = dict(config.get("identification", {}))
     evaluation_cfg = dict(config.get("evaluation", {}))
@@ -877,6 +1168,7 @@ def run_descriptor_l2_evaluation(
                     {
                         "query_id": row["image_id"],
                         "query_identity": true_identity,
+                        "evaluation_partition": row.get("evaluation_partition", "unknown"),
                         "owner_identity": owner,
                         "label": int(is_genuine),
                         "score": score,
@@ -891,56 +1183,207 @@ def run_descriptor_l2_evaluation(
                     }
                 )
 
-    # 第二遍：读取分数 CSV，统一计算指标和目标阈值。
+    # 第二遍：按 query partition 选阈值，再在独立 test partition 上冻结报告。
     score_rows = read_csv_rows(scores_path)
-    labels = np.asarray([int(row["label"]) for row in score_rows], dtype=np.int32)
-    scores = np.asarray([float(row["score"]) for row in score_rows], dtype=np.float32)
-    curve = build_threshold_curve(labels, scores, config)
-    metrics = compute_metrics(labels, scores, selected_threshold, far_points, curve, config)
-    target = metrics.get("target_operating_point") or {}
-    target_threshold = float(target.get("threshold", selected_threshold))
-    # 额外写一份带 target threshold 判定结果的 CSV，方便后续人工筛选。
+    validation_rows = [
+        row for row in score_rows
+        if str(row.get("evaluation_partition", "")).lower() == "validation"
+    ]
+    test_rows = [
+        row for row in score_rows
+        if str(row.get("evaluation_partition", "")).lower() == "test"
+    ]
+    if not validation_rows or not test_rows:
+        raise ValueError(
+            "Both validation and test query partitions are required: "
+            f"validation_attempts={len(validation_rows)}, test_attempts={len(test_rows)}."
+        )
+
+    validation_labels = np.asarray(
+        [int(row["label"]) for row in validation_rows],
+        dtype=np.int32,
+    )
+    validation_scores = np.asarray(
+        [float(row["score"]) for row in validation_rows],
+        dtype=np.float32,
+    )
+    validation_curve = build_threshold_curve(validation_labels, validation_scores, config)
+    validation_metrics = compute_metrics(
+        validation_labels,
+        validation_scores,
+        selected_threshold,
+        far_points,
+        validation_curve,
+        config,
+    )
+    selected_target = validation_metrics.get("target_operating_point") or {}
+    frozen_threshold = float(selected_target.get("threshold", selected_threshold))
+
+    test_labels = np.asarray(
+        [int(row["label"]) for row in test_rows],
+        dtype=np.int32,
+    )
+    test_scores = np.asarray(
+        [float(row["score"]) for row in test_rows],
+        dtype=np.float32,
+    )
+    test_curve = build_threshold_curve(test_labels, test_scores, config)
+    test_metrics = compute_metrics(
+        test_labels,
+        test_scores,
+        frozen_threshold,
+        far_points,
+        test_curve,
+        config,
+        select_operating_point=False,
+    )
+    metrics = {
+        **test_metrics,
+        "selected_threshold": frozen_threshold,
+        "configured_threshold": selected_threshold,
+        "threshold_selection": {
+            "partition": "validation",
+            "validation_metrics": validation_metrics,
+            "frozen_threshold": frozen_threshold,
+            "test_threshold_selection_disabled": True,
+        },
+        "validation_metrics": validation_metrics,
+        "test_metrics": test_metrics,
+    }
+    test_fixed = test_metrics.get("fixed_threshold") or {}
+    target = {
+        **selected_target,
+        "threshold": frozen_threshold,
+        "far": test_fixed.get("far"),
+        "frr": test_fixed.get("frr"),
+        "tar": test_fixed.get("tar"),
+        "genuine_accept": test_fixed.get("genuine_accept"),
+        "genuine_reject": test_fixed.get("genuine_reject"),
+        "genuine_total": test_fixed.get("genuine_total"),
+        "impostor_accept": test_fixed.get("impostor_accept"),
+        "impostor_reject": test_fixed.get("impostor_reject"),
+        "impostor_total": test_fixed.get("impostor_total"),
+        "selection_reason": selected_target.get("reason", ""),
+        "reason": "frozen_test_metrics",
+        "satisfied": bool(
+            test_fixed.get("far") is not None
+            and test_fixed.get("frr") is not None
+            and float(test_fixed["far"]) < float(selected_target.get("target_far", 1.0))
+            and float(test_fixed["frr"]) < float(selected_target.get("target_frr", 1.0))
+        ),
+        "validation_selection": selected_target,
+    }
+    # 写入冻结阈值下的 acceptance/failure 字段；这些字段不能在模板匹配时
+    # 用配置中的旧阈值提前计算，否则报告会混淆 validation 选模和 test 验收。
     for row in score_rows:
         score = float(row["score"])
-        row["accepted_at_target_threshold"] = int(score >= target_threshold)
-        row["target_failure_type"] = "false_reject" if int(row["label"]) == 1 and score < target_threshold else ("false_accept" if int(row["label"]) == 0 and score >= target_threshold else "")
-    write_csv_rows(out / "verification_scores_target_threshold.csv", score_rows)
-    unlock_timing = write_unlock_timing_report(score_rows, out)
-    failure_summary = export_failure_cases(score_rows, metrics.get("target_operating_point"), out, config) if export_failures else {"enabled": False, "reason": "export_failures_false"}
+        row["accepted_at_selected_threshold"] = int(score >= frozen_threshold)
+        row["accepted_at_target_threshold"] = int(score >= frozen_threshold)
+        row["target_failure_type"] = (
+            "false_reject"
+            if int(row["label"]) == 1 and score < frozen_threshold
+            else (
+                "false_accept"
+                if int(row["label"]) == 0 and score >= frozen_threshold
+                else ""
+            )
+        )
+    write_csv_rows(out / "verification_scores.csv", score_rows)
+    write_csv_rows(out / "verification_scores_frozen_threshold.csv", score_rows)
+    validation_official_rows = [
+        row for row in score_rows
+        if str(row.get("evaluation_partition", "")).lower() == "validation"
+    ]
+    official_rows = [
+        row for row in score_rows
+        if str(row.get("evaluation_partition", "")).lower() == "test"
+    ]
+    write_csv_rows(out / "verification_scores_validation.csv", validation_official_rows)
+    write_csv_rows(out / "verification_scores_test.csv", official_rows)
+    unlock_timing = write_unlock_timing_report(official_rows, out)
+    failure_summary = (
+        export_failure_cases(official_rows, target, out, config)
+        if export_failures
+        else {"enabled": False, "reason": "export_failures_false"}
+    )
     effective_config = build_effective_config_snapshot(scoring_config)
     template_management_summary = {
         "enabled": False,
         "requested_in_config": bool(management_cfg.get("enabled", False)),
         "reason": "offline_calibration_never_updates_templates",
     }
+    def unique_query_count(partition_rows: list[dict[str, str]]) -> int:
+        """按身份与图像联合键计数；不同身份可以共享 ``pair_N`` 图像名。"""
+
+        return len(
+            {
+                (str(row.get("query_identity", "")), str(row.get("query_id", "")))
+                for row in partition_rows
+            }
+        )
+
+    partition_query_counts = {
+        "validation": unique_query_count(validation_rows),
+        "test": unique_query_count(test_rows),
+    }
     metrics.update(
         {
             "descriptor_source": source,
             "matching_backend": matching_backend_name(source, scoring_config),
-            "num_queries": len(query_rows),
+            "num_query_pool": len(query_rows),
+            "num_validation_queries": partition_query_counts["validation"],
+            "num_test_queries": partition_query_counts["test"],
+            "num_queries": partition_query_counts["test"],
+            "evaluation_partition_for_metrics": "test",
+            "query_partition_counts": partition_query_counts,
             "num_identities": len(identities),
-            "num_match_attempts": len(score_rows),
-            "num_genuine_attempts": int(np.sum(labels == 1)),
-            "num_impostor_attempts": int(np.sum(labels == 0)),
+            "num_match_attempts": len(official_rows),
+            "num_match_attempts_all_partitions": len(score_rows),
+            "num_genuine_attempts": int(np.sum(test_labels == 1)),
+            "num_impostor_attempts": int(np.sum(test_labels == 0)),
+            "num_genuine_attempts_all_partitions": int(
+                sum(int(row["label"]) == 1 for row in score_rows)
+            ),
+            "num_impostor_attempts_all_partitions": int(
+                sum(int(row["label"]) == 0 for row in score_rows)
+            ),
             "fusion_method": fusion_method,
-            "scoring_mode": "offline_full_threshold_calibration",
+            "scoring_mode": "validation_threshold_selection_test_frozen",
             "offline_full_template_scoring": True,
             "early_stop_on_unlock_threshold": False,
             "early_stop_threshold": None,
             "max_impostor_identities_per_query": max_impostors,
+            "target_operating_point": target,
             "matching_config": dict(scoring_config.get("matching", {})),
             "texture_verification_config": dict(scoring_config.get("texture_verification", {})),
             "template_management": template_management_summary,
-            "score_component_summary": summarize_score_components(score_rows, selected_threshold),
+            "score_component_summary": summarize_score_components(
+                official_rows,
+                frozen_threshold,
+            ),
+            "score_component_summary_validation": summarize_score_components(
+                validation_rows,
+                float(validation_metrics["selected_threshold"]),
+            ),
+            "matching_stage_summary": summarize_matching_stages(
+                official_rows,
+                scoring_config,
+            ),
+            "matching_stage_summary_validation": summarize_matching_stages(
+                validation_rows,
+                scoring_config,
+            ),
             "effective_config": effective_config,
             "unlock_timing": unlock_timing,
             "failure_export": failure_summary,
         }
     )
-    write_csv_rows(out / "match_score_threshold_curve.csv", curve)
+    write_csv_rows(out / "match_score_threshold_curve.csv", validation_curve)
+    write_csv_rows(out / "match_score_threshold_curve_validation.csv", validation_curve)
+    write_csv_rows(out / "match_score_threshold_curve_test.csv", test_curve)
     write_json(out / "metrics.json", metrics)
     write_yaml(out / "effective_config.yaml", effective_config)
-    write_plots(labels, scores, curve, selected_threshold, out)
+    write_plots(test_labels, test_scores, test_curve, frozen_threshold, out)
     return {"metrics": metrics, "scores_path": str(scores_path)}
 
 
@@ -975,10 +1418,17 @@ def summary_row(metrics: dict[str, Any], far_points: list[float]) -> dict[str, A
     target = metrics.get("target_operating_point") or {}
     failure_export = metrics.get("failure_export") or {}
     texture_config = metrics.get("texture_verification_config") or {}
+    stage_summary = metrics.get("matching_stage_summary") or {}
+    genuine_stages = stage_summary.get("genuine") or {}
     row: dict[str, Any] = {
         "descriptor_source": metrics.get("descriptor_source", "hardnet"),
         "matching_backend": metrics.get("matching_backend", "hardnet_l2_unknown_ransac"),
         "num_queries": metrics.get("num_queries", ""),
+        "num_query_pool": metrics.get("num_query_pool", ""),
+        "num_validation_queries": metrics.get("num_validation_queries", ""),
+        "num_test_queries": metrics.get("num_test_queries", ""),
+        "evaluation_partition_for_metrics": metrics.get("evaluation_partition_for_metrics", ""),
+        "configured_threshold": metrics.get("configured_threshold", ""),
         "num_identities": metrics.get("num_identities", ""),
         "num_match_attempts": metrics.get("num_match_attempts", ""),
         "num_genuine_attempts": metrics.get("num_genuine_attempts", ""),
@@ -991,7 +1441,21 @@ def summary_row(metrics: dict[str, Any], far_points: list[float]) -> dict[str, A
         "geometry_weight": texture_config.get("geometry_weight", ""),
         "texture_weight": texture_config.get("texture_weight", ""),
         "geometry_saturation_inliers": texture_config.get("geometry_saturation_inliers", ""),
+        "genuine_candidate_ready_rate": genuine_stages.get("candidate_ready_rate", ""),
+        "genuine_ratio_ready_rate": genuine_stages.get("ratio_ready_rate", ""),
+        "genuine_ransac_success_rate": genuine_stages.get("ransac_success_rate", ""),
+        "genuine_unique_inlier_ready_rate": genuine_stages.get("unique_inlier_ready_rate", ""),
+        "genuine_texture_available_rate": genuine_stages.get("texture_available_rate", ""),
+        "genuine_fused_score_ready_rate": genuine_stages.get("fused_score_ready_rate", ""),
+        "genuine_mean_best_candidates": genuine_stages.get("mean_best_candidates", ""),
+        "genuine_mean_best_unique_inliers": genuine_stages.get("mean_best_unique_inliers", ""),
+        "genuine_mean_max_unique_inliers": genuine_stages.get("mean_max_unique_inliers", ""),
+        "genuine_mean_max_candidate_query_coverage": genuine_stages.get("mean_max_candidate_query_coverage", ""),
         "selected_threshold": metrics.get("selected_threshold", ""),
+        "validation_selected_threshold": (metrics.get("validation_metrics") or {}).get("selected_threshold", ""),
+        "validation_fixed_far": ((metrics.get("validation_metrics") or {}).get("fixed_threshold") or {}).get("far", ""),
+        "validation_fixed_frr": ((metrics.get("validation_metrics") or {}).get("fixed_threshold") or {}).get("frr", ""),
+        "validation_target_threshold": (((metrics.get("validation_metrics") or {}).get("target_operating_point") or {}).get("threshold", "")),
         "eer": metrics.get("eer", ""),
         "eer_threshold": metrics.get("eer_threshold", ""),
         "auc": metrics.get("auc", ""),

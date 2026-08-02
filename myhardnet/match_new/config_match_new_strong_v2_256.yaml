@@ -1,0 +1,15 @@
+# HardNet Strong V2 256-D matcher 配置；描述子维度和架构由 checkpoint 决定。
+extends: config_match_new.yaml
+
+experiment:
+  id: A2_hardnet_strong_v2_256_ysjz_V4
+  dataset: ysjz_V4
+  protocol: identity_verification_v1
+  descriptor_variant: hardnet_strong_v2_256
+
+output:
+  output_dir: ../outputs/ysjz_V4/A2_hardnet_strong_v2_256
+
+model:
+  checkpoint: ../outputs/models/hardnet_train_strong_v2_256/best.pt
+  dropout: 0.12

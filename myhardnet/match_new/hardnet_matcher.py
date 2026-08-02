@@ -5,7 +5,7 @@
     输出图像级分数和诊断指标。这个文件是 match_new 的核心：
 
     1. 不再使用 Hadamard/Hamming 二值化；
-    2. 直接在 HardNet 128 维连续 descriptor 上计算 L2 距离；
+    2. 直接在 HardNet 连续 descriptor 上计算 L2 距离，维度由模板元数据约束；
     3. 用 top-k / ratio 生成较宽松候选；
     4. 候选过多时做方向软排序截断，而不是方向峰硬裁剪；
     5. 用 RANSAC 估计局部仿射变换；
@@ -32,6 +32,12 @@ from typing import Any
 
 import cv2
 import numpy as np
+
+from match_new.descriptor_contract import (
+    require_compatible_contracts,
+    require_l2_float_contract,
+    resolve_descriptor_contract,
+)
 
 
 @dataclass(frozen=True)
@@ -69,12 +75,9 @@ def wrap_angle_deg(angle: float) -> float:
 
 
 def select_l2_descriptors(template: dict[str, Any], descriptor_source: str) -> np.ndarray:
-    """从模板中取出指定 descriptor，并做 L2 归一化保护。
+    """读取并归一化连续描述子，维度和类型完全由模板契约约束。"""
 
-    `hardnet` 使用 `hardnet_descriptors`；`sift` 使用 `sift_descriptors`。
-    """
-
-    source = str(descriptor_source).lower()
+    source = str(descriptor_source).strip().lower()
     if source == "hardnet":
         key = "hardnet_descriptors"
         has_flag = "has_hardnet"
@@ -89,15 +92,43 @@ def select_l2_descriptors(template: dict[str, Any], descriptor_source: str) -> n
             f"template has no {key}: {template_path}. "
             "请使用对应的单描述子模板目录，不要复用双描述子或错误类型的模板。"
         )
-    desc = np.asarray(template.get(key, np.zeros((0, 128))), dtype=np.float32)
-    if desc.ndim == 1:
-        desc = desc.reshape(1, -1)
+
+    contract = resolve_descriptor_contract(template, source)
+    label = str(template.get("template_path", template.get("image_id", "<in-memory-template>")))
+    require_l2_float_contract(contract, label=label)
+
+    raw = template.get(key)
+    desc = np.asarray(raw if raw is not None else [], dtype=np.float32)
     if desc.size == 0:
-        return np.zeros((0, 128), dtype=np.float32)
-    if desc.ndim != 2 or desc.shape[1] != 128:
-        raise ValueError(f"{key} must be [N,128], got {desc.shape}")
+        if desc.ndim == 2 and desc.shape[1] not in {0, contract.dimension}:
+            raise ValueError(
+                f"{key} metadata/array dimension mismatch for {label}: "
+                f"contract={contract.dimension}, array={desc.shape}."
+            )
+        return np.zeros((0, contract.dimension), dtype=np.float32)
+    if desc.ndim != 2 or desc.shape[1] != contract.dimension:
+        raise ValueError(
+            f"{key} must be [N,{contract.dimension}] for {label}, got {desc.shape}. "
+            "Implicit reshape, truncation and padding are not supported."
+        )
+    if not np.all(np.isfinite(desc)):
+        raise ValueError(f"{key} contains NaN or infinite values: {label}")
     norms = np.linalg.norm(desc, axis=1, keepdims=True)
     return desc / np.maximum(norms, 1e-12)
+
+
+def require_compatible_l2_templates(
+    query: dict[str, Any],
+    gallery: dict[str, Any],
+    descriptor_source: str,
+) -> None:
+    """在距离计算前验证 query/gallery 的类型、度量和维度完全一致。"""
+
+    query_contract = resolve_descriptor_contract(query, descriptor_source)
+    gallery_contract = resolve_descriptor_contract(gallery, descriptor_source)
+    require_l2_float_contract(query_contract, label="query")
+    require_l2_float_contract(gallery_contract, label="gallery")
+    require_compatible_contracts(query_contract, gallery_contract)
 
 
 def select_hardnet_descriptors(template: dict[str, Any]) -> np.ndarray:
@@ -124,6 +155,15 @@ def pairwise_l2(query: np.ndarray, gallery: np.ndarray) -> np.ndarray:
     但 L2 距离范围更直观，便于设置 abs_distance_threshold。
     """
 
+    if query.ndim != 2 or gallery.ndim != 2:
+        raise ValueError(
+            f"pairwise_l2 expects [N,D] arrays, got {query.shape} and {gallery.shape}."
+        )
+    if query.shape[1] != gallery.shape[1]:
+        raise ValueError(
+            "pairwise_l2 descriptor dimension mismatch: "
+            f"query={query.shape[1]}, gallery={gallery.shape[1]}."
+        )
     q2 = np.sum(query * query, axis=1, keepdims=True)
     g2 = np.sum(gallery * gallery, axis=1, keepdims=True).T
     d2 = np.maximum(q2 + g2 - 2.0 * query @ gallery.T, 0.0)
@@ -147,7 +187,13 @@ def top_indices(values: np.ndarray, count: int) -> np.ndarray:
     return order.astype(np.int64)
 
 
-def build_l2_candidates(query: dict[str, Any], gallery: dict[str, Any], cfg: dict[str, Any], descriptor_source: str = "hardnet") -> list[MatchCandidate]:
+def build_l2_candidates(
+    query: dict[str, Any],
+    gallery: dict[str, Any],
+    cfg: dict[str, Any],
+    descriptor_source: str = "hardnet",
+    diagnostics: dict[str, Any] | None = None,
+) -> list[MatchCandidate]:
     """生成 RANSAC 前的 HardNet L2 候选。
 
     支持三种策略：
@@ -162,8 +208,26 @@ def build_l2_candidates(query: dict[str, Any], gallery: dict[str, Any], cfg: dic
     这里默认允许 many-to-one，因为指纹局部纹理重复，过早强制一对一会删掉真匹配。
     """
 
+    require_compatible_l2_templates(query, gallery, descriptor_source)
     desc_q = select_l2_descriptors(query, descriptor_source)
     desc_g = select_l2_descriptors(gallery, descriptor_source)
+    if desc_q.shape[1] != desc_g.shape[1]:
+        raise ValueError(
+            "Query/gallery descriptor dimension mismatch: "
+            f"query={desc_q.shape[1]}, gallery={desc_g.shape[1]}."
+        )
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "num_query_descriptors": int(desc_q.shape[0]),
+                "num_gallery_descriptors": int(desc_g.shape[0]),
+                "num_abs_distance_pass": 0,
+                "num_one_way_ratio_pass": 0,
+                "num_ratio_pass": 0,
+                "num_queries_with_candidates": 0,
+                "candidate_query_coverage": 0.0,
+            }
+        )
     if desc_q.shape[0] == 0 or desc_g.shape[0] == 0:
         return []
 
@@ -201,6 +265,9 @@ def build_l2_candidates(query: dict[str, Any], gallery: dict[str, Any], cfg: dic
     # best_gallery 只在 allow_many=false 时使用，用于提前做 gallery 侧去重。
     candidates: list[MatchCandidate] = []
     best_gallery: dict[int, MatchCandidate] = {}
+    num_abs_distance_pass = 0
+    num_one_way_ratio_pass = 0
+    num_ratio_pass = 0
     for query_idx in range(distances.shape[0]):
         row = distances[query_idx]
         need = min(max(top_k, 2), row.size)
@@ -210,12 +277,22 @@ def build_l2_candidates(query: dict[str, Any], gallery: dict[str, Any], cfg: dic
         best_idx = int(order[0])
         best_dist = float(row[best_idx])
         second_dist = float(row[int(order[1])]) if order.size > 1 else float("inf")
-        ratio_ok = bool(second_dist > 1e-12 and best_dist < ratio_threshold * second_dist)
+        if best_dist <= abs_threshold:
+            num_abs_distance_pass += 1
+        one_way_ratio_ok = bool(
+            second_dist > 1e-12
+            and best_dist < ratio_threshold * second_dist
+        )
+        if one_way_ratio_ok:
+            num_one_way_ratio_pass += 1
+        ratio_ok = one_way_ratio_ok
         if ratio_ok and bidirectional_ratio:
             ratio_ok = bool(
                 reverse_best_query[best_idx] == query_idx
                 and reverse_ratio_ok[best_idx]
             )
+        if ratio_ok:
+            num_ratio_pass += 1
         adaptive_limit = min(abs_threshold, best_dist + margin)
 
         # 自适应距离上限防止 top-k 把明显过远的候选也塞进 RANSAC。
@@ -247,7 +324,23 @@ def build_l2_candidates(query: dict[str, Any], gallery: dict[str, Any], cfg: dic
                 if previous is None or candidate.distance < previous.distance:
                     best_gallery[candidate.gallery_idx] = candidate
 
-    return candidates if allow_many else list(best_gallery.values())
+    selected_candidates = candidates if allow_many else list(best_gallery.values())
+    if diagnostics is not None:
+        num_queries_with_candidates = len(
+            {candidate.query_idx for candidate in selected_candidates}
+        )
+        diagnostics.update(
+            {
+                "num_abs_distance_pass": num_abs_distance_pass,
+                "num_one_way_ratio_pass": num_one_way_ratio_pass,
+                "num_ratio_pass": num_ratio_pass,
+                "num_queries_with_candidates": num_queries_with_candidates,
+                "candidate_query_coverage": float(
+                    num_queries_with_candidates / max(desc_q.shape[0], 1)
+                ),
+            }
+        )
+    return selected_candidates
 
 
 def dominant_angle_delta(candidates: list[MatchCandidate], bin_deg: float = 10.0) -> float:
@@ -648,6 +741,12 @@ def empty_result(query: dict[str, Any], gallery: dict[str, Any]) -> dict[str, An
         "num_keypoints_g": ng,
         "num_candidates": 0,
         "num_raw_matches": 0,
+        "num_abs_distance_pass": 0,
+        "num_one_way_ratio_pass": 0,
+        "num_ratio_pass": 0,
+        "num_queries_with_candidates": 0,
+        "candidate_query_coverage": 0.0,
+        "ransac_success": False,
         "num_inliers": 0,
         "raw_inliers": 0,
         "unique_inliers": 0,
@@ -716,14 +815,23 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
         return result
 
     stage_started = time.perf_counter()
+    require_compatible_l2_templates(query, gallery, source)
     desc_q = select_l2_descriptors(query, source)
     desc_g = select_l2_descriptors(gallery, source)
+    if desc_q.shape[1] != desc_g.shape[1]:
+        raise ValueError(
+            "Query/gallery descriptor dimension mismatch: "
+            f"query={desc_q.shape[1]}, gallery={desc_g.shape[1]}."
+        )
     timings["descriptor_prepare_ms"] = (
         time.perf_counter() - stage_started
     ) * 1000.0
     base["num_keypoints_q"] = int(desc_q.shape[0])
     base["num_keypoints_g"] = int(desc_g.shape[0])
     base["descriptor_source"] = source
+    base["descriptor_kind"] = "float"
+    base["descriptor_metric"] = "l2"
+    base["descriptor_dim"] = int(desc_q.shape[1])
     if desc_q.shape[0] < 2 or desc_g.shape[0] < 2:
         return finish(base)
 
@@ -732,7 +840,15 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
 
     # 阶段 1：L2 候选生成。
     stage_started = time.perf_counter()
-    candidates = build_l2_candidates(query, gallery, cfg, descriptor_source=source)
+    candidate_diagnostics: dict[str, Any] = {}
+    candidates = build_l2_candidates(
+        query,
+        gallery,
+        cfg,
+        descriptor_source=source,
+        diagnostics=candidate_diagnostics,
+    )
+    base.update(candidate_diagnostics)
     timings["candidate_generation_ms"] = (
         time.perf_counter() - stage_started
     ) * 1000.0
@@ -778,6 +894,7 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
         ) * 1000.0
         return finish(base, {"candidates": candidate_debug_rows(candidates_for_ransac, query_xy, gallery_xy), "raw_inliers": [], "unique_inliers": []})
 
+    base["ransac_success"] = True
     mask = np.asarray(inlier_mask).reshape(-1).astype(bool)
     raw_inliers = [candidate for candidate, keep in zip(candidates_for_ransac, mask) if bool(keep)]
     base["num_inliers"] = int(len(raw_inliers))

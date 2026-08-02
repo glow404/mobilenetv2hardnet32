@@ -1,19 +1,20 @@
-# MobileHardNet 轻量描述子训练配置。
+# HardNet Strong V2 高精度浮点描述子默认训练配置。
 # 训练命令：python -m hardnet_train.train --config hardnet_train/config.yaml
-# 第一版保持 HardNet 的损失和 128 维输出，只替换描述子网络，
-# 便于独立评估移动端结构带来的精度与速度变化。
+# descriptor_dim=auto 会按架构选择默认维度：Strong V2 为 256，
+# MobileHardNet 和原版 HardNet 为 128。
 
 seed: 42
-output_dir: ../outputs/hardnet_train_mobile_fixed_v1
+# output_dir=auto 会按 architecture 使用独立目录，避免不同网络 checkpoint 混放。
+output_dir: auto
 
 data:
-  train_csv: ../hardnet_dataset/train_pairs.csv
-  val_csv: ../hardnet_dataset/val_pairs.csv
-  test_csv: ../hardnet_dataset/test_pairs.csv
+  train_csv: ../outputs/butieping/train_pairs.csv
+  val_csv: ../outputs/butieping/val_pairs.csv
+  test_csv: ../outputs/butieping/test_pairs.csv
   normalize: true
   # Windows 下使用多个常驻 worker 提前读取 patch，减少 GPU 等待磁盘/PIL 解码。
   num_workers: 4
-  pin_memory: true
+  pin_memory: false
   persistent_workers: true
   prefetch_factor: 2
   max_train_rows:
@@ -22,10 +23,11 @@ data:
   max_val_rows_per_finger:
 
 model:
-  architecture: mobile_hardnet
-  descriptor_dim: 128
-  # 小模型先使用温和 dropout，避免容量受限时正则过强。
-  dropout: 0.1
+  # 只把这一行改为 mobile_hardnet，即可切回保留的 MobileHardNet 网络。
+  architecture: hardnet_strong_v2
+  # auto 按 architecture 解析：Strong V2=256，MobileHardNet/HardNet=128。
+  descriptor_dim: 256
+  dropout: 0.12
   final_bn_affine: false
 
 training:
@@ -34,7 +36,7 @@ training:
   # 卷积前向使用 FP16，hardest-negative 距离矩阵和 loss 仍使用 FP32。
   mixed_precision: fp16
   channels_last: true
-  cudnn_benchmark: true
+  cudnn_benchmark: false  #当前批处理输如的关键点数量不固定，每次搜索最优卷积算法花的时间很长。
   allow_tf32: true
   # 允许长程训练并保留 last.pt 续训；当前固定协议可用于稳定观察过拟合拐点。
   epochs: 300
@@ -55,7 +57,7 @@ training:
   early_stop_patience: 0
   early_stop_min_relative_improvement: 0.002
   scheduler: warmup_cosine
-  warmup_epochs: 2
+  warmup_epochs: 3
   eta_min: 0.0001
   log_interval: 50
 
@@ -73,7 +75,7 @@ optimizer:
   # 默认使用 SGD + Nesterov。切换为 adamw 时也要显式设置对应学习率，
   # 不会静默改写 lr，确保 resolved_config 能准确记录实验变量。
   name: sgd
-  lr: 0.1
+  lr: 0.08
   momentum: 0.9
   nesterov: true
   # 仅 Conv/Linear 权重衰减；BatchNorm 参数和所有 bias 固定为 no-decay。

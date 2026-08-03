@@ -22,8 +22,8 @@ data:
   max_val_rows_per_finger:
 
 model:
-  # 只把这一行改为 mobile_hardnet，即可切回保留的 MobileHardNet 网络。
-  architecture: mobile_hardnet
+  #  可选hardnet_strong_v2和mobile_hardnet
+  architecture: hardnet_strong_v2
   # auto 按 architecture 解析：Strong V2=256，MobileHardNet/HardNet=128。
   descriptor_dim: auto
   dropout: 0.12

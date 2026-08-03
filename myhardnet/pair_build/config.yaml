@@ -49,10 +49,9 @@ index:
 
 # 数据划分配置。
 split:
-  # 按 finger_id 粒度划分，保证同一个 finger_id 不会同时出现在 train/val/test。
+  # 按 finger_id 粒度划分，保证同一个 finger_id 不会同时出现在 train/val。
   train_ratio: 0.8
-  val_ratio: 0.1
-  test_ratio: 0.1
+  val_ratio: 0.2
 
   # 固定随机种子，保证多次划分可复现。
   random_seed: 42
@@ -148,9 +147,23 @@ matching:
   texture_window_radius: 10
   min_texture_std: 5.0
 
-  # 图像对内部去重距离。
-  # 同侧关键点距离过近时，只保留 stability_score 更高的样本，降低伪负样本风险。
-  dedup_min_distance: 8.0
+  # SIFT/RANSAC 内点与几何扩展候选共用的局部 ZNCC 硬过滤。
+  # 两侧 patch 使用与训练一致的方向对齐几何，再搜索小范围平移和 180° 方向二义性。
+  # 低纹理导致有效块不足，或最佳块级 ZNCC 中位数低于门槛时，候选直接拒绝。
+  positive_zncc:
+    enabled: true
+    block_size: 8
+    max_shift_px: 2
+    allow_180_rotation: true
+    blur_sigma: 0.8
+    min_block_std: 5.0
+    min_valid_blocks: 8
+    min_similarity: 0.60
+
+  # 图像对内部的同指负样本安全间隔。！！！！！！
+  # 保留的任意两组 correspondence 在 A、B 两侧都必须满足：
+  # max(|dx|, |dy|) >= 16，即排除中心 32x32 方形邻域内的近重复点。
+  negative_min_coordinate_separation_px: 16.0
 
   # 下面三个 scale 用于把误差型指标转成 [0, 1] 分数。
   # scale 越小，对该误差越敏感。
@@ -173,7 +186,6 @@ matching:
 # patch 裁剪与过滤配置。
 patch:
   # 直接在原图中裁 32x32，输出仍为 32x32，贴合原版 HardNet 输入。
-  # 这样避免 64->32 压缩，同时降低靠边裁剪产生黑边的概率。
   patch_crop_size: 32
   patch_out_size: 32
 

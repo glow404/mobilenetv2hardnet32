@@ -16,6 +16,12 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from hardnet_train.negative_sampling import (
+    DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
+    normalize_min_coordinate_separation,
+    same_finger_nearby_mask,
+)
+
 
 HARD_NEGATIVE_STRATEGY_ALIASES = {
     "same_finger_allowed": "same_finger_allowed",
@@ -61,11 +67,19 @@ class HardNetLoss(nn.Module):
         margin: float = 1.0,
         hard_negative_strategy: str = "same_finger_allowed",
         hard_negative_top_k: int = 3,
+        same_finger_min_coordinate_separation_px: float = (
+            DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX
+        ),
     ) -> None:
         super().__init__()
         self.margin = float(margin)
         self.hard_negative_strategy = normalize_hard_negative_strategy(hard_negative_strategy)
         self.hard_negative_top_k = int(hard_negative_top_k)
+        self.same_finger_min_coordinate_separation_px = (
+            normalize_min_coordinate_separation(
+                same_finger_min_coordinate_separation_px
+            )
+        )
         if self.hard_negative_top_k < 1:
             raise ValueError(f"hard_negative_top_k must be >= 1, got {hard_negative_top_k!r}.")
 
@@ -75,6 +89,10 @@ class HardNetLoss(nn.Module):
         positive: torch.Tensor,
         point_group: torch.Tensor | None = None,
         finger_group: torch.Tensor | None = None,
+        anchor_xy: torch.Tensor | None = None,
+        positive_xy: torch.Tensor | None = None,
+        anchor_coordinate_frame_group: torch.Tensor | None = None,
+        positive_coordinate_frame_group: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """计算一个 batch 的 HardNet loss。
 
@@ -88,6 +106,11 @@ class HardNetLoss(nn.Module):
             finger_group:
                 每条正样本对应的手指编号。`different_finger` 策略下，同一手指
                 的所有候选都会被屏蔽。
+            anchor_xy / positive_xy:
+                两个分支关键点在各自原图坐标系中的 `[B, 2]` 坐标。
+            anchor_coordinate_frame_group / positive_coordinate_frame_group:
+                两个分支各自的原图编号。仅同指且同一原图坐标系的候选执行
+                16px 方形邻域过滤，跨图不直接比较原始坐标。
 
         返回：
             loss:
@@ -125,6 +148,47 @@ class HardNetLoss(nn.Module):
             # 即使表里没有 A-C，也不能把 A-C 当作负样本。
             invalid = invalid | group[:, None].eq(group[None, :])
 
+        anchor_invalid = invalid
+        positive_invalid = invalid.t()
+        if (
+            self.hard_negative_strategy == "same_finger_allowed"
+            and self.same_finger_min_coordinate_separation_px > 0.0
+        ):
+            spatial_inputs = {
+                "finger_group": finger_group,
+                "anchor_xy": anchor_xy,
+                "positive_xy": positive_xy,
+                "anchor_coordinate_frame_group": anchor_coordinate_frame_group,
+                "positive_coordinate_frame_group": positive_coordinate_frame_group,
+            }
+            missing = [name for name, value in spatial_inputs.items() if value is None]
+            if missing:
+                raise ValueError(
+                    "Same-finger coordinate filtering requires batch metadata: "
+                    f"{missing}."
+                )
+            assert finger_group is not None
+            assert anchor_xy is not None
+            assert positive_xy is not None
+            assert anchor_coordinate_frame_group is not None
+            assert positive_coordinate_frame_group is not None
+            anchor_invalid = anchor_invalid | same_finger_nearby_mask(
+                point_xy=anchor_xy.to(device=distances.device),
+                finger_group=finger_group,
+                coordinate_frame_group=anchor_coordinate_frame_group,
+                min_coordinate_separation_px=(
+                    self.same_finger_min_coordinate_separation_px
+                ),
+            )
+            positive_invalid = positive_invalid | same_finger_nearby_mask(
+                point_xy=positive_xy.to(device=distances.device),
+                finger_group=finger_group,
+                coordinate_frame_group=positive_coordinate_frame_group,
+                min_coordinate_separation_px=(
+                    self.same_finger_min_coordinate_separation_px
+                ),
+            )
+
         # 用一个很大的距离替换无效候选，这样 top-k 时不会优先选到它们。
         large_value = torch.finfo(distances.dtype).max / 16.0
 
@@ -132,8 +196,10 @@ class HardNetLoss(nn.Module):
         #   1. 对 anchor a_i，候选是所有非匹配 positive p_j；
         #   2. 对 positive p_i，候选是所有非匹配 anchor a_j。
         # 合并两个方向后取距离最小的 k 个。k=1 时与原来的 hardest-negative 等价。
-        anchor_candidates = distances.masked_fill(invalid, large_value)
-        positive_candidates = distances.t().masked_fill(invalid.t(), large_value)
+        anchor_candidates = distances.masked_fill(anchor_invalid, large_value)
+        positive_candidates = distances.t().masked_fill(
+            positive_invalid, large_value
+        )
         negative_candidates = torch.cat([anchor_candidates, positive_candidates], dim=1)
         selected_k = min(self.hard_negative_top_k, negative_candidates.size(1))
         topk_negative_dist = torch.topk(

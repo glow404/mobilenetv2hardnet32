@@ -5,7 +5,7 @@
 - 根据 CSV 中的 keypoint 坐标和方向，从原始小图中裁剪正样本 patch 对。
 - 按配置裁剪并输出 HardNet 需要的单通道 PNG；当前默认配置为直接裁 32x32。
 - 将成功落盘的 patch 路径写回 all_positive_pairs.csv，并拆分出
-  train_pairs.csv / val_pairs.csv / test_pairs.csv。
+  train_pairs.csv / val_pairs.csv。
 
 输入：
 - all_positive_pairs.csv：包含几何验证后的正样本 correspondence。
@@ -26,10 +26,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 
 from positive_builder import POSITIVE_FIELDNAMES
+from splits import DATASET_SPLITS, require_supported_split
+from texture_quality import extract_aligned_patch
 from utils import ensure_dir, get_nested, imread_grayscale, imwrite_image, resolve_path, sanitize_token, stable_id, write_json
 
 
@@ -83,27 +84,6 @@ def _overlap_ratio(image_shape: tuple[int, int], x: float, y: float, crop_size: 
     return inter / max(float(crop_size * crop_size), 1.0)
 
 
-def _extract_aligned_patch(image: np.ndarray, x: float, y: float, angle: float, crop_size: int, out_size: int) -> np.ndarray:
-    """按 keypoint 方向旋转对齐后裁剪 patch。
-
-    先围绕关键点旋转整张小图，再用 getRectSubPix 取局部窗口。
-    这样 patch 内的主方向更一致，HardNet 不必把大量容量浪费在旋转变化上。
-    """
-
-    height, width = image.shape[:2]
-    matrix = cv2.getRotationMatrix2D((float(x), float(y)), float(angle), 1.0)
-    rotated = cv2.warpAffine(
-        image,
-        matrix,
-        dsize=(width, height),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-    patch = cv2.getRectSubPix(rotated, patchSize=(int(crop_size), int(crop_size)), center=(float(x), float(y)))
-    return cv2.resize(patch, (int(out_size), int(out_size)), interpolation=cv2.INTER_AREA)
-
-
 def _patch_metrics(patch: np.ndarray, blank_threshold: int) -> dict[str, float]:
     """计算 patch 质量指标：标准差、空白比例、有效像素比例。"""
 
@@ -139,7 +119,7 @@ def _validate_and_extract(image: np.ndarray | None, x: float, y: float, angle: f
     overlap = _overlap_ratio(image.shape[:2], x, y, crop_size)
     if overlap < min_overlap:
         return None, {"ok": False, "reason": "overlap_too_low", "overlap_ratio": overlap}
-    patch = _extract_aligned_patch(image, x, y, angle, crop_size, out_size)
+    patch = extract_aligned_patch(image, x, y, angle, crop_size, out_size)
     metrics = _patch_metrics(patch, blank_threshold)
     metrics["overlap_ratio"] = overlap
     if metrics["blank_ratio"] > max_blank:
@@ -177,7 +157,9 @@ def extract_patches(config: dict[str, Any], logger: logging.Logger) -> dict[str,
 
     temp_path = output_root / "all_positive_pairs.tmp.csv"
     diagnostics_path = output_root / "patch_diagnostics.csv"
-    split_paths = {split: output_root / f"{split}_pairs.csv" for split in ["train", "val", "test"]}
+    split_paths = {
+        split: output_root / f"{split}_pairs.csv" for split in DATASET_SPLITS
+    }
     image_cache: dict[str, np.ndarray | None] = {}
     reason_counts: Counter[str] = Counter()
     split_counts: Counter[str] = Counter()
@@ -201,6 +183,8 @@ def extract_patches(config: dict[str, Any], logger: logging.Logger) -> dict[str,
 
             for row in reader:
                 total_rows += 1
+                split_name = require_supported_split(row["split"])
+                row["split"] = split_name
                 image_a = _load_image(row["image_a_path"], image_cache)
                 image_b = _load_image(row["image_b_path"], image_cache)
                 patch_a, metrics_a = _validate_and_extract(image_a, _to_float(row, "x_a"), _to_float(row, "y_a"), _to_float(row, "angle_a"), config)
@@ -247,9 +231,9 @@ def extract_patches(config: dict[str, Any], logger: logging.Logger) -> dict[str,
                 row["patch_a_path"] = str(patch_a_path)
                 row["patch_p_path"] = str(patch_p_path)
                 all_writer.writerow({key: row.get(key, "") for key in POSITIVE_FIELDNAMES})
-                split_writers[row["split"]].writerow({key: row.get(key, "") for key in POSITIVE_FIELDNAMES})
+                split_writers[split_name].writerow({key: row.get(key, "") for key in POSITIVE_FIELDNAMES})
                 kept_rows += 1
-                split_counts[row["split"]] += 1
+                split_counts[split_name] += 1
         finally:
             for handle in split_handles.values():
                 handle.close()

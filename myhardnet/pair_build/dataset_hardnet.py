@@ -1,7 +1,7 @@
 """HardNet 正样本 patch 对 PyTorch Dataset。
 
 作用：
-- 读取 extract_patches 阶段生成的 train_pairs.csv / val_pairs.csv / test_pairs.csv。
+- 读取 extract_patches 阶段生成的 train_pairs.csv / val_pairs.csv。
 - 加载其中的 `patch_a_path` 和 `patch_p_path`，返回 HardNet 训练需要的正样本对。
 - 默认执行 per-patch mean/std normalization，对齐 HardNet 论文的输入预处理。
 

@@ -159,6 +159,11 @@ def generate_qa_report(config: dict[str, Any], logger: logging.Logger) -> dict[s
     report_lines.extend(["", "## Source Counts"])
     for key, value in sorted(source_counts.items()):
         report_lines.append(f"- {key or 'unknown'}: {value}")
+    report_lines.extend(["", "## ZNCC Rejections"])
+    for key, value in sorted(
+        positive_summary.get("zncc_rejection_counts", {}).items()
+    ):
+        report_lines.append(f"- {key}: {value}")
     report_lines.extend(["", "## Match Skip Reasons"])
     for key, value in sorted(skip_counts.items()):
         report_lines.append(f"- {key or 'none'}: {value}")

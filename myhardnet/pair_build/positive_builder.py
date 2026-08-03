@@ -9,7 +9,8 @@
   3. 保留 RANSAC 内点作为 `source=sift_inlier`
   4. 使用几何矩阵 T 将 A 图所有 keypoint 投影到 B 图，扩展出
      `source=geometry_expanded` 正样本
-  5. 根据投影误差、方向、尺度、纹理、响应等指标打分、去重、截断到 K
+  5. SIFT/RANSAC 内点和几何扩展候选统一执行方向对齐局部块 ZNCC 硬过滤
+  6. 根据投影误差、方向、尺度、纹理、响应等指标打分、去重、截断到 K
 
 输出：
 - all_positive_pairs.csv：HardNet 训练所需的正样本 pair 元数据。
@@ -35,6 +36,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from splits import DATASET_SPLITS, require_supported_split
+from texture_quality import local_patch_zncc, minimum_zncc_similarity
 from utils import (
     angle_diff_mod180,
     clamp,
@@ -86,6 +89,12 @@ POSITIVE_FIELDNAMES = [
     "reproj_error",
     "angle_diff_mod180",
     "scale_ratio",
+    "zncc_available",
+    "zncc_similarity",
+    "zncc_valid_blocks",
+    "zncc_best_shift_x",
+    "zncc_best_shift_y",
+    "zncc_used_180_rotation",
     "stability_score",
     "transform_matrix",
     "transform_rotation_deg",
@@ -108,6 +117,8 @@ DIAGNOSTIC_FIELDNAMES = [
     "ratio_kept",
     "mutual_kept",
     "ransac_inliers",
+    "sift_inlier_zncc_rejected",
+    "geometry_expanded_zncc_rejected",
     "seed_candidates",
     "expanded_candidates",
     "final_pairs",
@@ -357,13 +368,14 @@ def _build_candidate(
     reproj_error: float,
     ransac_inlier: int,
     config: dict[str, Any],
+    rejection_counts: Counter[str] | None = None,
 ) -> dict[str, Any] | None:
     """把一个候选 keypoint 对转换成可训练正样本元数据。
 
     这里是正样本质量控制的核心：
-    - seed inlier 和 geometry expanded 都会经过边界、纹理、打分。
+    - seed inlier 和 geometry expanded 都会经过边界、纹理、ZNCC、打分。
     - geometry expanded 额外要求方向误差和尺度比例在阈值内。
-    - 返回 None 表示该候选被过滤。
+    - ZNCC 不可用或低于硬阈值时返回 None，不会进入 stability_score。
     """
 
     kp_a = feature_a["keypoints"][kp_a_idx]
@@ -395,6 +407,49 @@ def _build_candidate(
     # 两侧局部纹理都必须足够丰富，否则 HardNet 学到的描述子监督会很弱。
     if min(texture_std_a, texture_std_b) < min_std:
         return None
+
+    zncc_config = get_nested(
+        config,
+        "matching",
+        "positive_zncc",
+        default={},
+    )
+    if not isinstance(zncc_config, dict):
+        raise ValueError("matching.positive_zncc must be a mapping.")
+    zncc_available = False
+    zncc_similarity = 0.0
+    zncc_valid_blocks = 0
+    zncc_best_shift_x = 0
+    zncc_best_shift_y = 0
+    zncc_used_180_rotation = False
+    if bool(zncc_config.get("enabled", True)):
+        zncc_runtime_config = {
+            **zncc_config,
+            "crop_size": int(
+                get_nested(config, "patch", "patch_crop_size", default=32)
+            ),
+            "out_size": int(
+                get_nested(config, "patch", "patch_out_size", default=32)
+            ),
+        }
+        zncc_result = local_patch_zncc(
+            image_a=feature_a["image"],
+            point_a=kp_a,
+            image_b=feature_b["image"],
+            point_b=kp_b,
+            config=zncc_runtime_config,
+        )
+        zncc_available = zncc_result.available
+        zncc_similarity = zncc_result.similarity
+        zncc_valid_blocks = zncc_result.valid_blocks
+        zncc_best_shift_x = zncc_result.best_shift_x
+        zncc_best_shift_y = zncc_result.best_shift_y
+        zncc_used_180_rotation = zncc_result.used_180_rotation
+        minimum_similarity = minimum_zncc_similarity(zncc_config)
+        if not zncc_available or zncc_similarity < minimum_similarity:
+            if rejection_counts is not None:
+                rejection_counts[source] += 1
+            return None
 
     weights = get_nested(config, "matching", "score_weights", default={})
     # 将不同量纲的误差/质量指标转成 0-1 分数后加权。
@@ -450,6 +505,12 @@ def _build_candidate(
         "reproj_error": float(reproj_error),
         "angle_diff_mod180": float(angle_error),
         "scale_ratio": float(scale_ratio),
+        "zncc_available": int(zncc_available),
+        "zncc_similarity": float(zncc_similarity),
+        "zncc_valid_blocks": int(zncc_valid_blocks),
+        "zncc_best_shift_x": int(zncc_best_shift_x),
+        "zncc_best_shift_y": int(zncc_best_shift_y),
+        "zncc_used_180_rotation": int(zncc_used_180_rotation),
         "stability_score": float(stability_score),
         "transform_matrix": json.dumps(np.asarray(matrix, dtype=float).tolist(), ensure_ascii=False),
         "transform_rotation_deg": float(transform_rotation),
@@ -471,6 +532,7 @@ def _expand_by_geometry(
     transform_scale: float,
     existing_pairs: set[tuple[int, int]],
     config: dict[str, Any],
+    rejection_counts: Counter[str] | None = None,
 ) -> list[dict[str, Any]]:
     """使用 RANSAC 几何矩阵扩展正样本。
 
@@ -478,7 +540,7 @@ def _expand_by_geometry(
     1. 把 A 图所有 keypoint 坐标通过 T 投影到 B 图。
     2. 在 B 图 keypoints 中搜索投影点半径 projection_radius 内的候选。
     3. 若有多个候选，优先选择“投影距离近 + 方向误差小”的那个。
-    4. 再交给 _build_candidate 做边界、方向、尺度、纹理和打分过滤。
+    4. 再交给 _build_candidate 做边界、方向、尺度、纹理、ZNCC 和打分过滤。
     """
 
     if not bool(get_nested(config, "matching", "enable_geometry_expansion", default=True)):
@@ -536,27 +598,44 @@ def _expand_by_geometry(
             reproj_error=reproj_error,
             ransac_inlier=0,
             config=config,
+            rejection_counts=rejection_counts,
         )
         if candidate is not None:
             candidates.append(candidate)
     return candidates
 
 
-def _deduplicate(candidates: list[dict[str, Any]], min_distance: float) -> list[dict[str, Any]]:
-    """对同一 image_pair 内空间过近的候选做去重。
+def _deduplicate(
+    candidates: list[dict[str, Any]],
+    min_coordinate_separation_px: float,
+) -> list[dict[str, Any]]:
+    """按方形坐标邻域对同一 image_pair 的候选做去重。
 
-    目的：
-    - 避免同一局部纹理区域被多个 SIFT keypoint 重复采样。
-    - 降低后续 batch 内把近重复 patch 当成负样本的风险。
+    保留下来的任意两点在 A、B 两侧都必须满足
+    ``max(abs(dx), abs(dy)) >= threshold``。这样这些正样本以后互为同指负样本
+    候选时，不会来自锚点中心的重叠 32x32 邻域。
     """
+
+    separation = float(min_coordinate_separation_px)
+    if not np.isfinite(separation) or separation < 0.0:
+        raise ValueError(
+            "matching.negative_min_coordinate_separation_px must be finite and >= 0, "
+            f"got {min_coordinate_separation_px!r}."
+        )
 
     kept: list[dict[str, Any]] = []
     for candidate in sorted(candidates, key=lambda item: item["stability_score"], reverse=True):
         duplicate = False
         for chosen in kept:
-            dist_a = float(np.hypot(candidate["x_a"] - chosen["x_a"], candidate["y_a"] - chosen["y_a"]))
-            dist_b = float(np.hypot(candidate["x_b"] - chosen["x_b"], candidate["y_b"] - chosen["y_b"]))
-            if dist_a < min_distance or dist_b < min_distance:
+            gap_a = max(
+                abs(float(candidate["x_a"]) - float(chosen["x_a"])),
+                abs(float(candidate["y_a"]) - float(chosen["y_a"])),
+            )
+            gap_b = max(
+                abs(float(candidate["x_b"]) - float(chosen["x_b"])),
+                abs(float(candidate["y_b"]) - float(chosen["y_b"])),
+            )
+            if gap_a < separation or gap_b < separation:
                 duplicate = True
                 break
         if not duplicate:
@@ -621,6 +700,8 @@ def _build_single_image_pair(
         "ratio_kept": 0,
         "mutual_kept": 0,
         "ransac_inliers": 0,
+        "sift_inlier_zncc_rejected": 0,
+        "geometry_expanded_zncc_rejected": 0,
         "seed_candidates": 0,
         "expanded_candidates": 0,
         "final_pairs": 0,
@@ -670,6 +751,7 @@ def _build_single_image_pair(
 
     candidates: list[dict[str, Any]] = []
     existing_pairs: set[tuple[int, int]] = set()
+    zncc_rejections: Counter[str] = Counter()
     # RANSAC 内点作为最高置信的正样本来源。
     for index, item in enumerate(matches):
         if not bool(mask[index]):
@@ -696,11 +778,12 @@ def _build_single_image_pair(
             reproj_error=float(errors[index]),
             ransac_inlier=1,
             config=config,
+            rejection_counts=zncc_rejections,
         )
         if candidate is not None:
             candidates.append(candidate)
 
-    diagnostics["seed_candidates"] = len(candidates)
+    diagnostics["sift_inlier_zncc_rejected"] = int(zncc_rejections["sift_inlier"])
     # 几何引导扩展：用可信 T 从所有 SIFT keypoints 中补充更多对应点。
     expanded = _expand_by_geometry(
         split_name=split_name,
@@ -715,14 +798,37 @@ def _build_single_image_pair(
         transform_scale=transform_scale,
         existing_pairs=existing_pairs,
         config=config,
+        rejection_counts=zncc_rejections,
+    )
+    diagnostics["seed_candidates"] = len(
+        [candidate for candidate in candidates if candidate["source"] == "sift_inlier"]
     )
     diagnostics["expanded_candidates"] = len(expanded)
+    diagnostics["geometry_expanded_zncc_rejected"] = int(
+        zncc_rejections["geometry_expanded"]
+    )
     candidates.extend(expanded)
     if not candidates:
-        diagnostics["skip_reason"] = "no_valid_candidates"
+        diagnostics["skip_reason"] = "no_candidates_after_quality_filters"
         return [], diagnostics
 
-    deduped = _deduplicate(candidates, min_distance=float(get_nested(config, "matching", "dedup_min_distance", default=12.0)))
+    configured_separation = get_nested(
+        config,
+        "matching",
+        "negative_min_coordinate_separation_px",
+        default=None,
+    )
+    if configured_separation is None:
+        configured_separation = get_nested(
+            config,
+            "matching",
+            "dedup_min_distance",
+            default=16.0,
+        )
+    deduped = _deduplicate(
+        candidates,
+        min_coordinate_separation_px=float(configured_separation),
+    )
     final = _select_final(deduped, config)
     diagnostics["final_pairs"] = len(final)
     if not final:
@@ -752,7 +858,8 @@ def build_positive_pairs(config: dict[str, Any], logger: logging.Logger) -> dict
 
     rows_by_split_finger: dict[str, dict[str, list[dict[str, str]]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
-        rows_by_split_finger[row["split"]][row["finger_id"]].append(row)
+        split_name = require_supported_split(row["split"])
+        rows_by_split_finger[split_name][row["finger_id"]].append(row)
 
     positive_path = output_root / "all_positive_pairs.csv"
     diagnostics_path = output_root / "match_diagnostics.csv"
@@ -764,6 +871,7 @@ def build_positive_pairs(config: dict[str, Any], logger: logging.Logger) -> dict
     split_counts: Counter[str] = Counter()
     source_counts: Counter[str] = Counter()
     skip_counts: Counter[str] = Counter()
+    zncc_rejection_counts: Counter[str] = Counter()
     image_pair_count = 0
     positive_count = 0
 
@@ -777,7 +885,7 @@ def build_positive_pairs(config: dict[str, Any], logger: logging.Logger) -> dict
         pos_writer.writeheader()
         diag_writer.writeheader()
 
-        for split_name in ["train", "val", "test"]:
+        for split_name in DATASET_SPLITS:
             for finger_id, finger_rows in rows_by_split_finger.get(split_name, {}).items():
                 ordered = sorted(finger_rows, key=lambda item: item["image_id"])
                 image_pairs = list(combinations(ordered, 2))
@@ -801,6 +909,12 @@ def build_positive_pairs(config: dict[str, Any], logger: logging.Logger) -> dict
                     image_pair_count += 1
                     if diagnostics.get("skip_reason"):
                         skip_counts[str(diagnostics["skip_reason"])] += 1
+                    zncc_rejection_counts["sift_inlier"] += int(
+                        diagnostics["sift_inlier_zncc_rejected"]
+                    )
+                    zncc_rejection_counts["geometry_expanded"] += int(
+                        diagnostics["geometry_expanded_zncc_rejected"]
+                    )
                     diag_writer.writerow({key: diagnostics.get(key, "") for key in DIAGNOSTIC_FIELDNAMES})
 
                     for row in current_pairs:
@@ -812,7 +926,7 @@ def build_positive_pairs(config: dict[str, Any], logger: logging.Logger) -> dict
     split_summary_path = output_root / "split_summary.json"
     if split_summary_path.exists():
         split_summary = read_json(split_summary_path)
-        for split_name in ["train", "val", "test"]:
+        for split_name in DATASET_SPLITS:
             split_summary.setdefault("splits", {}).setdefault(split_name, {"finger_count": 0, "image_count": 0, "positive_pair_count": 0})
             split_summary["splits"][split_name]["positive_pair_count"] = int(split_counts.get(split_name, 0))
         write_json(split_summary_path, split_summary)
@@ -824,6 +938,12 @@ def build_positive_pairs(config: dict[str, Any], logger: logging.Logger) -> dict
             "positive_pair_count": positive_count,
             "split_positive_counts": dict(split_counts),
             "source_counts": dict(source_counts),
+            "zncc_rejection_counts": {
+                "sift_inlier": int(zncc_rejection_counts["sift_inlier"]),
+                "geometry_expanded": int(
+                    zncc_rejection_counts["geometry_expanded"]
+                ),
+            },
             "skip_counts": dict(skip_counts),
             "feature_cache_count": len(feature_cache),
         },

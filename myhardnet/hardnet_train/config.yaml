@@ -10,7 +10,6 @@ output_dir: auto
 data:
   train_csv: ../outputs/butieping/train_pairs.csv
   val_csv: ../outputs/butieping/val_pairs.csv
-  test_csv: ../outputs/butieping/test_pairs.csv
   normalize: true
   # Windows 下使用多个常驻 worker 提前读取 patch，减少 GPU 等待磁盘/PIL 解码。
   num_workers: 4
@@ -24,9 +23,9 @@ data:
 
 model:
   # 只把这一行改为 mobile_hardnet，即可切回保留的 MobileHardNet 网络。
-  architecture: hardnet_strong_v2
+  architecture: mobile_hardnet
   # auto 按 architecture 解析：Strong V2=256，MobileHardNet/HardNet=128。
-  descriptor_dim: 256
+  descriptor_dim: auto
   dropout: 0.12
   final_bn_affine: false
 
@@ -39,7 +38,7 @@ training:
   cudnn_benchmark: false  #当前批处理输如的关键点数量不固定，每次搜索最优卷积算法花的时间很长。
   allow_tf32: true
   # 允许长程训练并保留 last.pt 续训；当前固定协议可用于稳定观察过拟合拐点。
-  epochs: 300
+  epochs: 100
   steps_per_epoch: 1000
   # 单手指点数不足会从已选样本重复采样补齐；整个 batch 仍不足则丢弃。伪负样本由 point_group 屏蔽。
   batch_size: 256
@@ -49,6 +48,9 @@ training:
   # - same_finger_allowed: allow same-finger negatives, but mask connected point_group.
   # - different_finger: only use negatives from different finger_id values.
   hard_negative_strategy: same_finger_allowed
+  # 同指且位于同一原图坐标系的候选必须在锚点中心 32x32 方形邻域之外：
+  # max(|dx|, |dy|) >= 16；跨指或跨图候选不比较原始坐标。
+  same_finger_min_coordinate_separation_px: 16
   # 每条正样本从双向合法候选中选择距离最小的 k 个负样本；设为 1 可复现原来的 hardest-negative。
   hard_negative_top_k: 3
   # 论文 margin 是 1.0；当前指纹 patch 先保留较温和的 0.8。
@@ -62,14 +64,15 @@ training:
   log_interval: 50
 
 validation:
-  # 与训练 sampler 完全解耦；seed 决定索引，跨 epoch/运行保持相同。
-  protocol: fixed_pairs_v1
+  # 固定空间协议：同指负样本从 anchor 原图选取，并应用相同的 16px 方形邻域过滤。
+  protocol: fixed_pairs_v2_spatial
   seed: 10042
   positive_count: 16384
-  same_finger_negatives_per_anchor: 32
-  cross_finger_negatives_per_anchor: 32
+  same_finger_negatives_per_anchor: 4
+  cross_finger_negatives_per_anchor: 16
+  same_finger_min_coordinate_separation_px: 16
   # 这里只控制唯一 patch 的前向批量，不改变验证距离对。
-  batch_size: 256
+  batch_size: 128
 
 optimizer:
   # 默认使用 SGD + Nesterov。切换为 adamw 时也要显式设置对应学习率，

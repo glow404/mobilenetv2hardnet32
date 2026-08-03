@@ -27,6 +27,7 @@ import math
 import os
 import random
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,10 @@ from torch.utils.data import DataLoader
 from hardnet_train.data import FingerImagePairBatchSampler, FingerprintPairDataset
 from hardnet_train.loss import HardNetLoss, normalize_hard_negative_strategy
 from hardnet_train.metrics import RunningMean
+from hardnet_train.negative_sampling import (
+    DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
+    normalize_min_coordinate_separation,
+)
 from hardnet_train.model import (
     build_descriptor_model,
     checkpoint_descriptor_dim,
@@ -114,6 +119,68 @@ def resolve_resume_checkpoint(
     if allow_missing:
         return None
     raise FileNotFoundError(f"resume checkpoint not found: {checkpoint_path}")
+
+
+def negative_sampling_contract(config: Mapping[str, Any]) -> dict[str, Any]:
+    """提取会改变训练标签与验证配对的负样本协议。"""
+
+    training = config.get("training", {})
+    validation = config.get("validation", {})
+    if not isinstance(training, Mapping) or not isinstance(validation, Mapping):
+        raise ValueError("training and validation config sections must be mappings.")
+    return {
+        "contract_version": 1,
+        "training_same_finger_min_coordinate_separation_px": (
+            normalize_min_coordinate_separation(
+                training.get(
+                    "same_finger_min_coordinate_separation_px",
+                    DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
+                )
+            )
+        ),
+        "validation_protocol": str(
+            validation.get("protocol", "fixed_pairs_v2_spatial")
+        )
+        .strip()
+        .lower(),
+        "validation_same_finger_min_coordinate_separation_px": (
+            normalize_min_coordinate_separation(
+                validation.get(
+                    "same_finger_min_coordinate_separation_px",
+                    training.get(
+                        "same_finger_min_coordinate_separation_px",
+                        DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
+                    ),
+                )
+            )
+        ),
+        "same_finger_coordinate_rule": "outside_square",
+        "same_finger_coordinate_scope": "same_finger_same_image",
+    }
+
+
+def validate_resume_negative_sampling_contract(
+    checkpoint: Mapping[str, Any],
+    current_config: Mapping[str, Any],
+) -> None:
+    """禁止把旧负样本协议的优化器状态续接到空间过滤实验。"""
+
+    saved_contract = checkpoint.get("negative_sampling_contract")
+    if not isinstance(saved_contract, Mapping):
+        raise ValueError(
+            "Checkpoint predates the explicit spatial negative-sampling contract; "
+            "do not resume its optimizer state under the new 16px labels. Start a "
+            "new experiment and use the checkpoint only as pretrained weights."
+        )
+    saved_contract = dict(saved_contract)
+    current_contract = negative_sampling_contract(current_config)
+    if saved_contract != current_contract:
+        raise ValueError(
+            "Checkpoint negative-sampling protocol mismatch: "
+            f"checkpoint={saved_contract}, configured={current_contract}. "
+            "The 16px spatial protocol changes training labels and validation pairs; "
+            "start a new output directory instead of resuming this checkpoint."
+        )
 
 
 def set_seed(seed: int) -> None:
@@ -311,6 +378,14 @@ def train_one_epoch(
         positive = batch["positive"].to(device, non_blocking=True)
         point_group = batch["point_group"].to(device, non_blocking=True)
         finger_group = batch["finger_group"].to(device, non_blocking=True)
+        anchor_xy = batch["anchor_xy"].to(device, non_blocking=True)
+        positive_xy = batch["positive_xy"].to(device, non_blocking=True)
+        anchor_coordinate_frame_group = batch[
+            "anchor_coordinate_frame_group"
+        ].to(device, non_blocking=True)
+        positive_coordinate_frame_group = batch[
+            "positive_coordinate_frame_group"
+        ].to(device, non_blocking=True)
         if channels_last:
             anchor = anchor.contiguous(memory_format=torch.channels_last)
             positive = positive.contiguous(memory_format=torch.channels_last)
@@ -332,6 +407,10 @@ def train_one_epoch(
             positive_desc.float(),
             point_group=point_group,
             finger_group=finger_group,
+            anchor_xy=anchor_xy,
+            positive_xy=positive_xy,
+            anchor_coordinate_frame_group=anchor_coordinate_frame_group,
+            positive_coordinate_frame_group=positive_coordinate_frame_group,
         )
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -348,9 +427,9 @@ def train_one_epoch(
         if log_interval > 0 and step % log_interval == 0:
             elapsed = max(time.time() - start, 1e-6)
             print(
-                f"epoch={epoch} step={step}/{len(loader)} lr={lr:.6g} "
-                f"loss={loss_meter.value:.4f} pos={pos_meter.value:.4f} "
-                f"neg={neg_meter.value:.4f} samples/s={loss_meter.count / elapsed:.1f}",
+                f"epoch={epoch} step={step}/{len(loader)} lr={lr:.4g} "
+                f"loss={loss_meter.value:.4g} pos={pos_meter.value:.4g} "
+                f"neg={neg_meter.value:.4g} samples/s={loss_meter.count / elapsed:.4g}",
                 flush=True,
             )
         global_step += 1
@@ -381,6 +460,7 @@ def save_checkpoint(
         "training_task": "float_descriptor",
         "descriptor_kind": "float",
         "descriptor_metric": "l2",
+        "negative_sampling_contract": negative_sampling_contract(resolved_config),
         "model_architecture": model_architecture(model),
         "descriptor_dim": model_descriptor_dim(model),
         "model_parameter_count": count_parameters(model),
@@ -419,10 +499,14 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     steps_per_epoch: int,
+    config: Mapping[str, Any],
     scaler: torch.amp.GradScaler | None = None,
 ) -> tuple[int, int]:
     """加载 checkpoint，返回下一轮 epoch 和 global_step。"""
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
+    validate_resume_negative_sampling_contract(checkpoint, config)
     saved_architecture = checkpoint_model_architecture(checkpoint)
     current_architecture = model_architecture(model)
     if saved_architecture != current_architecture:
@@ -486,8 +570,15 @@ def best_fpr_at_tpr95_from_metrics(metrics_path: Path) -> tuple[float, float, in
     return best_fpr, early_best, no_improve
 
 
+def _format_metric_value(value: Any) -> Any:
+    """将浮点指标压缩为 4 位有效数字，整数状态保持原样。"""
+    if isinstance(value, (float, np.floating)):
+        return format(float(value), ".4g")
+    return value
+
+
 def append_metrics(path: Path, row: dict[str, Any]) -> None:
-    """把一个 epoch 的指标追加写入 CSV，并拒绝混写不同验证协议的 schema。"""
+    """把一个 epoch 的精简指标追加写入 CSV，并拒绝混写不同 schema。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
     fieldnames = list(row.keys())
@@ -496,21 +587,23 @@ def append_metrics(path: Path, row: dict[str, Any]) -> None:
             existing_fields = csv.DictReader(handle).fieldnames
         if existing_fields != fieldnames:
             raise ValueError(
-                "metrics.csv schema does not match the fixed validation protocol. "
+                "metrics.csv schema does not match the focused training metrics. "
                 "Use a new output directory instead of appending to an old experiment."
             )
     with path.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow(
+            {name: _format_metric_value(value) for name, value in row.items()}
+        )
 
 
 def plot_training_curves(metrics_path: Path, output_path: Path) -> None:
-    """根据 metrics.csv 输出训练曲线图。
+    """根据精简 metrics.csv 输出与最终匹配最相关的训练曲线。
 
-    图中包含 loss、正负样本距离、`val_fpr_at_tpr95` 和学习率曲线。
-    如果 matplotlib 不可用，则跳过绘图，不影响训练结果。
+    图中包含 loss、正负困难尾部、总体/同指 FPR，以及同指严格 TPR
+    和 Recall@1。如果 matplotlib 不可用，则跳过绘图，不影响训练结果。
     """
     if not metrics_path.exists():
         return
@@ -542,17 +635,27 @@ def plot_training_curves(metrics_path: Path, output_path: Path) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=140)
 
     axes[0, 0].plot(epochs, values("train_loss"), label="train_loss")
-    axes[0, 0].plot(epochs, values("val_loss"), label="val_loss")
-    axes[0, 0].set_title("Loss")
+    axes[0, 0].plot(
+        epochs,
+        values("val_same_finger_loss", "val_loss"),
+        label="val_same_finger_loss",
+    )
+    axes[0, 0].set_title("Train vs Same-finger Validation Loss")
     axes[0, 0].set_xlabel("Epoch")
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].legend()
 
-    axes[0, 1].plot(epochs, values("train_pos_dist"), label="train_pos")
-    axes[0, 1].plot(epochs, values("train_neg_dist"), label="train_neg")
-    axes[0, 1].plot(epochs, values("val_pos_mean", "val_pos_dist"), label="val_pos")
-    axes[0, 1].plot(epochs, values("val_neg_mean", "val_neg_dist"), label="val_neg")
-    axes[0, 1].set_title("Descriptor Distances")
+    axes[0, 1].plot(
+        epochs,
+        values("val_pos_p95", "val_pos_mean"),
+        label="val_pos_p95",
+    )
+    axes[0, 1].plot(
+        epochs,
+        values("val_same_finger_neg_p01", "val_neg_p01"),
+        label="same_finger_neg_p01",
+    )
+    axes[0, 1].set_title("Difficult Positive/Negative Tails")
     axes[0, 1].set_xlabel("Epoch")
     axes[0, 1].grid(True, alpha=0.3)
     axes[0, 1].legend()
@@ -560,17 +663,29 @@ def plot_training_curves(metrics_path: Path, output_path: Path) -> None:
     axes[1, 0].plot(
         epochs,
         values("val_fpr_at_tpr95"),
-        label="val_fpr_at_tpr95",
-        color="tab:red",
+        label="overall_fpr_at_tpr95",
     )
-    axes[1, 0].set_title("FPR@TPR=95%")
+    axes[1, 0].plot(
+        epochs,
+        values("val_same_finger_fpr_at_tpr95", "val_fpr_at_tpr95"),
+        label="same_finger_fpr_at_tpr95",
+    )
+    axes[1, 0].set_title("FPR at TPR=95%")
     axes[1, 0].set_xlabel("Epoch")
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].legend()
 
-    if rows and "lr" in rows[0]:
-        axes[1, 1].plot(epochs, values("lr"), label="lr", color="tab:green")
-    axes[1, 1].set_title("Learning Rate")
+    axes[1, 1].plot(
+        epochs,
+        values("val_same_finger_tpr_at_fpr_1e_4"),
+        label="same_finger_tpr_at_fpr_1e_4",
+    )
+    axes[1, 1].plot(
+        epochs,
+        values("val_same_finger_recall_at_1"),
+        label="same_finger_recall_at_1",
+    )
+    axes[1, 1].set_title("Same-finger Strict TPR and Recall@1")
     axes[1, 1].set_xlabel("Epoch")
     axes[1, 1].grid(True, alpha=0.3)
     axes[1, 1].legend()
@@ -696,10 +811,13 @@ def main() -> None:
     optim_cfg["name"] = normalize_optimizer_name(optim_cfg.get("name"))
     optim_cfg["lr"] = float(optim_cfg.get("lr", 0.1))
     optim_cfg["weight_decay"] = float(optim_cfg.get("weight_decay", 1e-4))
-    validation_protocol_name = str(validation_cfg.get("protocol", "fixed_pairs_v1")).strip().lower()
-    if validation_protocol_name != "fixed_pairs_v1":
+    validation_protocol_name = str(
+        validation_cfg.get("protocol", "fixed_pairs_v2_spatial")
+    ).strip().lower()
+    if validation_protocol_name != "fixed_pairs_v2_spatial":
         raise ValueError(
-            f"Unsupported validation.protocol: {validation_protocol_name!r}. Expected 'fixed_pairs_v1'."
+            f"Unsupported validation.protocol: {validation_protocol_name!r}. "
+            "Expected 'fixed_pairs_v2_spatial'."
         )
     validation_cfg["protocol"] = validation_protocol_name
     validation_cfg["seed"] = int(validation_cfg.get("seed", seed + 10_000))
@@ -711,6 +829,22 @@ def main() -> None:
         validation_cfg.get("cross_finger_negatives_per_anchor", 32)
     )
     validation_cfg["batch_size"] = int(validation_cfg.get("batch_size", batch_size))
+    train_cfg["same_finger_min_coordinate_separation_px"] = (
+        normalize_min_coordinate_separation(
+            train_cfg.get(
+                "same_finger_min_coordinate_separation_px",
+                DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
+            )
+        )
+    )
+    validation_cfg["same_finger_min_coordinate_separation_px"] = (
+        normalize_min_coordinate_separation(
+            validation_cfg.get(
+                "same_finger_min_coordinate_separation_px",
+                train_cfg["same_finger_min_coordinate_separation_px"],
+            )
+        )
+    )
 
     model_cfg["architecture"] = normalize_model_architecture(
         model_cfg.get("architecture")
@@ -763,6 +897,9 @@ def main() -> None:
         positive_count=int(validation_cfg["positive_count"]),
         same_finger_negatives_per_anchor=int(validation_cfg["same_finger_negatives_per_anchor"]),
         cross_finger_negatives_per_anchor=int(validation_cfg["cross_finger_negatives_per_anchor"]),
+        same_finger_min_coordinate_separation_px=float(
+            validation_cfg["same_finger_min_coordinate_separation_px"]
+        ),
         seed=int(validation_cfg["seed"]),
     )
     validation_loader, validation_patch_refs = make_validation_patch_loader(
@@ -781,6 +918,9 @@ def main() -> None:
         margin=float(train_cfg.get("margin", 1.0)),
         hard_negative_strategy=str(train_cfg.get("hard_negative_strategy", "same_finger_allowed")),
         hard_negative_top_k=int(train_cfg.get("hard_negative_top_k", 3)),
+        same_finger_min_coordinate_separation_px=float(
+            train_cfg["same_finger_min_coordinate_separation_px"]
+        ),
     )
     optimizer = build_optimizer(model, optim_cfg)
 
@@ -808,6 +948,8 @@ def main() -> None:
         f"margin={train_cfg.get('margin', 1.0)} steps_per_epoch={steps_per_epoch} epochs={epochs} "
         f"hard_negative_strategy={train_cfg.get('hard_negative_strategy', 'same_finger_allowed')} "
         f"hard_negative_top_k={train_cfg.get('hard_negative_top_k', 3)} "
+        f"same_finger_min_coordinate_separation_px="
+        f"{train_cfg['same_finger_min_coordinate_separation_px']} "
         f"scheduler={scheduler} warmup_epochs={warmup_epochs} eta_min={eta_min} "
         f"early_stop_patience={early_stop_patience} early_stop_min_delta={early_stop_min_relative} "
         f"mixed_precision={train_cfg.get('mixed_precision', 'fp16') if amp_enabled else 'fp32'} "
@@ -831,6 +973,7 @@ def main() -> None:
             optimizer,
             device,
             steps_per_epoch,
+            config=config,
             scaler=scaler,
         )
         print(f"resumed from {resume_path} | start_epoch={start_epoch} global_step={global_step}", flush=True)
@@ -921,9 +1064,23 @@ def main() -> None:
         metric_row = {
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
-            "train_pos_dist": train_metrics["pos_dist"],
-            "train_neg_dist": train_metrics["neg_dist"],
-            **{f"val_{name}": value for name, value in val_metrics.items()},
+            "val_loss": val_metrics["loss"],
+            "val_same_finger_loss": val_metrics["same_finger_loss"],
+            "val_pos_p95": val_metrics["pos_p95"],
+            "val_same_finger_neg_p01": val_metrics["same_finger_neg_p01"],
+            "val_same_finger_tail_gap": (
+                val_metrics["same_finger_neg_p01"] - val_metrics["pos_p95"]
+            ),
+            "val_fpr_at_tpr95": current_fpr_at_tpr95,
+            "val_same_finger_fpr_at_tpr95": val_metrics[
+                "same_finger_fpr_at_tpr95"
+            ],
+            "val_same_finger_tpr_at_fpr_1e_4": val_metrics[
+                "same_finger_tpr_at_fpr_1e_4"
+            ],
+            "val_same_finger_recall_at_1": val_metrics[
+                "same_finger_recall_at_1"
+            ],
             "lr": train_metrics["lr"],
             "early_stop_best_fpr_at_tpr95": early_stop_best_fpr_at_tpr95,
             "no_improve_epochs": no_improve_epochs,
@@ -931,18 +1088,22 @@ def main() -> None:
         append_metrics(output_dir / "metrics.csv", metric_row)
 
         print(
-            f"epoch={epoch} done train_loss={train_metrics['loss']:.4f} "
-            f"val_loss={val_metrics['loss']:.4f} "
-            f"val_fpr_at_tpr95={current_fpr_at_tpr95:.6f} "
-            f"val_tpr_at_fpr_1e_4={val_metrics['tpr_at_fpr_1e_4']:.6f} "
-            f"val_recall_at_1={val_metrics['recall_at_1']:.4f} "
-            f"best_for_stop={early_stop_best_fpr_at_tpr95:.6f} {early_stop_message}",
+            f"epoch={epoch} done "
+            f"train_loss={train_metrics['loss']:.4g} "
+            f"val_same_loss={val_metrics['same_finger_loss']:.4g} "
+            f"val_fpr95={current_fpr_at_tpr95:.4g} "
+            f"same_fpr95={val_metrics['same_finger_fpr_at_tpr95']:.4g} "
+            f"same_tpr1e4={val_metrics['same_finger_tpr_at_fpr_1e_4']:.4g} "
+            f"same_recall1={val_metrics['same_finger_recall_at_1']:.4g} "
+            f"tail_gap={metric_row['val_same_finger_tail_gap']:.4g} "
+            f"best_for_stop={early_stop_best_fpr_at_tpr95:.4g} "
+            f"{early_stop_message}",
             flush=True,
         )
         if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
             print(
                 f"early stopping: val_fpr_at_tpr95 has not improved by "
-                f"{early_stop_min_relative * 100:.2f}% for {early_stop_patience} epochs.",
+                f"{early_stop_min_relative * 100:.4g}% for {early_stop_patience} epochs.",
                 flush=True,
             )
             break

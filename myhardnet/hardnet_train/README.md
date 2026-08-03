@@ -7,8 +7,9 @@
 
 - `model.py`：保留原 HardNet、MobileHardNet 与 HardNet Strong V2，统一接收 `[B, 1, 32, 32]` patch。
 - `loss.py`：top-k hardest-in-batch triplet margin loss。
-- `data.py`：CSV 数据集、PIL patch 读取、union-find 物理点分组和训练 batch sampler。
-- `validation.py`：固定正样本、同指纹负样本和跨指纹负样本协议。
+- `data.py`：CSV 数据集、坐标契约、PIL patch 读取、union-find 物理点分组和训练 batch sampler。
+- `negative_sampling.py`：同指负样本的 16px 方形邻域规则，供训练和验证共同使用。
+- `validation.py`：固定正样本、空间过滤后的同指负样本和跨指纹负样本协议。
 - `metrics.py`：运行均值、ROC/ranking、距离分位数和 active-triplet 指标。
 - `optim.py`：SGD/AdamW 工厂与 decay/no-decay 参数分组。
 - `train.py`：训练主入口，负责配置解析、训练、固定验证、checkpoint 和 metrics 输出。
@@ -21,8 +22,31 @@
 
 - `best.pt`：固定协议 `val_fpr_at_tpr95` 最低的 checkpoint。
 - `last.pt`：最后一个 epoch 的 checkpoint。
-- `metrics.csv`：每个 epoch 的训练指标、总体验证指标及 `same_finger` / `cross_finger` 分项。
+- `metrics.csv`：每个 epoch 只记录与最终匹配最相关的精简指标，浮点值最多保留 4 位有效数字。
 - `resolved_config.json`：包含命令行覆盖后的实际配置快照。
+
+### 精简训练指标
+
+新的 `metrics.csv` 每个 epoch 只写入以下字段：
+
+- `epoch`
+- `train_loss`
+- `val_loss`
+- `val_same_finger_loss`
+- `val_pos_p95`
+- `val_same_finger_neg_p01`
+- `val_same_finger_tail_gap`：`val_same_finger_neg_p01 - val_pos_p95`
+- `val_fpr_at_tpr95`
+- `val_same_finger_fpr_at_tpr95`
+- `val_same_finger_tpr_at_fpr_1e_4`
+- `val_same_finger_recall_at_1`
+- `lr`
+- `early_stop_best_fpr_at_tpr95`
+- `no_improve_epochs`
+
+浮点指标以 4 位有效数字写入 CSV；epoch 和早停计数保持整数。删除的 ROC AUC、EER、跨指分项和均值仍会在内存中用于 checkpoint 验证结果，但不再扩散到逐 epoch CSV。
+
+训练曲线同步聚焦于同指误接受、严格低 FPR 下的 TPR、Recall@1，以及正负困难尾部。旧 schema 的 `metrics.csv` 不能与新 schema 混写，继续训练必须使用匹配新协议的新输出目录。
 
 ## 网络架构切换
 
@@ -98,8 +122,8 @@ HardNet 的 top-k hardest-in-batch loss 会从 batch 内选择最相似的若干
 
 负样本候选策略由 `training.hard_negative_strategy` 控制：
 
-- `same_finger_allowed`：允许同一 `finger_id` 内的样本成为负样本，但会屏蔽同一 `point_group`。如果 CSV 中存在 A-B、B-C 两条正样本关系，即使没有显式 A-C，union-find 也会把 A、B、C 合并为同一物理点组，loss 不会把 A-C 当负样本。
-- `different_finger`：最难负样本只能来自不同 `finger_id`。使用这个策略时，每个 batch 至少需要 2 根手指，因此 `fingers_per_batch` 也必须大于等于 2。
+- `same_finger_allowed`：允许同一 `finger_id` 内的样本成为负样本，但会先屏蔽同一 `point_group`。如果 CSV 中存在 A-B、B-C 两条正样本关系，即使没有显式 A-C，union-find 也会把 A、B、C 合并为同一物理点组，loss 不会把 A-C 当负样本。对仍然合法的同指候选，仅在同一原图坐标系内比较坐标，并要求 `max(|dx|, |dy|) >= same_finger_min_coordinate_separation_px`；默认阈值为 16px，等于 16 时允许。
+- `different_finger`：最难负样本只能来自不同 `finger_id`。使用这个策略时，每个 batch 至少需要 2 根手指，因此 `fingers_per_batch` 也必须大于等于 2；同指空间规则不会影响跨指候选。
 
 难负样本数量由 `training.hard_negative_top_k` 控制，默认是 `3`。对每条正样本，loss 会合并
 anchor→positive 和 positive→anchor 两个方向的合法负样本候选，选距离最小的 k 个，分别计算
@@ -112,6 +136,9 @@ triplet margin loss 后求均值。合法候选不足 k 个时只使用现有候
 2. 每个 `finger_id` 在当前 batch 中只使用一个 `image_pair_id`，也就是只来自两张图。
 3. 通过 union-find 把正样本关系连起来的关键点合并为 `point_group`。
 4. loss 计算时屏蔽同一 `point_group` 的候选负样本。
+5. 对同指候选，anchor→positive 方向使用 A 图坐标，positive→anchor 方向使用 B 图坐标；只有同一坐标参考图内、位于锚点中心 32x32 方形邻域之外的点才合法。
+
+固定验证使用 `fixed_pairs_v2_spatial`。每个同指负样本必须来自 anchor 所在的原图、属于不同 `point_group`，并满足相同的 16px 方形间隔；跨指负样本不比较坐标。该协议改变了验证配对集合，旧 `fixed_pairs_v1` 指标不能与新指标直接混写，旧 checkpoint 也不能在原输出目录中续训。
 
 命令行可临时覆盖：
 

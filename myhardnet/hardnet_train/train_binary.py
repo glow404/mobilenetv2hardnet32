@@ -26,6 +26,10 @@ from hardnet_train.binary_validation import evaluate_binary_fixed_protocol
 from hardnet_train.data import FingerprintPairDataset
 from hardnet_train.loss import normalize_hard_negative_strategy
 from hardnet_train.metrics import RunningMean
+from hardnet_train.negative_sampling import (
+    DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
+    normalize_min_coordinate_separation,
+)
 from hardnet_train.model import (
     build_descriptor_model,
     checkpoint_descriptor_dim,
@@ -46,6 +50,7 @@ from hardnet_train.train import (
     load_config,
     make_loader,
     move_optimizer_state_to_device,
+    negative_sampling_contract,
     resolve_amp,
     resolve_device,
     resolve_path,
@@ -53,6 +58,7 @@ from hardnet_train.train import (
     scheduled_lr,
     set_optimizer_lr,
     set_seed,
+    validate_resume_negative_sampling_contract,
 )
 from hardnet_train.validation import (
     build_fixed_validation_protocol,
@@ -221,6 +227,14 @@ def train_binary_one_epoch(
         positive = batch["positive"].to(device, non_blocking=True)
         point_group = batch["point_group"].to(device, non_blocking=True)
         finger_group = batch["finger_group"].to(device, non_blocking=True)
+        anchor_xy = batch["anchor_xy"].to(device, non_blocking=True)
+        positive_xy = batch["positive_xy"].to(device, non_blocking=True)
+        anchor_coordinate_frame_group = batch[
+            "anchor_coordinate_frame_group"
+        ].to(device, non_blocking=True)
+        positive_coordinate_frame_group = batch[
+            "positive_coordinate_frame_group"
+        ].to(device, non_blocking=True)
         if channels_last:
             anchor = anchor.contiguous(memory_format=torch.channels_last)
             positive = positive.contiguous(memory_format=torch.channels_last)
@@ -238,6 +252,10 @@ def train_binary_one_epoch(
             positive_features,
             point_group=point_group,
             finger_group=finger_group,
+            anchor_xy=anchor_xy,
+            positive_xy=positive_xy,
+            anchor_coordinate_frame_group=anchor_coordinate_frame_group,
+            positive_coordinate_frame_group=positive_coordinate_frame_group,
         )
         scaler.scale(loss).backward()
         if grad_clip_norm > 0.0:
@@ -307,6 +325,7 @@ def save_binary_checkpoint(
         "training_task": "binary_descriptor",
         "epoch": int(epoch),
         "global_step": int(global_step),
+        "negative_sampling_contract": negative_sampling_contract(resolved_config),
         **metadata,
         "quantization_method": "tanh_ste_sign",
         "quantization_temperature": model.quantization_temperature,
@@ -338,6 +357,7 @@ def load_binary_checkpoint(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     steps_per_epoch: int,
+    config: Mapping[str, Any],
     scaler: torch.amp.GradScaler | None = None,
 ) -> tuple[int, int]:
     """恢复二值训练，并严格校验 backbone/hash 契约。"""
@@ -345,6 +365,7 @@ def load_binary_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if not isinstance(checkpoint, Mapping):
         raise ValueError(f"Unsupported binary checkpoint format: {checkpoint_path}")
+    validate_resume_negative_sampling_contract(checkpoint, config)
     if checkpoint.get("training_task") != "binary_descriptor":
         raise ValueError(
             f"Checkpoint is not a binary descriptor training checkpoint: {checkpoint_path}"
@@ -440,12 +461,21 @@ def main() -> None:
     )
     if train_cfg["hard_negative_top_k"] < 1:
         raise ValueError("training.hard_negative_top_k must be >= 1.")
+    train_cfg["same_finger_min_coordinate_separation_px"] = (
+        normalize_min_coordinate_separation(
+            train_cfg.get(
+                "same_finger_min_coordinate_separation_px",
+                DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
+            )
+        )
+    )
     validation_protocol_name = str(
-        validation_cfg.get("protocol", "fixed_pairs_v1")
+        validation_cfg.get("protocol", "fixed_pairs_v2_spatial")
     ).strip().lower()
-    if validation_protocol_name != "fixed_pairs_v1":
+    if validation_protocol_name != "fixed_pairs_v2_spatial":
         raise ValueError(
-            f"Unsupported validation.protocol: {validation_protocol_name!r}."
+            f"Unsupported validation.protocol: {validation_protocol_name!r}. "
+            "Expected 'fixed_pairs_v2_spatial'."
         )
     validation_cfg["protocol"] = validation_protocol_name
     binary_cfg["hash_bits"] = int(binary_cfg.get("hash_bits", 256))
@@ -523,6 +553,14 @@ def main() -> None:
     validation_cfg["batch_size"] = int(
         validation_cfg.get("batch_size", batch_size)
     )
+    validation_cfg["same_finger_min_coordinate_separation_px"] = (
+        normalize_min_coordinate_separation(
+            validation_cfg.get(
+                "same_finger_min_coordinate_separation_px",
+                train_cfg["same_finger_min_coordinate_separation_px"],
+            )
+        )
+    )
     validation_protocol = build_fixed_validation_protocol(
         records=validation_dataset.records,
         positive_count=validation_cfg["positive_count"],
@@ -531,6 +569,9 @@ def main() -> None:
         ],
         cross_finger_negatives_per_anchor=validation_cfg[
             "cross_finger_negatives_per_anchor"
+        ],
+        same_finger_min_coordinate_separation_px=validation_cfg[
+            "same_finger_min_coordinate_separation_px"
         ],
         seed=validation_cfg["seed"],
     )
@@ -574,7 +615,8 @@ def main() -> None:
             optimizer,
             device,
             steps_per_epoch,
-            scaler,
+            config=config,
+            scaler=scaler,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)

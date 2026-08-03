@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import random
 from collections import defaultdict
 from dataclasses import dataclass
@@ -40,6 +41,14 @@ class PairRecord:
     finger_id: str
     finger_group: int
     image_pair_id: str
+    image_a_id: str
+    image_b_id: str
+    anchor_coordinate_frame_group: int
+    positive_coordinate_frame_group: int
+    anchor_x: float
+    anchor_y: float
+    positive_x: float
+    positive_y: float
     point_key: str
     point_group: int
     pair_id: str
@@ -90,6 +99,33 @@ def _keypoint_node(row: dict[str, str], side: str) -> str:
     return "|".join([row.get("finger_id", ""), image_id, kp_idx])
 
 
+_REQUIRED_COORDINATE_FIELDS = (
+    "image_a_id",
+    "image_b_id",
+    "x_a",
+    "y_a",
+    "x_b",
+    "y_b",
+)
+
+
+def _parse_coordinate(row: dict[str, str], key: str, row_number: int) -> float:
+    """读取有限坐标；空间负样本规则不接受缺失或非法值。"""
+
+    raw = row.get(key, "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid coordinate {key}={raw!r} at CSV row {row_number}."
+        ) from exc
+    if not math.isfinite(value):
+        raise ValueError(
+            f"Coordinate {key} must be finite at CSV row {row_number}, got {raw!r}."
+        )
+    return value
+
+
 class FingerprintPairDataset(Dataset):
     """读取 `pair_build` 输出的正样本 patch 对。"""
 
@@ -111,7 +147,16 @@ class FingerprintPairDataset(Dataset):
 
         with self.csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
-            for row in reader:
+            fieldnames = set(reader.fieldnames or ())
+            missing_fields = [
+                field for field in _REQUIRED_COORDINATE_FIELDS if field not in fieldnames
+            ]
+            if missing_fields:
+                raise ValueError(
+                    f"CSV {self.csv_path} is missing coordinate fields required by "
+                    f"same-finger negative filtering: {missing_fields}."
+                )
+            for row_number, row in enumerate(reader, start=2):
                 # max_rows 用于 smoke test 或快速小实验；正式训练保持 None。
                 if max_rows is not None and len(rows) >= int(max_rows):
                     break
@@ -120,9 +165,20 @@ class FingerprintPairDataset(Dataset):
                 if max_rows_per_finger is not None and per_finger_counts[finger_id] >= int(max_rows_per_finger):
                     continue
 
+                for image_field in ("image_a_id", "image_b_id"):
+                    if not str(row.get(image_field, "")).strip():
+                        raise ValueError(
+                            f"CSV row {row_number} has an empty {image_field}; "
+                            "coordinate frames must be explicit."
+                        )
+                for coordinate_field in ("x_a", "y_a", "x_b", "y_b"):
+                    _parse_coordinate(row, coordinate_field, row_number)
+
                 # 一条正样本边说明 A 图关键点和 P 图关键点应属于同一个物理点。
                 union_find.union(_keypoint_node(row, "a"), _keypoint_node(row, "p"))
-                rows.append(row)
+                current = dict(row)
+                current["_csv_row_number"] = str(row_number)
+                rows.append(current)
                 per_finger_counts[finger_id] += 1
 
         if not rows:
@@ -130,12 +186,22 @@ class FingerprintPairDataset(Dataset):
 
         root_to_group: dict[str, int] = {}
         finger_to_group: dict[str, int] = {}
+        coordinate_frame_to_group: dict[tuple[str, str], int] = {}
         self.records = []
         for row_index, row in enumerate(rows):
             # union-find 的 root 是字符串，不适合直接搬到 GPU；这里映射成连续 int。
             root = union_find.find(_keypoint_node(row, "a"))
             point_group = root_to_group.setdefault(root, len(root_to_group))
             finger_group = finger_to_group.setdefault(row["finger_id"], len(finger_to_group))
+            anchor_frame = (row["finger_id"], row["image_a_id"])
+            positive_frame = (row["finger_id"], row["image_b_id"])
+            anchor_coordinate_frame_group = coordinate_frame_to_group.setdefault(
+                anchor_frame, len(coordinate_frame_to_group)
+            )
+            positive_coordinate_frame_group = coordinate_frame_to_group.setdefault(
+                positive_frame, len(coordinate_frame_to_group)
+            )
+            csv_row_number = int(row["_csv_row_number"])
             self.records.append(
                 PairRecord(
                     patch_a_path=row["patch_a_path"],
@@ -143,6 +209,14 @@ class FingerprintPairDataset(Dataset):
                     finger_id=row["finger_id"],
                     finger_group=finger_group,
                     image_pair_id=row["image_pair_id"],
+                    image_a_id=row["image_a_id"],
+                    image_b_id=row["image_b_id"],
+                    anchor_coordinate_frame_group=anchor_coordinate_frame_group,
+                    positive_coordinate_frame_group=positive_coordinate_frame_group,
+                    anchor_x=_parse_coordinate(row, "x_a", csv_row_number),
+                    anchor_y=_parse_coordinate(row, "y_a", csv_row_number),
+                    positive_x=_parse_coordinate(row, "x_b", csv_row_number),
+                    positive_y=_parse_coordinate(row, "y_b", csv_row_number),
                     point_key=root,
                     point_group=point_group,
                     pair_id=row.get("pair_id", str(row_index)),
@@ -201,6 +275,18 @@ class FingerprintPairDataset(Dataset):
             "positive": self.load_patch(index, "positive"),
             "point_group": torch.tensor(record.point_group, dtype=torch.long),
             "finger_group": torch.tensor(record.finger_group, dtype=torch.long),
+            "anchor_xy": torch.tensor(
+                (record.anchor_x, record.anchor_y), dtype=torch.float32
+            ),
+            "positive_xy": torch.tensor(
+                (record.positive_x, record.positive_y), dtype=torch.float32
+            ),
+            "anchor_coordinate_frame_group": torch.tensor(
+                record.anchor_coordinate_frame_group, dtype=torch.long
+            ),
+            "positive_coordinate_frame_group": torch.tensor(
+                record.positive_coordinate_frame_group, dtype=torch.long
+            ),
             "finger_id": record.finger_id,
             "image_pair_id": record.image_pair_id,
             "pair_id": record.pair_id,

@@ -11,6 +11,9 @@ from torch.nn import functional as F
 
 from hardnet_train.binary_model import BinaryDescriptorFeatures
 from hardnet_train.loss import HardNetLoss
+from hardnet_train.negative_sampling import (
+    DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
+)
 
 
 class BinaryDescriptorLoss(nn.Module):
@@ -22,6 +25,9 @@ class BinaryDescriptorLoss(nn.Module):
         margin: float = 0.8,
         hard_negative_strategy: str = "same_finger_allowed",
         hard_negative_top_k: int = 3,
+        same_finger_min_coordinate_separation_px: float = (
+            DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX
+        ),
         metric_weight: float = 1.0,
         teacher_similarity_weight: float = 0.5,
         positive_consistency_weight: float = 0.1,
@@ -34,6 +40,9 @@ class BinaryDescriptorLoss(nn.Module):
             margin=margin,
             hard_negative_strategy=hard_negative_strategy,
             hard_negative_top_k=hard_negative_top_k,
+            same_finger_min_coordinate_separation_px=(
+                same_finger_min_coordinate_separation_px
+            ),
         )
         self.weights = {
             "metric": float(metric_weight),
@@ -67,6 +76,12 @@ class BinaryDescriptorLoss(nn.Module):
             ),
             hard_negative_top_k=int(
                 training_config.get("hard_negative_top_k", 3)
+            ),
+            same_finger_min_coordinate_separation_px=float(
+                training_config.get(
+                    "same_finger_min_coordinate_separation_px",
+                    DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
+                )
             ),
             metric_weight=float(loss_config.get("metric_weight", 1.0)),
             teacher_similarity_weight=float(
@@ -121,6 +136,10 @@ class BinaryDescriptorLoss(nn.Module):
         positive: BinaryDescriptorFeatures,
         point_group: torch.Tensor | None = None,
         finger_group: torch.Tensor | None = None,
+        anchor_xy: torch.Tensor | None = None,
+        positive_xy: torch.Tensor | None = None,
+        anchor_coordinate_frame_group: torch.Tensor | None = None,
+        positive_coordinate_frame_group: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if anchor.logits.shape != positive.logits.shape:
             raise ValueError(
@@ -137,6 +156,10 @@ class BinaryDescriptorLoss(nn.Module):
             positive_metric,
             point_group=point_group,
             finger_group=finger_group,
+            anchor_xy=anchor_xy,
+            positive_xy=positive_xy,
+            anchor_coordinate_frame_group=anchor_coordinate_frame_group,
+            positive_coordinate_frame_group=positive_coordinate_frame_group,
         )
 
         all_teacher = torch.cat([anchor.teacher_f, positive.teacher_f], dim=0)

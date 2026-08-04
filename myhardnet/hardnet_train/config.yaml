@@ -64,15 +64,15 @@ training:
   log_interval: 50
 
 validation:
-  # 固定空间协议：同指负样本从 anchor 原图选取，并应用相同的 16px 方形邻域过滤。
-  protocol: fixed_pairs_v2_spatial
+  # 固定 in-batch 协议：batch 构造、非法候选屏蔽和双向 top-k 均与训练一致。
+  protocol: fixed_in_batch_v1
   seed: 10042
-  positive_count: 16384
-  same_finger_negatives_per_anchor: 4
-  cross_finger_negatives_per_anchor: 16
-  same_finger_min_coordinate_separation_px: 16
-  # 这里只控制唯一 patch 的前向批量，不改变验证距离对。
-  batch_size: 128
+  # auto 使用 min(验证集可用手指数, batch_size)，保证每根手指至少贡献 1 对样本。
+  # batch_count 只控制固定验证 batch 数；image_pair 不足时会确定性循环，不会因此报错。
+  finger_count: auto
+  batch_count: 256
+  # batch_size 会尽量均匀分配到所选手指；无合法负样本的 anchor 只跳过并计数。
+  batch_size: 64
 
 optimizer:
   # 默认使用 SGD + Nesterov。切换为 adamw 时也要显式设置对应学习率，

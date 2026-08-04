@@ -2,10 +2,10 @@
 
 作用：
     1. 读取 YAML 配置与命令行覆盖参数。
-    2. 构造训练随机 sampler 与确定性固定验证协议。
+    2. 构造训练随机 sampler 与确定性的固定验证 batch 计划。
     3. 构造描述子网络、top-k hardest-in-batch triplet loss 和可配置优化器。
     4. 执行带预热的余弦学习率调度训练。
-    5. 每个 epoch 输出固定验证指标、checkpoint 和 metrics.csv。
+    5. 每个 epoch 输出固定 in-batch 验证指标、checkpoint 和 metrics.csv。
 
 典型用法：
     python -m hardnet_train.train --config hardnet_train/config.yaml --device cuda
@@ -61,9 +61,10 @@ from hardnet_train.model import (
 )
 from hardnet_train.optim import build_optimizer, normalize_optimizer_name, optimizer_name
 from hardnet_train.validation import (
-    build_fixed_validation_protocol,
-    evaluate_fixed_protocol,
-    make_validation_patch_loader,
+    build_fixed_validation_batch_plan,
+    evaluate_fixed_validation_batches,
+    make_fixed_validation_loader,
+    normalize_validation_finger_count,
 )
 
 
@@ -93,9 +94,13 @@ def default_output_dir(architecture: str) -> str:
     """返回统一训练配置在各架构下互不冲突的默认输出目录。"""
 
     return {
-        "hardnet_strong_v2": "../outputs/models/hardnet_train_strong_v2_256",
-        "mobile_hardnet": "../outputs/models/hardnet_train_mobile_128",
-        "hardnet": "../outputs/models/hardnet_train_hardnet_128",
+        "hardnet_strong_v2": (
+            "../outputs/models/hardnet_train_strong_v2_256_fixed_in_batch_v1"
+        ),
+        "mobile_hardnet": (
+            "../outputs/models/hardnet_train_mobile_128_fixed_in_batch_v1"
+        ),
+        "hardnet": "../outputs/models/hardnet_train_hardnet_128_fixed_in_batch_v1",
     }[normalize_model_architecture(architecture)]
 
 
@@ -129,7 +134,13 @@ def negative_sampling_contract(config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(training, Mapping) or not isinstance(validation, Mapping):
         raise ValueError("training and validation config sections must be mappings.")
     return {
-        "contract_version": 1,
+        "contract_version": 3,
+        "training_hard_negative_strategy": normalize_hard_negative_strategy(
+            training.get("hard_negative_strategy", "same_finger_allowed")
+        ),
+        "training_hard_negative_top_k": int(
+            training.get("hard_negative_top_k", 3)
+        ),
         "training_same_finger_min_coordinate_separation_px": (
             normalize_min_coordinate_separation(
                 training.get(
@@ -139,47 +150,119 @@ def negative_sampling_contract(config: Mapping[str, Any]) -> dict[str, Any]:
             )
         ),
         "validation_protocol": str(
-            validation.get("protocol", "fixed_pairs_v2_spatial")
+            validation.get("protocol", "fixed_in_batch_v1")
         )
         .strip()
         .lower(),
-        "validation_same_finger_min_coordinate_separation_px": (
-            normalize_min_coordinate_separation(
-                validation.get(
-                    "same_finger_min_coordinate_separation_px",
-                    training.get(
-                        "same_finger_min_coordinate_separation_px",
-                        DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
-                    ),
-                )
-            )
+        "validation_seed": int(validation.get("seed", 10_042)),
+        "validation_finger_count": normalize_validation_finger_count(
+            validation.get("finger_count", "auto")
+        ),
+        "validation_batch_count": int(
+            validation.get("batch_count", 256)
+        ),
+        "validation_batch_size": int(
+            validation.get("batch_size", 24)
         ),
         "same_finger_coordinate_rule": "outside_square",
         "same_finger_coordinate_scope": "same_finger_same_image",
+        "validation_candidate_rule": "same_as_training_in_batch",
     }
+
+
+_LEGACY_FIXED_PAIR_VALIDATION_KEYS = {
+    "positive_count",
+    "same_finger_negatives_per_anchor",
+    "cross_finger_negatives_per_anchor",
+    "same_finger_min_coordinate_separation_px",
+}
+
+
+def normalize_fixed_in_batch_validation_config(
+    validation_config: dict[str, Any],
+    *,
+    default_seed: int,
+) -> None:
+    """规范化唯一支持的固定 in-batch 验证配置，并拒绝旧配额字段。"""
+
+    protocol = str(
+        validation_config.get("protocol", "fixed_in_batch_v1")
+    ).strip().lower()
+    if protocol != "fixed_in_batch_v1":
+        raise ValueError(
+            f"Unsupported validation.protocol: {protocol!r}. Expected "
+            "'fixed_in_batch_v1'; old fixed-pair protocols require a new "
+            "configuration and output directory."
+        )
+    legacy_keys = sorted(
+        key
+        for key in _LEGACY_FIXED_PAIR_VALIDATION_KEYS
+        if key in validation_config
+    )
+    if legacy_keys:
+        raise ValueError(
+            "Legacy fixed-pair validation fields are not supported by "
+            f"fixed_in_batch_v1: {legacy_keys}. Configure finger_count, "
+            "batch_count and batch_size instead."
+        )
+    if "image_pairs_per_finger" in validation_config:
+        raise ValueError(
+            "validation.image_pairs_per_finger has been replaced by "
+            "validation.batch_count. The new plan cycles deterministically through "
+            "each selected finger's available image_pair values."
+        )
+
+    validation_config["protocol"] = protocol
+    validation_config["seed"] = int(
+        validation_config.get("seed", default_seed)
+    )
+    validation_config["finger_count"] = normalize_validation_finger_count(
+        validation_config.get("finger_count", "auto")
+    )
+    validation_config["batch_count"] = int(
+        validation_config.get("batch_count", 256)
+    )
+    validation_config["batch_size"] = int(
+        validation_config.get("batch_size", 24)
+    )
+    if validation_config["batch_count"] < 1:
+        raise ValueError("validation.batch_count must be >= 1.")
+    if validation_config["batch_size"] < 2:
+        raise ValueError(
+            "validation.batch_size must be >= 2 so in-batch negatives can exist."
+        )
+    if (
+        isinstance(validation_config["finger_count"], int)
+        and validation_config["batch_size"] < validation_config["finger_count"]
+    ):
+        raise ValueError(
+            "validation.batch_size must be >= validation.finger_count. Set "
+            "validation.finger_count=auto or adjust the two numeric values."
+        )
 
 
 def validate_resume_negative_sampling_contract(
     checkpoint: Mapping[str, Any],
     current_config: Mapping[str, Any],
 ) -> None:
-    """禁止把旧负样本协议的优化器状态续接到空间过滤实验。"""
+    """禁止把旧训练/验证候选协议的优化器状态续接到新实验。"""
 
     saved_contract = checkpoint.get("negative_sampling_contract")
     if not isinstance(saved_contract, Mapping):
         raise ValueError(
-            "Checkpoint predates the explicit spatial negative-sampling contract; "
-            "do not resume its optimizer state under the new 16px labels. Start a "
-            "new experiment and use the checkpoint only as pretrained weights."
+            "Checkpoint predates the fixed in-batch validation contract; do not "
+            "resume its optimizer state under the new protocol. Start a new "
+            "experiment and use the checkpoint only as pretrained weights."
         )
     saved_contract = dict(saved_contract)
     current_contract = negative_sampling_contract(current_config)
     if saved_contract != current_contract:
         raise ValueError(
-            "Checkpoint negative-sampling protocol mismatch: "
+            "Checkpoint negative-sampling/validation protocol mismatch: "
             f"checkpoint={saved_contract}, configured={current_contract}. "
-            "The 16px spatial protocol changes training labels and validation pairs; "
-            "start a new output directory instead of resuming this checkpoint."
+            "The fixed in-batch protocol changes validation batches and candidate "
+            "selection; start a new output directory instead of resuming this "
+            "checkpoint."
         )
 
 
@@ -195,7 +278,7 @@ def set_seed(seed: int) -> None:
 def make_loader(config: dict[str, Any], split: str, batch_size: int, steps: int, seed: int) -> DataLoader:
     """构造使用随机 hardest-in-batch sampler 的训练 DataLoader。
 
-    固定验证协议不调用此函数，避免验证距离对随 epoch 改变。
+    验证使用同一采样语义，但 batch 索引在训练启动时一次性固化。
     """
     data_cfg = config["data"]
     train_cfg = config["training"]
@@ -208,9 +291,30 @@ def make_loader(config: dict[str, Any], split: str, batch_size: int, steps: int,
         normalize=bool(data_cfg.get("normalize", True)),
     )
     available_fingers = len({record.finger_id for record in dataset.records})
-    # 验证集可能只有 3 根手指；如果配置的 fingers_per_batch 更大，自动降到可用手指数。
-    fingers_per_batch = min(int(train_cfg.get("fingers_per_batch", 8)), available_fingers)
-    hard_negative_strategy = normalize_hard_negative_strategy(train_cfg.get("hard_negative_strategy", "same_finger_allowed"))
+    requested_fingers_per_batch = int(train_cfg.get("fingers_per_batch", 8))
+    if requested_fingers_per_batch < 1:
+        raise ValueError("training.fingers_per_batch must be >= 1.")
+    if available_fingers < 1:
+        raise ValueError(f"No usable fingers found for split={split}.")
+    fingers_per_batch = min(requested_fingers_per_batch, available_fingers)
+    if fingers_per_batch > batch_size:
+        raise ValueError(
+            f"Effective fingers_per_batch={fingers_per_batch} exceeds "
+            f"training.batch_size={batch_size} for split={split}. Increase "
+            "batch_size or reduce training.fingers_per_batch."
+        )
+    if fingers_per_batch != requested_fingers_per_batch:
+        print(
+            "configuration adjustment: "
+            f"training.fingers_per_batch={requested_fingers_per_batch} reduced "
+            f"to {fingers_per_batch} because split={split} contains only "
+            f"{available_fingers} usable fingers.",
+            flush=True,
+        )
+    train_cfg["fingers_per_batch"] = fingers_per_batch
+    hard_negative_strategy = normalize_hard_negative_strategy(
+        train_cfg.get("hard_negative_strategy", "same_finger_allowed")
+    )
     if hard_negative_strategy == "different_finger" and fingers_per_batch < 2:
         raise ValueError(
             "hard_negative_strategy='different_finger' requires at least 2 fingers per batch "
@@ -706,11 +810,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument(
-        "--val-steps",
-        type=int,
+        "--val-finger-count",
+        type=normalize_validation_finger_count,
         default=None,
-        help="Deprecated: fixed validation size is configured under validation.",
     )
+    parser.add_argument("--val-batch-count", type=int, default=None)
+    parser.add_argument("--val-batch-size", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--fingers-per-batch", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
@@ -769,8 +874,12 @@ def main() -> None:
         train_cfg["epochs"] = int(args.epochs)
     if args.steps_per_epoch is not None:
         train_cfg["steps_per_epoch"] = int(args.steps_per_epoch)
-    if args.val_steps is not None:
-        raise ValueError("--val-steps is no longer used; fixed validation size is configured under validation.")
+    if args.val_finger_count is not None:
+        validation_cfg["finger_count"] = args.val_finger_count
+    if args.val_batch_count is not None:
+        validation_cfg["batch_count"] = int(args.val_batch_count)
+    if args.val_batch_size is not None:
+        validation_cfg["batch_size"] = int(args.val_batch_size)
     if args.batch_size is not None:
         train_cfg["batch_size"] = int(args.batch_size)
     if args.device is not None:
@@ -805,43 +914,27 @@ def main() -> None:
     epochs = int(train_cfg.get("epochs", 10))
     steps_per_epoch = int(train_cfg.get("steps_per_epoch", 1000))
     batch_size = int(train_cfg.get("batch_size", 128))
+    if epochs <= 0 or steps_per_epoch <= 0:
+        raise ValueError("training.epochs and training.steps_per_epoch must be > 0.")
+    if batch_size < 2:
+        raise ValueError(
+            "training.batch_size must be >= 2 so in-batch negatives can exist."
+        )
     train_cfg["epochs"] = epochs
     train_cfg["steps_per_epoch"] = steps_per_epoch
     train_cfg["batch_size"] = batch_size
     optim_cfg["name"] = normalize_optimizer_name(optim_cfg.get("name"))
     optim_cfg["lr"] = float(optim_cfg.get("lr", 0.1))
     optim_cfg["weight_decay"] = float(optim_cfg.get("weight_decay", 1e-4))
-    validation_protocol_name = str(
-        validation_cfg.get("protocol", "fixed_pairs_v2_spatial")
-    ).strip().lower()
-    if validation_protocol_name != "fixed_pairs_v2_spatial":
-        raise ValueError(
-            f"Unsupported validation.protocol: {validation_protocol_name!r}. "
-            "Expected 'fixed_pairs_v2_spatial'."
-        )
-    validation_cfg["protocol"] = validation_protocol_name
-    validation_cfg["seed"] = int(validation_cfg.get("seed", seed + 10_000))
-    validation_cfg["positive_count"] = int(validation_cfg.get("positive_count", 16_384))
-    validation_cfg["same_finger_negatives_per_anchor"] = int(
-        validation_cfg.get("same_finger_negatives_per_anchor", 32)
+    normalize_fixed_in_batch_validation_config(
+        validation_cfg,
+        default_seed=seed + 10_000,
     )
-    validation_cfg["cross_finger_negatives_per_anchor"] = int(
-        validation_cfg.get("cross_finger_negatives_per_anchor", 32)
-    )
-    validation_cfg["batch_size"] = int(validation_cfg.get("batch_size", batch_size))
     train_cfg["same_finger_min_coordinate_separation_px"] = (
         normalize_min_coordinate_separation(
             train_cfg.get(
                 "same_finger_min_coordinate_separation_px",
                 DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
-            )
-        )
-    )
-    validation_cfg["same_finger_min_coordinate_separation_px"] = (
-        normalize_min_coordinate_separation(
-            validation_cfg.get(
-                "same_finger_min_coordinate_separation_px",
-                train_cfg["same_finger_min_coordinate_separation_px"],
             )
         )
     )
@@ -855,6 +948,17 @@ def main() -> None:
     )
     train_cfg["hard_negative_strategy"] = normalize_hard_negative_strategy(train_cfg.get("hard_negative_strategy", "same_finger_allowed"))
     train_cfg["hard_negative_top_k"] = int(train_cfg.get("hard_negative_top_k", 3))
+    configured_validation_fingers = validation_cfg["finger_count"]
+    if (
+        train_cfg["hard_negative_strategy"] == "different_finger"
+        and isinstance(configured_validation_fingers, int)
+        and configured_validation_fingers < 2
+    ):
+        raise ValueError(
+            "hard_negative_strategy='different_finger' requires "
+            "validation.finger_count >= 2 or 'auto' with at least two usable "
+            "validation fingers."
+        )
     if train_cfg["hard_negative_top_k"] < 1:
         raise ValueError(
             f"training.hard_negative_top_k must be >= 1, got {train_cfg['hard_negative_top_k']}."
@@ -883,8 +987,14 @@ def main() -> None:
         )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 训练 sampler 保持随机；验证数据流独立扫描 val CSV 并固化索引。
-    train_loader = make_loader(config, "train", batch_size=batch_size, steps=steps_per_epoch, seed=seed)
+    # 训练 batch 随 epoch 改变；验证 batch 在启动时按固定 seed 构建一次并复用。
+    train_loader = make_loader(
+        config,
+        "train",
+        batch_size=batch_size,
+        steps=steps_per_epoch,
+        seed=seed,
+    )
     data_cfg = config["data"]
     validation_dataset = FingerprintPairDataset(
         csv_path=resolve_path(config, data_cfg["val_csv"]),
@@ -892,20 +1002,25 @@ def main() -> None:
         max_rows_per_finger=data_cfg.get("max_val_rows_per_finger"),
         normalize=bool(data_cfg.get("normalize", True)),
     )
-    validation_protocol = build_fixed_validation_protocol(
+    validation_plan = build_fixed_validation_batch_plan(
         records=validation_dataset.records,
-        positive_count=int(validation_cfg["positive_count"]),
-        same_finger_negatives_per_anchor=int(validation_cfg["same_finger_negatives_per_anchor"]),
-        cross_finger_negatives_per_anchor=int(validation_cfg["cross_finger_negatives_per_anchor"]),
-        same_finger_min_coordinate_separation_px=float(
-            validation_cfg["same_finger_min_coordinate_separation_px"]
-        ),
+        finger_count=validation_cfg["finger_count"],
+        batch_count=int(validation_cfg["batch_count"]),
+        batch_size=int(validation_cfg["batch_size"]),
         seed=int(validation_cfg["seed"]),
     )
-    validation_loader, validation_patch_refs = make_validation_patch_loader(
+    validation_cfg["finger_count"] = validation_plan.finger_count
+    if (
+        train_cfg["hard_negative_strategy"] == "different_finger"
+        and validation_plan.finger_count < 2
+    ):
+        raise ValueError(
+            "hard_negative_strategy='different_finger' requires at least two "
+            "usable validation fingers."
+        )
+    validation_loader = make_fixed_validation_loader(
         dataset=validation_dataset,
-        protocol=validation_protocol,
-        batch_size=int(validation_cfg["batch_size"]),
+        plan=validation_plan,
         num_workers=int(data_cfg.get("num_workers", 0)),
         pin_memory=bool(data_cfg.get("pin_memory", False)),
         persistent_workers=bool(data_cfg.get("persistent_workers", True)),
@@ -954,8 +1069,15 @@ def main() -> None:
         f"early_stop_patience={early_stop_patience} early_stop_min_delta={early_stop_min_relative} "
         f"mixed_precision={train_cfg.get('mixed_precision', 'fp16') if amp_enabled else 'fp32'} "
         f"channels_last={channels_last} "
-        f"validation_positives={validation_protocol.positive_count} "
-        f"validation_unique_patches={validation_patch_refs.size}",
+        f"validation_fingers={validation_plan.finger_count} "
+        f"validation_batches={validation_plan.batch_count} "
+        f"validation_batch_size={validation_plan.batch_size} "
+        f"validation_unique_image_pairs_per_finger="
+        f"{min(validation_plan.unique_image_pair_counts)}-"
+        f"{max(validation_plan.unique_image_pair_counts)} "
+        f"validation_fingers_with_image_pair_reuse="
+        f"{validation_plan.repeated_image_pair_finger_count} "
+        f"validation_positives={validation_plan.positive_count}",
         flush=True,
     )
 
@@ -1007,14 +1129,12 @@ def main() -> None:
             amp_dtype=amp_dtype,
             channels_last=channels_last,
         )
-        val_metrics = evaluate_fixed_protocol(
+        val_metrics = evaluate_fixed_validation_batches(
             model=model,
             loader=validation_loader,
-            unique_refs=validation_patch_refs,
-            protocol=validation_protocol,
+            plan=validation_plan,
+            criterion=criterion,
             device=device,
-            margin=float(train_cfg.get("margin", 1.0)),
-            hard_negative_top_k=int(train_cfg.get("hard_negative_top_k", 3)),
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             channels_last=channels_last,
@@ -1081,6 +1201,8 @@ def main() -> None:
             "val_same_finger_recall_at_1": val_metrics[
                 "same_finger_recall_at_1"
             ],
+            "val_valid_anchor_count": int(val_metrics["valid_anchor_count"]),
+            "val_skipped_anchor_count": int(val_metrics["skipped_anchor_count"]),
             "lr": train_metrics["lr"],
             "early_stop_best_fpr_at_tpr95": early_stop_best_fpr_at_tpr95,
             "no_improve_epochs": no_improve_epochs,
@@ -1095,6 +1217,8 @@ def main() -> None:
             f"same_fpr95={val_metrics['same_finger_fpr_at_tpr95']:.4g} "
             f"same_tpr1e4={val_metrics['same_finger_tpr_at_fpr_1e_4']:.4g} "
             f"same_recall1={val_metrics['same_finger_recall_at_1']:.4g} "
+            f"valid_anchors={int(val_metrics['valid_anchor_count'])} "
+            f"skipped_anchors={int(val_metrics['skipped_anchor_count'])} "
             f"tail_gap={metric_row['val_same_finger_tail_gap']:.4g} "
             f"best_for_stop={early_stop_best_fpr_at_tpr95:.4g} "
             f"{early_stop_message}",

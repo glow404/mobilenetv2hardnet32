@@ -1,314 +1,458 @@
-"""确定性的 patch 描述子验证协议。
-
-验证协议与训练 batch sampler 解耦：固定抽取正样本行，并为每个 anchor 固定选择
-跨指负样本；同指负样本必须来自 anchor 原图中的其他物理点组，且位于以 anchor
-为中心的配置方形邻域之外。协议只存在于当前训练进程中。
-"""
+"""与训练采样、候选掩码和 top-k 规则对齐的固定验证 batch。"""
 
 from __future__ import annotations
 
-import hashlib
 import random
-from collections import defaultdict
+import warnings
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
-import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Sampler
 
-from hardnet_train.data import FingerprintPairDataset, PairRecord
-from hardnet_train.metrics import descriptor_validation_metrics, pair_l2_distance
-from hardnet_train.negative_sampling import (
-    DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX,
-    is_outside_square_neighborhood,
-    normalize_min_coordinate_separation,
+from hardnet_train.data import (
+    FingerprintPairDataset,
+    PairRecord,
+    allocate_finger_pair_counts,
+    build_finger_image_pair_index,
+    sample_unique_point_indices,
 )
+from hardnet_train.loss import HardNetLoss
+from hardnet_train.metrics import in_batch_descriptor_validation_metrics
 
 
-ANCHOR_SIDE = 0
-POSITIVE_SIDE = 1
+AUTO_VALIDATION_FINGER_COUNT = "auto"
+VALIDATION_PLAN_WARNING_POSITIVE_SLOTS = 100_000
+VALIDATION_PLAN_MAX_POSITIVE_SLOTS = 10_000_000
 
 
-def _encoded_reference(record_index: int, side: int) -> int:
-    return int(record_index) * 2 + int(side)
+def normalize_validation_finger_count(value: Any) -> int | str:
+    """把验证手指数规范化为正整数或 `auto`。"""
 
-
-def _reference_xy(records: list[PairRecord], encoded_reference: int) -> tuple[float, float]:
-    record_index, side = divmod(int(encoded_reference), 2)
-    record = records[record_index]
-    if side == ANCHOR_SIDE:
-        return record.anchor_x, record.anchor_y
-    return record.positive_x, record.positive_y
-
-
-def _stable_seed(seed: int, *parts: object) -> int:
-    payload = "\x1f".join([str(seed), *(str(part) for part in parts)]).encode("utf-8")
-    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+    text = str(value if value is not None else AUTO_VALIDATION_FINGER_COUNT).strip().lower()
+    if text in {"", AUTO_VALIDATION_FINGER_COUNT}:
+        return AUTO_VALIDATION_FINGER_COUNT
+    try:
+        finger_count = int(text)
+    except ValueError as exc:
+        raise ValueError(
+            "validation.finger_count must be a positive integer or 'auto'."
+        ) from exc
+    if finger_count < 1:
+        raise ValueError("validation.finger_count must be >= 1 or 'auto'.")
+    return finger_count
 
 
 @dataclass(frozen=True)
-class FixedValidationProtocol:
-    """固定验证索引；负样本引用编码为 `record_index * 2 + side`。"""
+class FixedValidationBatchPlan:
+    """训练启动时一次性固化、之后每个 epoch 原样复用的验证 batch 索引。"""
 
-    positive_indices: np.ndarray
-    same_finger_negative_refs: np.ndarray
-    cross_finger_negative_refs: np.ndarray
-    same_finger_min_coordinate_separation_px: float
+    batches: tuple[tuple[int, ...], ...]
+    selected_finger_ids: tuple[str, ...]
+    scheduled_image_pair_ids: tuple[tuple[str, ...], ...]
+    batch_size: int
+    seed: int
+
+    @property
+    def finger_count(self) -> int:
+        return len(self.selected_finger_ids)
+
+    @property
+    def batch_count(self) -> int:
+        return len(self.batches)
 
     @property
     def positive_count(self) -> int:
-        return int(self.positive_indices.shape[0])
+        return sum(len(batch) for batch in self.batches)
 
     @property
-    def same_finger_negatives_per_anchor(self) -> int:
-        return int(self.same_finger_negative_refs.shape[1])
+    def unique_image_pair_counts(self) -> tuple[int, ...]:
+        return tuple(
+            len(set(schedule)) for schedule in self.scheduled_image_pair_ids
+        )
 
     @property
-    def cross_finger_negatives_per_anchor(self) -> int:
-        return int(self.cross_finger_negative_refs.shape[1])
-
-    def positive_anchor_refs(self) -> np.ndarray:
-        return self.positive_indices.astype(np.int64, copy=False) * 2 + ANCHOR_SIDE
-
-    def positive_match_refs(self) -> np.ndarray:
-        return self.positive_indices.astype(np.int64, copy=False) * 2 + POSITIVE_SIDE
-
-    def unique_patch_refs(self) -> np.ndarray:
-        return np.unique(
-            np.concatenate(
-                [
-                    self.positive_anchor_refs(),
-                    self.positive_match_refs(),
-                    self.same_finger_negative_refs.reshape(-1),
-                    self.cross_finger_negative_refs.reshape(-1),
-                ]
-            )
+    def repeated_image_pair_finger_count(self) -> int:
+        return sum(
+            unique_count < self.batch_count
+            for unique_count in self.unique_image_pair_counts
         )
 
-def build_fixed_validation_protocol(
-    records: list[PairRecord],
-    positive_count: int,
-    same_finger_negatives_per_anchor: int,
-    cross_finger_negatives_per_anchor: int,
-    seed: int,
-    same_finger_min_coordinate_separation_px: float = (
-        DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX
-    ),
-) -> FixedValidationProtocol:
-    """构建确定性空间过滤协议，不使用重复采样补齐。"""
-    if not records:
-        raise ValueError("Fixed validation protocol requires at least one record.")
-    if not 1 <= positive_count <= len(records):
-        raise ValueError(
-            f"validation positive_count must be in [1, {len(records)}], got {positive_count}."
-        )
-    if same_finger_negatives_per_anchor < 1 or cross_finger_negatives_per_anchor < 1:
-        raise ValueError("Both validation negative counts must be >= 1.")
-    min_coordinate_separation_px = normalize_min_coordinate_separation(
-        same_finger_min_coordinate_separation_px
-    )
 
-    refs_by_point: dict[tuple[str, int], list[int]] = defaultdict(list)
-    refs_by_frame: dict[
-        tuple[str, str], dict[tuple[str, int], list[int]]
-    ] = defaultdict(lambda: defaultdict(list))
-    for index, record in enumerate(records):
-        key = (record.finger_id, record.point_group)
-        anchor_ref = _encoded_reference(index, ANCHOR_SIDE)
-        positive_ref = _encoded_reference(index, POSITIVE_SIDE)
-        refs_by_point[key].append(anchor_ref)
-        refs_by_point[key].append(positive_ref)
-        refs_by_frame[(record.finger_id, record.image_a_id)][key].append(
-            anchor_ref
-        )
-        refs_by_frame[(record.finger_id, record.image_b_id)][key].append(
-            positive_ref
-        )
+class FixedValidationBatchSampler(Sampler[list[int]]):
+    """按固定顺序重复产出同一组验证 batch。"""
 
-    finger_ids = tuple(sorted({record.finger_id for record in records}))
-    if len(finger_ids) < 2:
-        raise ValueError("Cross-finger validation requires at least two distinct finger_id values.")
-
-    cross_point_keys: dict[str, list[tuple[str, int]]] = {
-        finger_id: sorted(key for key in refs_by_point if key[0] != finger_id)
-        for finger_id in finger_ids
-    }
-    representative_ref = {
-        key: refs[_stable_seed(seed, "representative", key[0], key[1]) % len(refs)]
-        for key, refs in refs_by_point.items()
-    }
-
-    unique_positive_indices: list[int] = []
-    seen_positive_pairs: set[tuple[str, str]] = set()
-    for index, record in enumerate(records):
-        # L2 距离对 A/P 方向对称；路径排序后也能排除方向相反的重复 pair。
-        positive_key = tuple(sorted((record.patch_a_path, record.patch_p_path)))
-        if positive_key in seen_positive_pairs:
-            continue
-        seen_positive_pairs.add(positive_key)
-        unique_positive_indices.append(index)
-    if positive_count > len(unique_positive_indices):
-        raise ValueError(
-            f"validation positive_count={positive_count} exceeds {len(unique_positive_indices)} unique pairs."
-        )
-    selected_positive_indices = np.asarray(
-        random.Random(_stable_seed(seed, "positives")).sample(unique_positive_indices, positive_count),
-        dtype=np.int64,
-    )
-    same_refs = np.empty((positive_count, same_finger_negatives_per_anchor), dtype=np.int64)
-    cross_refs = np.empty((positive_count, cross_finger_negatives_per_anchor), dtype=np.int64)
-
-    for row, record_index in enumerate(selected_positive_indices):
-        record = records[int(record_index)]
-        anchor_key = (record.finger_id, record.point_group)
-        anchor_xy = (record.anchor_x, record.anchor_y)
-        frame_points = refs_by_frame.get(
-            (record.finger_id, record.image_a_id), {}
-        )
-        same_candidates: list[tuple[tuple[str, int], int]] = []
-        for key, refs in sorted(frame_points.items()):
-            if key == anchor_key:
-                continue
-            representative_index = _stable_seed(
-                seed,
-                "same-frame-representative",
-                record.finger_id,
-                record.image_a_id,
-                key[1],
-            ) % len(refs)
-            candidate_ref = refs[representative_index]
-            if is_outside_square_neighborhood(
-                anchor_xy=anchor_xy,
-                candidate_xy=_reference_xy(records, candidate_ref),
-                min_coordinate_separation_px=min_coordinate_separation_px,
-            ):
-                same_candidates.append((key, candidate_ref))
-        cross_candidates = cross_point_keys[record.finger_id]
-        if len(same_candidates) < same_finger_negatives_per_anchor:
-            raise ValueError(
-                f"finger_id={record.finger_id!r}, image_id={record.image_a_id!r}, "
-                f"anchor=({record.anchor_x:.3f}, {record.anchor_y:.3f}) has only "
-                f"{len(same_candidates)} same-finger point groups outside the "
-                f"{min_coordinate_separation_px:g}px square neighborhood; need "
-                f"{same_finger_negatives_per_anchor}."
-            )
-        if len(cross_candidates) < cross_finger_negatives_per_anchor:
-            raise ValueError(
-                f"finger_id={record.finger_id!r} has only {len(cross_candidates)} cross-finger "
-                f"point groups; need {cross_finger_negatives_per_anchor}."
-            )
-
-        rng = random.Random(_stable_seed(seed, "anchor", record.pair_id, int(record_index)))
-        selected_same = rng.sample(
-            same_candidates, same_finger_negatives_per_anchor
-        )
-        selected_cross = rng.sample(cross_candidates, cross_finger_negatives_per_anchor)
-        same_refs[row] = [candidate_ref for _, candidate_ref in selected_same]
-        cross_refs[row] = [representative_ref[key] for key in selected_cross]
-
-    return FixedValidationProtocol(
-        positive_indices=selected_positive_indices,
-        same_finger_negative_refs=same_refs,
-        cross_finger_negative_refs=cross_refs,
-        same_finger_min_coordinate_separation_px=min_coordinate_separation_px,
-    )
-
-
-class _ValidationPatchDataset(Dataset):
-    def __init__(self, dataset: FingerprintPairDataset, encoded_refs: np.ndarray) -> None:
-        self.dataset = dataset
-        self.encoded_refs = encoded_refs
+    def __init__(self, plan: FixedValidationBatchPlan) -> None:
+        self.plan = plan
 
     def __len__(self) -> int:
-        return int(self.encoded_refs.size)
+        return self.plan.batch_count
 
-    def __getitem__(self, index: int) -> torch.Tensor:
-        encoded = int(self.encoded_refs[index])
-        record_index, side = divmod(encoded, 2)
-        side_name = "anchor" if side == ANCHOR_SIDE else "positive"
-        return self.dataset.load_patch(record_index, side_name)
+    def __iter__(self) -> Iterator[list[int]]:
+        for batch in self.plan.batches:
+            yield list(batch)
 
 
-def make_validation_patch_loader(
-    dataset: FingerprintPairDataset,
-    protocol: FixedValidationProtocol,
+def _build_repeating_shuffle_schedule(
+    values: list[str],
+    count: int,
+    rng: random.Random,
+) -> tuple[str, ...]:
+    """优先无重复遍历全部值；预算更大时重新洗牌后继续循环。"""
+
+    if not values:
+        raise ValueError("Cannot build a validation schedule from empty values.")
+    scheduled: list[str] = []
+    while len(scheduled) < int(count):
+        cycle = list(values)
+        rng.shuffle(cycle)
+        scheduled.extend(cycle)
+    return tuple(scheduled[: int(count)])
+
+
+def build_fixed_validation_batch_plan(
+    records: list[PairRecord],
+    *,
+    finger_count: int | str,
+    batch_count: int,
     batch_size: int,
+    seed: int,
+) -> FixedValidationBatchPlan:
+    """按训练 sampler 的结构构造确定性验证 batch，不预分配负样本。"""
+
+    requested_finger_count = normalize_validation_finger_count(finger_count)
+    batch_count = int(batch_count)
+    batch_size = int(batch_size)
+    seed = int(seed)
+    if not records:
+        raise ValueError("Fixed validation batch plan requires at least one record.")
+    if batch_count < 1:
+        raise ValueError("validation.batch_count must be >= 1.")
+    if batch_size < 2:
+        raise ValueError(
+            "validation.batch_size must be >= 2 so an in-batch negative candidate "
+            "can exist."
+        )
+    planned_positive_slots = batch_count * batch_size
+    if planned_positive_slots > VALIDATION_PLAN_MAX_POSITIVE_SLOTS:
+        raise ValueError(
+            "Validation plan is too large: "
+            f"batch_count({batch_count}) * batch_size({batch_size}) = "
+            f"{planned_positive_slots:,} positive slots, exceeding the safety "
+            f"limit {VALIDATION_PLAN_MAX_POSITIVE_SLOTS:,}. Reduce "
+            "validation.batch_count or validation.batch_size."
+        )
+    if planned_positive_slots > VALIDATION_PLAN_WARNING_POSITIVE_SLOTS:
+        warnings.warn(
+            "Large fixed validation plan: "
+            f"{batch_count} batches x {batch_size} pairs = "
+            f"{planned_positive_slots:,} positive slots. This normally does not "
+            "fail because image pairs are cycled, but validation time and CPU "
+            "metric memory grow approximately linearly with this value.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    groups = build_finger_image_pair_index(records)
+    available_fingers = sorted(
+        finger_id for finger_id, image_pairs in groups.items() if image_pairs
+    )
+    if requested_finger_count == AUTO_VALIDATION_FINGER_COUNT:
+        finger_count = min(len(available_fingers), batch_size)
+    else:
+        finger_count = int(requested_finger_count)
+    if finger_count < 1:
+        raise ValueError(
+            "Validation data does not contain any finger with a usable image_pair."
+        )
+    if finger_count > len(available_fingers):
+        raise ValueError(
+            f"validation.finger_count={finger_count} exceeds the "
+            f"{len(available_fingers)} usable fingers in validation data. Set "
+            "validation.finger_count=auto or reduce the configured value."
+        )
+    if finger_count > batch_size:
+        raise ValueError(
+            f"validation.finger_count={finger_count} exceeds "
+            f"validation.batch_size={batch_size}; every selected finger must "
+            "contribute at least one positive pair per batch. Set "
+            "validation.finger_count=auto, increase batch_size, or reduce "
+            "finger_count."
+        )
+    if finger_count == 1:
+        warnings.warn(
+            "Validation uses only one finger, so cross-finger metrics and "
+            "different_finger hard negatives are unavailable.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if finger_count == batch_size:
+        warnings.warn(
+            "validation.finger_count equals validation.batch_size, so every "
+            "finger contributes only one positive pair per batch and no "
+            "same-finger negative can exist inside that batch.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    rng = random.Random(seed)
+    selected_fingers = tuple(rng.sample(available_fingers, finger_count))
+    scheduled_image_pairs = tuple(
+        _build_repeating_shuffle_schedule(
+            sorted(groups[finger_id]),
+            batch_count,
+            rng,
+        )
+        for finger_id in selected_fingers
+    )
+
+    batches: list[tuple[int, ...]] = []
+    for batch_offset in range(batch_count):
+        per_finger_counts = allocate_finger_pair_counts(
+            batch_size,
+            finger_count,
+        )
+        rng.shuffle(per_finger_counts)
+        batch: list[int] = []
+        for finger_offset, (finger_id, pair_count) in enumerate(
+            zip(selected_fingers, per_finger_counts)
+        ):
+            image_pair_id = scheduled_image_pairs[finger_offset][batch_offset]
+            batch.extend(
+                sample_unique_point_indices(
+                    records,
+                    groups[finger_id][image_pair_id],
+                    pair_count,
+                    rng,
+                )
+            )
+        if len(batch) != batch_size:
+            raise RuntimeError(
+                "Fixed validation batch construction produced an incomplete "
+                f"batch: expected {batch_size}, got {len(batch)}."
+            )
+        rng.shuffle(batch)
+        batches.append(tuple(batch))
+
+    return FixedValidationBatchPlan(
+        batches=tuple(batches),
+        selected_finger_ids=selected_fingers,
+        scheduled_image_pair_ids=scheduled_image_pairs,
+        batch_size=batch_size,
+        seed=seed,
+    )
+
+
+def make_fixed_validation_loader(
+    dataset: FingerprintPairDataset,
+    plan: FixedValidationBatchPlan,
+    *,
     num_workers: int,
     pin_memory: bool,
     persistent_workers: bool,
     prefetch_factor: int,
-) -> tuple[DataLoader, np.ndarray]:
-    """按排序后的唯一引用构造顺序固定的 patch 编码 DataLoader。"""
-    unique_refs = protocol.unique_patch_refs()
+) -> DataLoader:
+    """构造按固定 batch plan 读取正样本对及训练元数据的 DataLoader。"""
+
+    worker_count = max(0, int(num_workers))
     options: dict[str, Any] = {
-        "dataset": _ValidationPatchDataset(dataset, unique_refs),
-        "batch_size": int(batch_size),
-        "shuffle": False,
-        "drop_last": False,
-        "num_workers": max(0, int(num_workers)),
+        "dataset": dataset,
+        "batch_sampler": FixedValidationBatchSampler(plan),
+        "num_workers": worker_count,
         "pin_memory": bool(pin_memory) and torch.cuda.is_available(),
     }
-    if options["num_workers"] > 0:
+    if worker_count > 0:
         options["persistent_workers"] = bool(persistent_workers)
         options["prefetch_factor"] = max(1, int(prefetch_factor))
-    return DataLoader(**options), unique_refs
+    return DataLoader(**options)
 
 
-def _descriptor_rows(unique_refs: np.ndarray, refs: np.ndarray) -> torch.Tensor:
-    rows = np.searchsorted(unique_refs, refs)
-    if np.any(rows >= unique_refs.size) or not np.array_equal(unique_refs[rows], refs):
-        raise RuntimeError("Validation protocol contains an unresolved patch reference.")
-    return torch.from_numpy(rows.astype(np.int64, copy=False))
+@dataclass(frozen=True)
+class InBatchValidationDistances:
+    """一个验证 batch 的正距离、实际 top-k 负距离及候选类型。"""
+
+    positive_dist: torch.Tensor
+    selected_negative_dist: torch.Tensor
+    selected_negative_mask: torch.Tensor
+    selected_negative_is_same_finger: torch.Tensor
+    valid_anchor: torch.Tensor
+
+
+def detach_validation_distances_to_cpu(
+    batch: InBatchValidationDistances,
+) -> InBatchValidationDistances:
+    """验证批次计算结束后立即释放 GPU 指标张量，只缓存 CPU 副本。"""
+
+    return InBatchValidationDistances(
+        positive_dist=batch.positive_dist.detach().cpu(),
+        selected_negative_dist=batch.selected_negative_dist.detach().cpu(),
+        selected_negative_mask=batch.selected_negative_mask.detach().cpu(),
+        selected_negative_is_same_finger=(
+            batch.selected_negative_is_same_finger.detach().cpu()
+        ),
+        valid_anchor=batch.valid_anchor.detach().cpu(),
+    )
+
+
+def summarize_in_batch_validation(
+    batches: list[InBatchValidationDistances],
+    *,
+    margin: float,
+    plan: FixedValidationBatchPlan,
+) -> dict[str, float]:
+    """合并可变候选数的 batch；无候选 anchor 只计数，不中止验证。"""
+
+    if not batches:
+        raise RuntimeError("Fixed validation loader produced no batches.")
+
+    positive_parts: list[torch.Tensor] = []
+    negative_parts: list[torch.Tensor] = []
+    negative_anchor_parts: list[torch.Tensor] = []
+    negative_same_parts: list[torch.Tensor] = []
+    valid_anchor_count = 0
+    skipped_anchor_count = 0
+
+    for batch in batches:
+        positive = batch.positive_dist.detach().float().cpu().reshape(-1)
+        selected_negative = (
+            batch.selected_negative_dist.detach().float().cpu()
+        )
+        selected_mask = batch.selected_negative_mask.detach().bool().cpu()
+        selected_same = (
+            batch.selected_negative_is_same_finger.detach().bool().cpu()
+        )
+        valid_anchor = batch.valid_anchor.detach().bool().cpu().reshape(-1)
+        batch_size = int(positive.numel())
+        if selected_negative.ndim != 2:
+            raise ValueError("selected_negative_dist must have shape [batch, top_k].")
+        expected_shape = selected_negative.shape
+        if selected_mask.shape != expected_shape or selected_same.shape != expected_shape:
+            raise ValueError("Selected negative distances, masks and types must align.")
+        if valid_anchor.numel() != batch_size:
+            raise ValueError("valid_anchor length must match positive_dist length.")
+
+        valid_rows = torch.nonzero(valid_anchor, as_tuple=False).reshape(-1)
+        skipped_anchor_count += batch_size - int(valid_rows.numel())
+        if valid_rows.numel() == 0:
+            continue
+
+        local_to_global = torch.full((batch_size,), -1, dtype=torch.long)
+        local_to_global[valid_rows] = torch.arange(
+            valid_anchor_count,
+            valid_anchor_count + int(valid_rows.numel()),
+            dtype=torch.long,
+        )
+        valid_anchor_count += int(valid_rows.numel())
+        positive_parts.append(positive[valid_rows])
+
+        usable_mask = selected_mask & valid_anchor[:, None]
+        local_anchor_index = torch.arange(batch_size)[:, None].expand_as(
+            usable_mask
+        )[usable_mask]
+        negative_parts.append(selected_negative[usable_mask])
+        negative_same_parts.append(selected_same[usable_mask])
+        negative_anchor_parts.append(local_to_global[local_anchor_index])
+
+    if valid_anchor_count == 0:
+        raise RuntimeError(
+            "Every validation anchor has zero legal in-batch negatives. Increase "
+            "validation.finger_count or validation.batch_size, or review the "
+            "configured hard-negative strategy and spatial separation."
+        )
+
+    positive_dist = torch.cat(positive_parts)
+    negative_dist = torch.cat(negative_parts)
+    negative_anchor_index = torch.cat(negative_anchor_parts)
+    negative_is_same_finger = torch.cat(negative_same_parts)
+    metrics = in_batch_descriptor_validation_metrics(
+        positive_dist=positive_dist,
+        negative_dist=negative_dist,
+        negative_anchor_index=negative_anchor_index,
+        negative_is_same_finger=negative_is_same_finger,
+        margin=float(margin),
+        valid_anchor_count=valid_anchor_count,
+        skipped_anchor_count=skipped_anchor_count,
+    )
+    metrics.update(
+        {
+            "batch_count": float(plan.batch_count),
+            "configured_finger_count": float(plan.finger_count),
+            "configured_batch_count": float(plan.batch_count),
+            "configured_batch_size": float(plan.batch_size),
+            "planned_positive_count": float(plan.positive_count),
+            "hard_negative_count_mean": float(negative_dist.numel())
+            / float(valid_anchor_count),
+        }
+    )
+    return metrics
+
+
+def _metadata_to_device(
+    batch: dict[str, Any],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    return {
+        name: batch[name].to(device, non_blocking=True)
+        for name in (
+            "point_group",
+            "finger_group",
+            "anchor_xy",
+            "positive_xy",
+            "anchor_coordinate_frame_group",
+            "positive_coordinate_frame_group",
+        )
+    }
 
 
 @torch.inference_mode()
-def evaluate_fixed_protocol(
+def evaluate_fixed_validation_batches(
     model: torch.nn.Module,
     loader: DataLoader,
-    unique_refs: np.ndarray,
-    protocol: FixedValidationProtocol,
+    plan: FixedValidationBatchPlan,
+    criterion: HardNetLoss,
     device: torch.device,
-    margin: float,
-    hard_negative_top_k: int,
     amp_enabled: bool,
     amp_dtype: torch.dtype | None,
     channels_last: bool,
 ) -> dict[str, float]:
-    """只编码唯一 patch，再按固定索引计算正样本及两类负样本距离。"""
+    """对固定 batch 逐批执行与训练完全相同的候选掩码和 top-k loss。"""
+
     model.eval()
-    descriptor_batches: list[torch.Tensor] = []
-    for patches in loader:
-        patches = patches.to(device, non_blocking=True)
+    distance_batches: list[InBatchValidationDistances] = []
+    for batch in loader:
+        anchor = batch["anchor"].to(device, non_blocking=True)
+        positive = batch["positive"].to(device, non_blocking=True)
         if channels_last:
-            patches = patches.contiguous(memory_format=torch.channels_last)
+            anchor = anchor.contiguous(memory_format=torch.channels_last)
+            positive = positive.contiguous(memory_format=torch.channels_last)
         with torch.autocast(
             device_type=device.type,
             dtype=amp_dtype,
             enabled=amp_enabled,
         ):
-            descriptors = model(patches)
-        descriptor_batches.append(descriptors.float().cpu())
-    if not descriptor_batches:
-        raise RuntimeError("Fixed validation patch loader produced no descriptors.")
-    descriptors = torch.cat(descriptor_batches, dim=0)
+            anchor_desc = model(anchor)
+            positive_desc = model(positive)
+        _, stats = criterion(
+            anchor_desc.float(),
+            positive_desc.float(),
+            **_metadata_to_device(batch, device),
+        )
+        distance_batches.append(
+            detach_validation_distances_to_cpu(
+                InBatchValidationDistances(
+                    positive_dist=stats["pos_dist"],
+                    selected_negative_dist=stats["selected_negative_dist"],
+                    selected_negative_mask=stats["selected_negative_mask"],
+                    selected_negative_is_same_finger=stats[
+                        "selected_negative_is_same_finger"
+                    ],
+                    valid_anchor=stats["valid_triplets"],
+                )
+            )
+        )
 
-    anchor_rows = _descriptor_rows(unique_refs, protocol.positive_anchor_refs())
-    positive_rows = _descriptor_rows(unique_refs, protocol.positive_match_refs())
-    same_rows = _descriptor_rows(unique_refs, protocol.same_finger_negative_refs)
-    cross_rows = _descriptor_rows(unique_refs, protocol.cross_finger_negative_refs)
-
-    anchor_desc = descriptors[anchor_rows]
-    positive_desc = descriptors[positive_rows]
-    positive_dist = pair_l2_distance(anchor_desc, positive_desc)
-    same_dist = pair_l2_distance(anchor_desc[:, None, :], descriptors[same_rows])
-    cross_dist = pair_l2_distance(anchor_desc[:, None, :], descriptors[cross_rows])
-
-    metrics = descriptor_validation_metrics(
-        positive_dist=positive_dist,
-        same_finger_negative_dist=same_dist,
-        cross_finger_negative_dist=cross_dist,
-        margin=float(margin),
-        hard_negative_top_k=int(hard_negative_top_k),
+    return summarize_in_batch_validation(
+        distance_batches,
+        margin=criterion.margin,
+        plan=plan,
     )
-    return metrics

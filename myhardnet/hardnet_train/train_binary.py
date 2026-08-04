@@ -22,7 +22,9 @@ from hardnet_train.binary_model import (
     binary_model_metadata,
     build_binary_descriptor_model,
 )
-from hardnet_train.binary_validation import evaluate_binary_fixed_protocol
+from hardnet_train.binary_validation import (
+    evaluate_binary_fixed_validation_batches,
+)
 from hardnet_train.data import FingerprintPairDataset
 from hardnet_train.loss import normalize_hard_negative_strategy
 from hardnet_train.metrics import RunningMean
@@ -51,6 +53,7 @@ from hardnet_train.train import (
     make_loader,
     move_optimizer_state_to_device,
     negative_sampling_contract,
+    normalize_fixed_in_batch_validation_config,
     resolve_amp,
     resolve_device,
     resolve_path,
@@ -61,8 +64,9 @@ from hardnet_train.train import (
     validate_resume_negative_sampling_contract,
 )
 from hardnet_train.validation import (
-    build_fixed_validation_protocol,
-    make_validation_patch_loader,
+    build_fixed_validation_batch_plan,
+    make_fixed_validation_loader,
+    normalize_validation_finger_count,
 )
 
 
@@ -74,6 +78,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument(
+        "--val-finger-count",
+        type=normalize_validation_finger_count,
+        default=None,
+    )
+    parser.add_argument("--val-batch-count", type=int, default=None)
+    parser.add_argument("--val-batch-size", type=int, default=None)
     parser.add_argument("--hash-bits", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--device", default=None)
@@ -434,6 +445,12 @@ def main() -> None:
         train_cfg["steps_per_epoch"] = int(args.steps_per_epoch)
     if args.batch_size is not None:
         train_cfg["batch_size"] = int(args.batch_size)
+    if args.val_finger_count is not None:
+        validation_cfg["finger_count"] = args.val_finger_count
+    if args.val_batch_count is not None:
+        validation_cfg["batch_count"] = int(args.val_batch_count)
+    if args.val_batch_size is not None:
+        validation_cfg["batch_size"] = int(args.val_batch_size)
     if args.hash_bits is not None:
         binary_cfg["hash_bits"] = int(args.hash_bits)
     if args.lr is not None:
@@ -448,8 +465,12 @@ def main() -> None:
     epochs = int(train_cfg.get("epochs", 100))
     steps_per_epoch = int(train_cfg.get("steps_per_epoch", 1000))
     batch_size = int(train_cfg.get("batch_size", 256))
-    if epochs <= 0 or steps_per_epoch <= 0 or batch_size <= 0:
-        raise ValueError("epochs, steps_per_epoch and batch_size must be positive.")
+    if epochs <= 0 or steps_per_epoch <= 0:
+        raise ValueError("training.epochs and training.steps_per_epoch must be > 0.")
+    if batch_size < 2:
+        raise ValueError(
+            "training.batch_size must be >= 2 so in-batch negatives can exist."
+        )
     train_cfg["epochs"] = epochs
     train_cfg["steps_per_epoch"] = steps_per_epoch
     train_cfg["batch_size"] = batch_size
@@ -469,15 +490,21 @@ def main() -> None:
             )
         )
     )
-    validation_protocol_name = str(
-        validation_cfg.get("protocol", "fixed_pairs_v2_spatial")
-    ).strip().lower()
-    if validation_protocol_name != "fixed_pairs_v2_spatial":
+    normalize_fixed_in_batch_validation_config(
+        validation_cfg,
+        default_seed=seed + 10_000,
+    )
+    configured_validation_fingers = validation_cfg["finger_count"]
+    if (
+        train_cfg["hard_negative_strategy"] == "different_finger"
+        and isinstance(configured_validation_fingers, int)
+        and configured_validation_fingers < 2
+    ):
         raise ValueError(
-            f"Unsupported validation.protocol: {validation_protocol_name!r}. "
-            "Expected 'fixed_pairs_v2_spatial'."
+            "hard_negative_strategy='different_finger' requires "
+            "validation.finger_count >= 2 or 'auto' with at least two usable "
+            "validation fingers."
         )
-    validation_cfg["protocol"] = validation_protocol_name
     binary_cfg["hash_bits"] = int(binary_cfg.get("hash_bits", 256))
     binary_cfg["backbone_trainable"] = bool(
         binary_cfg.get("backbone_trainable", False)
@@ -502,7 +529,10 @@ def main() -> None:
 
     output_dir = resolve_path(
         config,
-        config.get("output_dir", "../outputs/models/hardnet_binary_256_v1"),
+        config.get(
+            "output_dir",
+            "../outputs/models/hardnet_binary_256_fixed_in_batch_v1",
+        ),
     )
     resume_arg = "auto" if args.resume_auto else args.resume
     resume_path = resolve_resume_checkpoint(
@@ -540,45 +570,25 @@ def main() -> None:
         max_rows_per_finger=data_cfg.get("max_val_rows_per_finger"),
         normalize=bool(data_cfg.get("normalize", True)),
     )
-    validation_cfg["seed"] = int(validation_cfg.get("seed", seed + 10_000))
-    validation_cfg["positive_count"] = int(
-        validation_cfg.get("positive_count", 16_384)
-    )
-    validation_cfg["same_finger_negatives_per_anchor"] = int(
-        validation_cfg.get("same_finger_negatives_per_anchor", 32)
-    )
-    validation_cfg["cross_finger_negatives_per_anchor"] = int(
-        validation_cfg.get("cross_finger_negatives_per_anchor", 32)
-    )
-    validation_cfg["batch_size"] = int(
-        validation_cfg.get("batch_size", batch_size)
-    )
-    validation_cfg["same_finger_min_coordinate_separation_px"] = (
-        normalize_min_coordinate_separation(
-            validation_cfg.get(
-                "same_finger_min_coordinate_separation_px",
-                train_cfg["same_finger_min_coordinate_separation_px"],
-            )
-        )
-    )
-    validation_protocol = build_fixed_validation_protocol(
+    validation_plan = build_fixed_validation_batch_plan(
         records=validation_dataset.records,
-        positive_count=validation_cfg["positive_count"],
-        same_finger_negatives_per_anchor=validation_cfg[
-            "same_finger_negatives_per_anchor"
-        ],
-        cross_finger_negatives_per_anchor=validation_cfg[
-            "cross_finger_negatives_per_anchor"
-        ],
-        same_finger_min_coordinate_separation_px=validation_cfg[
-            "same_finger_min_coordinate_separation_px"
-        ],
+        finger_count=validation_cfg["finger_count"],
+        batch_count=validation_cfg["batch_count"],
+        batch_size=validation_cfg["batch_size"],
         seed=validation_cfg["seed"],
     )
-    validation_loader, validation_patch_refs = make_validation_patch_loader(
+    validation_cfg["finger_count"] = validation_plan.finger_count
+    if (
+        train_cfg["hard_negative_strategy"] == "different_finger"
+        and validation_plan.finger_count < 2
+    ):
+        raise ValueError(
+            "hard_negative_strategy='different_finger' requires at least two "
+            "usable validation fingers."
+        )
+    validation_loader = make_fixed_validation_loader(
         dataset=validation_dataset,
-        protocol=validation_protocol,
-        batch_size=validation_cfg["batch_size"],
+        plan=validation_plan,
         num_workers=int(data_cfg.get("num_workers", 0)),
         pin_memory=bool(data_cfg.get("pin_memory", False)),
         persistent_workers=bool(data_cfg.get("persistent_workers", True)),
@@ -636,7 +646,15 @@ def main() -> None:
         f"backbone_trainable={metadata['backbone_trainable']} "
         f"trainable_params={count_parameters(model)} optimizer={optimizer_name(optimizer)} "
         f"lr={optim_cfg['lr']} batch={batch_size} epochs={epochs} "
-        f"steps_per_epoch={steps_per_epoch} temperature={temperature_start}->{temperature_end}",
+        f"steps_per_epoch={steps_per_epoch} temperature={temperature_start}->{temperature_end} "
+        f"validation_fingers={validation_plan.finger_count} "
+        f"validation_batches={validation_plan.batch_count} "
+        f"validation_batch_size={validation_plan.batch_size} "
+        f"validation_unique_image_pairs_per_finger="
+        f"{min(validation_plan.unique_image_pair_counts)}-"
+        f"{max(validation_plan.unique_image_pair_counts)} "
+        f"validation_fingers_with_image_pair_reuse="
+        f"{validation_plan.repeated_image_pair_finger_count}",
         flush=True,
     )
 
@@ -663,14 +681,17 @@ def main() -> None:
             amp_dtype=amp_dtype,
             channels_last=channels_last,
         )
-        val_metrics = evaluate_binary_fixed_protocol(
+        val_metrics = evaluate_binary_fixed_validation_batches(
             model=model,
             loader=validation_loader,
-            unique_refs=validation_patch_refs,
-            protocol=validation_protocol,
+            plan=validation_plan,
             device=device,
             margin=float(validation_cfg.get("margin", 0.2)),
+            hard_negative_strategy=train_cfg["hard_negative_strategy"],
             hard_negative_top_k=train_cfg["hard_negative_top_k"],
+            same_finger_min_coordinate_separation_px=train_cfg[
+                "same_finger_min_coordinate_separation_px"
+            ],
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             channels_last=channels_last,
@@ -724,6 +745,8 @@ def main() -> None:
             f"epoch={epoch} train_loss={train_metrics['loss']:.4f} "
             f"val_fpr_at_tpr95={current_fpr:.6f} "
             f"val_eer={val_metrics['eer']:.6f} "
+            f"val_valid_anchors={int(val_metrics['valid_anchor_count'])} "
+            f"val_skipped_anchors={int(val_metrics['skipped_anchor_count'])} "
             f"val_bit_balance_error={val_metrics['bit_balance_error']:.6f}",
             flush=True,
         )

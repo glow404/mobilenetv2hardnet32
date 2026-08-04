@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
 
@@ -57,6 +59,166 @@ def pairwise_l2_for_unit_vectors(anchor: torch.Tensor, positive: torch.Tensor, e
     similarity = anchor @ positive.t()
     distance_sq = torch.clamp(2.0 - 2.0 * similarity, min=eps)
     return torch.sqrt(distance_sq)
+
+
+@dataclass(frozen=True)
+class HardNegativeSelection:
+    """一次 batch 内 top-k 负样本选择的完整结果。"""
+
+    positive_dist: torch.Tensor
+    topk_negative_dist: torch.Tensor
+    valid_topk: torch.Tensor
+    negative_count: torch.Tensor
+    valid_anchor: torch.Tensor
+    mean_negative_dist: torch.Tensor
+    topk_same_finger: torch.Tensor
+    topk_candidate_index: torch.Tensor
+
+
+def select_hard_negatives(
+    anchor: torch.Tensor,
+    positive: torch.Tensor,
+    *,
+    hard_negative_strategy: str,
+    hard_negative_top_k: int,
+    same_finger_min_coordinate_separation_px: float,
+    point_group: torch.Tensor | None = None,
+    finger_group: torch.Tensor | None = None,
+    anchor_xy: torch.Tensor | None = None,
+    positive_xy: torch.Tensor | None = None,
+    anchor_coordinate_frame_group: torch.Tensor | None = None,
+    positive_coordinate_frame_group: torch.Tensor | None = None,
+) -> HardNegativeSelection:
+    """按训练契约构建合法候选掩码并选择双向 top-k 难负样本。"""
+
+    if anchor.shape != positive.shape:
+        raise ValueError(
+            f"anchor/positive shape mismatch: {anchor.shape} vs {positive.shape}"
+        )
+    if anchor.ndim != 2:
+        raise ValueError(
+            "Hard negative selection expects [batch, descriptor_dim] tensors."
+        )
+    strategy = normalize_hard_negative_strategy(hard_negative_strategy)
+    top_k = int(hard_negative_top_k)
+    if top_k < 1:
+        raise ValueError(
+            f"hard_negative_top_k must be >= 1, got {hard_negative_top_k!r}."
+        )
+    min_separation = normalize_min_coordinate_separation(
+        same_finger_min_coordinate_separation_px
+    )
+
+    batch_size = int(anchor.size(0))
+    distances = pairwise_l2_for_unit_vectors(anchor, positive)
+    positive_dist = distances.diag()
+    invalid = torch.eye(
+        batch_size,
+        dtype=torch.bool,
+        device=distances.device,
+    )
+
+    finger: torch.Tensor | None = None
+    same_finger = torch.zeros_like(invalid)
+    if finger_group is not None:
+        finger = finger_group.to(device=distances.device).view(-1)
+        if finger.numel() != batch_size:
+            raise ValueError("finger_group length must match batch size.")
+        same_finger = finger[:, None].eq(finger[None, :])
+    if strategy == "different_finger":
+        if finger is None:
+            raise ValueError(
+                "finger_group is required when "
+                "hard_negative_strategy='different_finger'."
+            )
+        invalid = invalid | same_finger
+
+    if point_group is not None:
+        point = point_group.to(device=distances.device).view(-1)
+        if point.numel() != batch_size:
+            raise ValueError("point_group length must match batch size.")
+        invalid = invalid | point[:, None].eq(point[None, :])
+
+    anchor_invalid = invalid
+    positive_invalid = invalid.t()
+    if strategy == "same_finger_allowed" and min_separation > 0.0:
+        spatial_inputs = {
+            "finger_group": finger_group,
+            "anchor_xy": anchor_xy,
+            "positive_xy": positive_xy,
+            "anchor_coordinate_frame_group": anchor_coordinate_frame_group,
+            "positive_coordinate_frame_group": positive_coordinate_frame_group,
+        }
+        missing = [name for name, value in spatial_inputs.items() if value is None]
+        if missing:
+            raise ValueError(
+                "Same-finger coordinate filtering requires batch metadata: "
+                f"{missing}."
+            )
+        assert finger_group is not None
+        assert anchor_xy is not None
+        assert positive_xy is not None
+        assert anchor_coordinate_frame_group is not None
+        assert positive_coordinate_frame_group is not None
+        anchor_invalid = anchor_invalid | same_finger_nearby_mask(
+            point_xy=anchor_xy.to(device=distances.device),
+            finger_group=finger_group,
+            coordinate_frame_group=anchor_coordinate_frame_group,
+            min_coordinate_separation_px=min_separation,
+        )
+        positive_invalid = positive_invalid | same_finger_nearby_mask(
+            point_xy=positive_xy.to(device=distances.device),
+            finger_group=finger_group,
+            coordinate_frame_group=positive_coordinate_frame_group,
+            min_coordinate_separation_px=min_separation,
+        )
+
+    large_value = torch.finfo(distances.dtype).max / 16.0
+    negative_candidates = torch.cat(
+        [
+            distances.masked_fill(anchor_invalid, large_value),
+            distances.t().masked_fill(positive_invalid, large_value),
+        ],
+        dim=1,
+    )
+    candidate_same_finger = torch.cat(
+        [same_finger, same_finger.t()],
+        dim=1,
+    )
+    selected_k = min(top_k, int(negative_candidates.size(1)))
+    topk_negative_dist, topk_indices = torch.topk(
+        negative_candidates,
+        k=selected_k,
+        dim=1,
+        largest=False,
+        sorted=True,
+    )
+    topk_same_finger = torch.gather(candidate_same_finger, 1, topk_indices)
+
+    valid_topk = topk_negative_dist < large_value / 2.0
+    negative_count = valid_topk.sum(dim=1)
+    valid_anchor = negative_count > 0
+    negative_sum = torch.where(
+        valid_topk,
+        topk_negative_dist,
+        torch.zeros_like(topk_negative_dist),
+    ).sum(dim=1)
+    mean_negative_dist = negative_sum / negative_count.clamp_min(1)
+    mean_negative_dist = torch.where(
+        valid_anchor,
+        mean_negative_dist,
+        torch.full_like(mean_negative_dist, large_value),
+    )
+    return HardNegativeSelection(
+        positive_dist=positive_dist,
+        topk_negative_dist=topk_negative_dist,
+        valid_topk=valid_topk,
+        negative_count=negative_count,
+        valid_anchor=valid_anchor,
+        mean_negative_dist=mean_negative_dist,
+        topk_same_finger=topk_same_finger,
+        topk_candidate_index=topk_indices,
+    )
 
 
 class HardNetLoss(nn.Module):
@@ -119,133 +281,67 @@ class HardNetLoss(nn.Module):
                 训练日志使用的正样本距离、top-k 负样本平均距离、有效样本 mask
                 以及每条样本实际选中的负样本数量。
         """
-        if anchor.shape != positive.shape:
-            raise ValueError(f"anchor/positive shape mismatch: {anchor.shape} vs {positive.shape}")
-        if anchor.ndim != 2:
-            raise ValueError("HardNetLoss expects descriptor tensors shaped [batch, descriptor_dim].")
-
-        batch_size = anchor.size(0)
-        # distances[i, j] = d(a_i, p_j)。对角线 i==j 是正样本距离。
-        distances = pairwise_l2_for_unit_vectors(anchor, positive)
-        positive_dist = distances.diag()
-
-        # i==j 必须屏蔽，因为它是正样本，不是负样本。
-        invalid = torch.eye(batch_size, dtype=torch.bool, device=distances.device)
-        if self.hard_negative_strategy == "different_finger":
-            if finger_group is None:
-                raise ValueError("finger_group is required when hard_negative_strategy='different_finger'.")
-            group = finger_group.to(device=distances.device).view(-1)
-            if group.numel() != batch_size:
-                raise ValueError("finger_group length must match batch size.")
-            # 策略一：最难负样本只能来自不同手指。
-            invalid = invalid | group[:, None].eq(group[None, :])
-
-        if point_group is not None:
-            group = point_group.to(device=distances.device).view(-1)
-            if group.numel() != batch_size:
-                raise ValueError("point_group length must match batch size.")
-            # 策略二依赖这个屏蔽：A-B、B-C 会经 union-find 合并，
-            # 即使表里没有 A-C，也不能把 A-C 当作负样本。
-            invalid = invalid | group[:, None].eq(group[None, :])
-
-        anchor_invalid = invalid
-        positive_invalid = invalid.t()
-        if (
-            self.hard_negative_strategy == "same_finger_allowed"
-            and self.same_finger_min_coordinate_separation_px > 0.0
-        ):
-            spatial_inputs = {
-                "finger_group": finger_group,
-                "anchor_xy": anchor_xy,
-                "positive_xy": positive_xy,
-                "anchor_coordinate_frame_group": anchor_coordinate_frame_group,
-                "positive_coordinate_frame_group": positive_coordinate_frame_group,
-            }
-            missing = [name for name, value in spatial_inputs.items() if value is None]
-            if missing:
-                raise ValueError(
-                    "Same-finger coordinate filtering requires batch metadata: "
-                    f"{missing}."
-                )
-            assert finger_group is not None
-            assert anchor_xy is not None
-            assert positive_xy is not None
-            assert anchor_coordinate_frame_group is not None
-            assert positive_coordinate_frame_group is not None
-            anchor_invalid = anchor_invalid | same_finger_nearby_mask(
-                point_xy=anchor_xy.to(device=distances.device),
-                finger_group=finger_group,
-                coordinate_frame_group=anchor_coordinate_frame_group,
-                min_coordinate_separation_px=(
-                    self.same_finger_min_coordinate_separation_px
-                ),
-            )
-            positive_invalid = positive_invalid | same_finger_nearby_mask(
-                point_xy=positive_xy.to(device=distances.device),
-                finger_group=finger_group,
-                coordinate_frame_group=positive_coordinate_frame_group,
-                min_coordinate_separation_px=(
-                    self.same_finger_min_coordinate_separation_px
-                ),
-            )
-
-        # 用一个很大的距离替换无效候选，这样 top-k 时不会优先选到它们。
-        large_value = torch.finfo(distances.dtype).max / 16.0
-
-        # 保留原来的双向难负样本定义：
-        #   1. 对 anchor a_i，候选是所有非匹配 positive p_j；
-        #   2. 对 positive p_i，候选是所有非匹配 anchor a_j。
-        # 合并两个方向后取距离最小的 k 个。k=1 时与原来的 hardest-negative 等价。
-        anchor_candidates = distances.masked_fill(anchor_invalid, large_value)
-        positive_candidates = distances.t().masked_fill(
-            positive_invalid, large_value
-        )
-        negative_candidates = torch.cat([anchor_candidates, positive_candidates], dim=1)
-        selected_k = min(self.hard_negative_top_k, negative_candidates.size(1))
-        topk_negative_dist = torch.topk(
-            negative_candidates,
-            k=selected_k,
-            dim=1,
-            largest=False,
-            sorted=True,
-        ).values
-
-        # 若合法候选少于配置的 k，只使用实际存在的候选，不让填充值参与损失。
-        valid_topk = topk_negative_dist < large_value / 2.0
-        negative_count = valid_topk.sum(dim=1)
-        valid = negative_count > 0
-        negative_sum = torch.where(valid_topk, topk_negative_dist, torch.zeros_like(topk_negative_dist)).sum(dim=1)
-        mean_negative_dist = negative_sum / negative_count.clamp_min(1)
-        mean_negative_dist = torch.where(
-            valid,
-            mean_negative_dist,
-            torch.full_like(mean_negative_dist, large_value),
+        selection = select_hard_negatives(
+            anchor,
+            positive,
+            hard_negative_strategy=self.hard_negative_strategy,
+            hard_negative_top_k=self.hard_negative_top_k,
+            same_finger_min_coordinate_separation_px=(
+                self.same_finger_min_coordinate_separation_px
+            ),
+            point_group=point_group,
+            finger_group=finger_group,
+            anchor_xy=anchor_xy,
+            positive_xy=positive_xy,
+            anchor_coordinate_frame_group=anchor_coordinate_frame_group,
+            positive_coordinate_frame_group=positive_coordinate_frame_group,
         )
 
-        # 极端情况下，一个 batch 里所有候选都被屏蔽，会没有有效负样本。
-        if not torch.any(valid):
-            zero = positive_dist.sum() * 0.0
+        if not torch.any(selection.valid_anchor):
+            zero = selection.positive_dist.sum() * 0.0
             stats = {
-                "pos_dist": positive_dist.detach(),
-                "neg_dist": mean_negative_dist.detach(),
-                "valid_triplets": valid.detach(),
-                "hard_negative_count": negative_count.detach(),
+                "pos_dist": selection.positive_dist.detach(),
+                "neg_dist": selection.mean_negative_dist.detach(),
+                "valid_triplets": selection.valid_anchor.detach(),
+                "hard_negative_count": selection.negative_count.detach(),
+                "selected_negative_dist": selection.topk_negative_dist.detach(),
+                "selected_negative_mask": selection.valid_topk.detach(),
+                "selected_negative_is_same_finger": (
+                    selection.topk_same_finger.detach()
+                ),
+                "selected_negative_candidate_index": (
+                    selection.topk_candidate_index.detach()
+                ),
             }
             return zero, stats
 
         # 每个 top-k 负样本各自计算 triplet margin loss；先在单条正样本内部
         # 对有效负样本求均值，再在有效正样本间求均值，避免候选较少的样本权重变低。
         per_negative = torch.clamp(
-            self.margin + positive_dist[:, None] - topk_negative_dist,
+            self.margin
+            + selection.positive_dist[:, None]
+            - selection.topk_negative_dist,
             min=0.0,
         )
-        per_sample = torch.where(valid_topk, per_negative, torch.zeros_like(per_negative)).sum(dim=1)
-        per_sample = per_sample / negative_count.clamp_min(1)
-        loss = per_sample[valid].mean()
+        per_sample = torch.where(
+            selection.valid_topk,
+            per_negative,
+            torch.zeros_like(per_negative),
+        ).sum(dim=1)
+        per_sample = per_sample / selection.negative_count.clamp_min(1)
+        loss = per_sample[selection.valid_anchor].mean()
         stats = {
-            "pos_dist": positive_dist.detach(),
-            "neg_dist": mean_negative_dist.detach(),
-            "valid_triplets": valid.detach(),
-            "hard_negative_count": negative_count.detach(),
+            "pos_dist": selection.positive_dist.detach(),
+            "neg_dist": selection.mean_negative_dist.detach(),
+            "valid_triplets": selection.valid_anchor.detach(),
+            "hard_negative_count": selection.negative_count.detach(),
+            "selected_negative_dist": selection.topk_negative_dist.detach(),
+            "selected_negative_mask": selection.valid_topk.detach(),
+            "selected_negative_is_same_finger": (
+                selection.topk_same_finger.detach()
+            ),
+            "selected_negative_candidate_index": (
+                selection.topk_candidate_index.detach()
+            ),
         }
         return loss, stats

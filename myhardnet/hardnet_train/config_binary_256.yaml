@@ -2,7 +2,7 @@
 # 先加载并默认冻结浮点 teacher，再独立优化 hash head；不会覆盖浮点 checkpoint。
 
 seed: 42
-output_dir: ../outputs/models/hardnet_binary_256_v1
+output_dir: ../outputs/models/hardnet_binary_256_fixed_in_batch_v1
 
 data:
   train_csv: ../hardnet_dataset/train_pairs.csv
@@ -18,7 +18,7 @@ data:
   max_val_rows_per_finger:
 
 backbone:
-  checkpoint: ../outputs/models/hardnet_train_strong_v2_256/best.pt
+  checkpoint: ../outputs/models/hardnet_train_strong_v2_256_fixed_in_batch_v1/best.pt
   architecture: auto
   descriptor_dim: auto
 
@@ -62,13 +62,15 @@ training:
   log_interval: 50
 
 validation:
-  protocol: fixed_pairs_v2_spatial
+  # 与训练相同的多手指、单 image_pair/batch、合法候选掩码和双向 top-k 规则。
+  protocol: fixed_in_batch_v1
   seed: 10042
-  positive_count: 16384
-  same_finger_negatives_per_anchor: 32
-  cross_finger_negatives_per_anchor: 32
-  same_finger_min_coordinate_separation_px: 16
-  batch_size: 256
+  # auto 使用 min(验证集可用手指数, batch_size)。
+  finger_count: auto
+  # image_pair 不足时循环使用；过大只会增加验证耗时和指标缓存。
+  batch_count: 256
+  batch_size: 24
+  # Hamming triplet 指标使用归一化距离，因此保留独立 margin。
   margin: 0.10
 
 optimizer:

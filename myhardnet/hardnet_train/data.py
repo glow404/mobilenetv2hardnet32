@@ -294,6 +294,70 @@ class FingerprintPairDataset(Dataset):
         }
 
 
+def build_finger_image_pair_index(
+    records: list[PairRecord],
+) -> dict[str, dict[str, list[int]]]:
+    """建立训练与验证共用的 `finger_id -> image_pair_id -> indices` 索引。"""
+
+    groups: dict[str, dict[str, list[int]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for index, record in enumerate(records):
+        groups[record.finger_id][record.image_pair_id].append(index)
+    return {
+        finger_id: dict(image_pairs)
+        for finger_id, image_pairs in groups.items()
+    }
+
+
+def allocate_finger_pair_counts(
+    batch_size: int,
+    finger_count: int,
+) -> list[int]:
+    """尽量均匀地分配一个 batch 中每根手指贡献的正样本数。"""
+
+    batch_size = int(batch_size)
+    finger_count = int(finger_count)
+    if finger_count < 1:
+        raise ValueError("finger_count must be >= 1")
+    if batch_size < finger_count:
+        raise ValueError("batch_size must be >= finger_count")
+    base = batch_size // finger_count
+    remainder = batch_size % finger_count
+    return [
+        base + (1 if index < remainder else 0)
+        for index in range(finger_count)
+    ]
+
+
+def sample_unique_point_indices(
+    records: list[PairRecord],
+    candidates: list[int],
+    count: int,
+    rng: random.Random,
+) -> list[int]:
+    """从一个 image pair 中抽取尽量不重复物理点的正样本。"""
+
+    shuffled = list(candidates)
+    rng.shuffle(shuffled)
+    selected: list[int] = []
+    seen: set[int] = set()
+    for index in shuffled:
+        point_group = records[index].point_group
+        if point_group in seen:
+            continue
+        selected.append(index)
+        seen.add(point_group)
+        if len(selected) >= int(count):
+            break
+
+    # 与训练现有行为保持一致：image pair 内独立物理点不足时，从已选正样本
+    # 重复补齐。重复项会继续由 point_group mask 排除，不能互相充当负样本。
+    if len(selected) < int(count) and selected:
+        selected.extend(rng.choices(selected, k=int(count) - len(selected)))
+    return selected
+
+
 class FingerImagePairBatchSampler(Sampler[list[int]]):
     """按“多手指、每手指单两图组合”构造 batch。
 
@@ -328,14 +392,13 @@ class FingerImagePairBatchSampler(Sampler[list[int]]):
         self.drop_incomplete = bool(drop_incomplete)
         self._iteration = 0
 
-        # 建立二级索引：
+        # 建立训练与验证共用的二级索引：
         #   finger_id -> image_pair_id -> [dataset index]
         # 采样时可以快速限制“每个手指只用一个两图组合”。
-        groups: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
-        for index, record in enumerate(records):
-            groups[record.finger_id][record.image_pair_id].append(index)
-        self.groups = {finger: dict(image_pairs) for finger, image_pairs in groups.items()}
-        self.finger_ids = [finger for finger, image_pairs in self.groups.items() if image_pairs]
+        self.groups = build_finger_image_pair_index(records)
+        self.finger_ids = [
+            finger for finger, image_pairs in self.groups.items() if image_pairs
+        ]
         if len(self.finger_ids) < self.fingers_per_batch:
             raise ValueError(
                 f"Need at least {self.fingers_per_batch} fingers, found {len(self.finger_ids)} in dataset."
@@ -353,13 +416,23 @@ class FingerImagePairBatchSampler(Sampler[list[int]]):
         self._iteration += 1
         for _ in range(self.batches_per_epoch):
             selected_fingers = rng.sample(self.finger_ids, self.fingers_per_batch)
-            per_finger_counts = self._counts_for_batch()
+            per_finger_counts = allocate_finger_pair_counts(
+                self.batch_size,
+                self.fingers_per_batch,
+            )
             rng.shuffle(per_finger_counts)
             batch: list[int] = []
             for finger_id, pair_count in zip(selected_fingers, per_finger_counts):
                 image_pair_id = rng.choice(list(self.groups[finger_id].keys()))
                 candidates = self.groups[finger_id][image_pair_id]
-                batch.extend(self._sample_unique_points(candidates, pair_count, rng))
+                batch.extend(
+                    sample_unique_point_indices(
+                        self.records,
+                        candidates,
+                        pair_count,
+                        rng,
+                    )
+                )
 
             # 默认 drop_incomplete=True。若某些图组可用点太少，会丢掉不完整 batch；
             # smoke/调试场景也可以改成补采样。
@@ -370,29 +443,3 @@ class FingerImagePairBatchSampler(Sampler[list[int]]):
             if len(batch) == self.batch_size or not self.drop_incomplete:
                 rng.shuffle(batch)
                 yield batch
-
-    def _counts_for_batch(self) -> list[int]:
-        """计算每个手指在当前 batch 中贡献多少正样本对。"""
-        base = self.batch_size // self.fingers_per_batch
-        remainder = self.batch_size % self.fingers_per_batch
-        return [base + (1 if index < remainder else 0) for index in range(self.fingers_per_batch)]
-
-    def _sample_unique_points(self, candidates: list[int], count: int, rng: random.Random) -> list[int]:
-        """从一个两图组合中抽取尽量不重复物理点的样本。"""
-        shuffled = list(candidates)
-        rng.shuffle(shuffled)
-        selected: list[int] = []
-        seen: set[int] = set()
-        for index in shuffled:
-            point_group = self.records[index].point_group
-            if point_group in seen:
-                continue
-            selected.append(index)
-            seen.add(point_group)
-            if len(selected) >= count:
-                break
-        # 如果某个 image_pair 内独立物理点不足，为了保持 batch_size，只从已选样本补齐。
-        # 这种补齐样本会在 loss 中被 point_group mask 保护，不会互相当负样本。
-        if len(selected) < count and selected:
-            selected.extend(rng.choices(selected, k=count - len(selected)))
-        return selected

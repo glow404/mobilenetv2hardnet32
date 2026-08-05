@@ -53,6 +53,15 @@ training:
   same_finger_min_coordinate_separation_px: 16
   # 每条正样本从双向合法候选中选择距离最小的 k 个负样本；设为 1 可复现原来的 hardest-negative。
   hard_negative_top_k: 3
+  # top-1 使用该权重；其余有效 top-k 负样本均分剩余权重。0.6 会让最近负样本获得主要梯度。
+  hard_negative_top1_weight: 0.6
+  # 对有效正样本的 p95/p99 距离施加平方 hinge 约束；目标是单位描述子的 L2 距离。
+  # p99 在 batch=256 时样本数较少，因此默认权重低于 p95，避免训练抖动。
+  positive_tail_loss_weight: 0.10
+  positive_tail_p95_weight: 0.7
+  positive_tail_p99_weight: 0.3
+  positive_tail_p95_target: 0.75
+  positive_tail_p99_target: 0.90
   # 论文 margin 是 1.0；当前指纹 patch 先保留较温和的 0.8。
   margin: 0.8
   # 长训练先禁用早停；需要时可命令行设置 --early-stop-patience。
@@ -73,6 +82,17 @@ validation:
   batch_count: 256
   # batch_size 会尽量均匀分配到所选手指；无合法负样本的 anchor 只跳过并计数。
   batch_size: 64
+
+# 匹配导向的综合选择：同时考虑误接受、低 FPR 召回、top-1 排序和距离间隔。
+# 各分项先归一化到 [0, 1]，再按权重加权；分数越高越好。
+checkpoint_selection:
+  strategy: matching_composite_v1
+  weights:
+    false_acceptance: 0.45
+    low_fpr_recall: 0.20
+    hard_negative_recall: 0.15
+    mean_gap: 0.10
+    tail_gap: 0.10
 
 optimizer:
   # 默认使用 SGD + Nesterov。切换为 adamw 时也要显式设置对应学习率，

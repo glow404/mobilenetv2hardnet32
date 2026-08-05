@@ -1,7 +1,5 @@
 # HardNet Strong V2 与二值描述子训练设计
 
-> 文件名 `mobilev2.md` 是历史遗留名称。本文记录当前实际使用的高精度浮点主干、二值描述子网络、训练流程与损失函数，不再描述已废弃的 Strong V1 方案。
-
 ## 1. 当前方案概览
 
 当前描述子系统分为两个相互隔离的训练阶段：
@@ -611,12 +609,12 @@ B-bit binary code
 ```text
 输入 q [N,D]
   │
-  ├─ LayerNorm(D)
-  ├─ Linear(D,B, bias=False)                 → base [N,B]
+  ├─ LayerNorm(D)  （归一化）
+  ├─ Linear(D,B, bias=False)                 → base [N,B]   （相当于全连接层）
   │
   ├─ LayerNorm(B)
   ├─ Linear(B,2B)
-  ├─ GELU
+  ├─ GELU（高斯误差线性单元，transform常用这个）
   ├─ Dropout
   ├─ Linear(2B,B)
   ├─ residual_scale
@@ -628,9 +626,27 @@ B-bit binary code
        └─ 与 refined 相加                    → logits [N,B]
 ```
 
-`residual_scale` 和 `output_scale` 都初始化为 0.1，使 hash head 从较稳定的近线性投影开始训练，再逐步学习非线性修正。
+`residual_scale`（残差音量旋钮。） 和 `output_scale`（最后一条输出残差缩放系数） 都初始化为 0.1，使 hash head 从较稳定的近线性投影开始训练，再逐步学习非线性修正。
 
 当前 `D=256`、`B=256`、`hidden_multiplier=2.0` 时，hash head 有 396,288 个参数。
+
+| 层                | 操作                      | 输出     | 作用                                                         |
+| ----------------- | ------------------------- | -------- | ------------------------------------------------------------ |
+| 输入              | 浮点主干输出连续特征 `q`  | `[N,D]`  | 输入未归一化的浮点描述子，作为 Hash Head 的输入              |
+| LayerNorm         | `LayerNorm(D)`            | `[N,D]`  | 对每个样本做归一化，使不同维度数值分布更加稳定，便于后续线性映射 |
+| Base Projection   | `Linear(D,B, bias=False)` | `[N,B]`  | 将 D 维浮点描述子映射到 B 维 hash 空间，得到基础 hash 表示（base） |
+| LayerNorm         | `LayerNorm(B)`            | `[N,B]`  | 对 base 再次标准化，避免后续 MLP 输入分布漂移                |
+| Expand            | `Linear(B,2B)`            | `[N,2B]` | 将特征升维，提高非线性建模能力                               |
+| 激活              | `GELU`                    | `[N,2B]` | 引入非线性，使网络能够学习复杂的 bit 之间关系                |
+| 正则化            | `Dropout`                 | `[N,2B]` | 防止过拟合，提高泛化能力                                     |
+| Compress          | `Linear(2B,B)`            | `[N,B]`  | 将高维特征重新压缩回 B 维，形成残差修正项                    |
+| LayerScale        | `residual_scale`          | `[N,B]`  | 使用可学习缩放系数（初始值 0.1）控制残差大小，避免训练初期扰动过大 |
+| Residual Add      | `+ base`                  | `[N,B]`  | 将残差修正加回基础表示，得到 refined hash 表示               |
+| LayerNorm         | `LayerNorm(B)`            | `[N,B]`  | 对 refined 再次归一化，使最终映射更加稳定                    |
+| Output Projection | `Linear(B,B)`             | `[N,B]`  | 对 refined 做最后一次线性校正                                |
+| LayerScale        | `output_scale`            | `[N,B]`  | 再次控制最终修正量，保证输出不会突然偏离 refined             |
+| Residual Add      | `+ refined`               | `[N,B]`  | 得到最终连续 hash logits                                     |
+| 输出              | `logits`                  | `[N,B]`  | 后续经过 `tanh`、STE、`sign` 得到真正的二值码                |
 
 ### 3.3 连续表示、STE 表示与真实二值码
 

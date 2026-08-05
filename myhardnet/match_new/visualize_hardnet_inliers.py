@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 
 from match_new.hardnet_matcher import match_templates_descriptor_l2
 from match_new.template_builder import build_hardnet_templates, build_identity_templates, load_image_template
-from match_new.utils import ensure_dir, load_config, read_csv_rows, resolve_path, safe_id, template_filename, write_csv_rows, write_json
+from match_new.utils import ensure_dir, load_config, resolve_path, safe_id, template_filename, write_csv_rows, write_json
 
 
 MATCH_NEW_DIR = Path(__file__).resolve().parent
@@ -457,11 +457,23 @@ def main() -> None:
         raise RuntimeError(f"No images found under {args.image_root}")
     write_csv_rows(output_dir / "metadata_all.csv", rows)
 
-    metadata_success_path = output_dir / "metadata_success.csv"
     if args.skip_template_build:
-        if not metadata_success_path.exists():
-            raise RuntimeError("--skip_template_build requires output_dir/metadata_success.csv")
-        success_rows = read_csv_rows(metadata_success_path)
+        success_rows = []
+        for row in rows:
+            template_path = template_dir / template_filename(
+                row["identity_id"],
+                row["image_id"],
+            )
+            if template_path.exists():
+                success_rows.append(
+                    {
+                        **row,
+                        "template_path": str(template_path),
+                        "status": "success",
+                    }
+                )
+        if not success_rows:
+            raise RuntimeError("--skip_template_build requires existing image templates")
     else:
         report = build_hardnet_templates(rows, template_dir, config)
         write_json(output_dir / "build_report.json", {key: value for key, value in report.items() if key != "success_rows"})
@@ -469,21 +481,17 @@ def main() -> None:
         success_rows = report["success_rows"]
         if not success_rows:
             raise RuntimeError("No templates were built successfully.")
-        write_csv_rows(metadata_success_path, success_rows)
 
     enrollment = dict(config.get("enrollment", {}))
     enrollment_count = int(enrollment.get("enrollment_images_per_identity", 20))
     random_seed = int(enrollment.get("random_seed", 42))
     identity_templates_path = output_dir / f"identity_templates_{enrollment_count}.json"
-    split_metadata_path = output_dir / f"metadata_with_split_{enrollment_count}.csv"
-    identity_payload = build_identity_templates(
+    identity_payload, split_rows = build_identity_templates(
         success_rows,
         identity_templates_path,
-        split_metadata_path,
         enrollment_count=enrollment_count,
         seed=random_seed,
     )
-    split_rows = read_csv_rows(split_metadata_path)
 
     cases = score_genuine_pairs(
         split_rows=split_rows,

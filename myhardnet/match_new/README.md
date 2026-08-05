@@ -13,7 +13,7 @@ conda activate hardnet-cuda
 
 ## 1. `run_hardnet_matching.py`
 
-**作用**：HardNet 离线阈值标定实验。只检测 SIFT 关键点位置/方向，计算 HardNet 描述子并匹配；**不计算、不保存 SIFT/RootSIFT 描述子**。离线入口始终遍历全部注册模板并生成完整 FAR/FRR 曲线。
+**作用**：HardNet 全量离线阈值标定实验。只检测 SIFT 关键点位置/方向，计算 HardNet 描述子并匹配；**不计算、不保存 SIFT/RootSIFT 描述子**。所有未注册 query 都会遍历本人和全部非本人 identity 的全部注册模板，不再拆分 validation/test；阈值曲线、阈值选择和最终 FAR/FRR 均基于同一份全量匹配结果。
 
 **运行参数**默认写在 `match_new/config_match_new.yaml`：
 
@@ -129,7 +129,7 @@ python match_new\run_online_unlock.py `
   --benchmark
 ```
 
-在线入口通过 `--artifacts` 和 `online_unlock.identity_templates`、`online_unlock.split_metadata` 直接定位离线产物，不需要部署档案。在线耗时测试以当前 YAML 配置为准，不要求模型、预处理、匹配参数和阈值与离线一致。
+在线入口通过 `--artifacts` 和 `online_unlock.identity_templates` 定位注册模板；批量 benchmark 使用 `metadata_all.csv` 与注册模板索引在内存中推导 query 划分，不再依赖单独的 split CSV。在线耗时测试以当前 YAML 配置为准，不要求模型、预处理、匹配参数和阈值与离线一致。
 
 在线基准输出：
 
@@ -205,7 +205,7 @@ identification:
   match_score_threshold: 0.55
 ```
 
-`unique_inliers` 继续作为诊断字段输出，但不再直接充当 `score` 或解锁阈值。以上权重和 `0.55` 阈值只是首轮实验值，必须通过独立验证集按目标 FAR/FRR 重新标定。`verification_scores.csv` 会额外输出 `geometry_similarity`、`texture_similarity`、有效重叠比例、有效块数和实际融合权重。
+`unique_inliers` 继续作为诊断字段输出，但不再直接充当 `score` 或解锁阈值。以上权重和 `0.55` 是初始配置值；离线评估会直接使用全部 query 的 identity 级分数扫描 FAR/FRR 并选择目标阈值。`verification_scores.csv` 会额外输出 `geometry_similarity`、`texture_similarity`、有效重叠比例、有效块数和实际融合权重。
 
 FAR/FRR 阈值曲线写入 `match_score_threshold_curve.csv`。默认按 `0.01` 在 `[0,1]` 范围扫描，不再生成整数内点阈值曲线。
 
@@ -231,7 +231,6 @@ FAR/FRR 阈值曲线写入 `match_score_threshold_curve.csv`。默认按 `0.01` 
 ```yaml
 template_management:
   enabled: false
-  reset_library_on_start: true
 
   max_active_templates: 40
   protected_seed_templates: 20
@@ -285,9 +284,9 @@ LRU规则：
 | `eval_hardnet_l2/template_learning_events.csv` | 每次query的学习、替换和耗时摘要 |
 | `eval_hardnet_l2/template_learning_events.json` | 包含每张确认模板详细证据的完整事件 |
 
-`reset_library_on_start: true` 适合可重复实验，每次从相同20张seed开始。长期在线运行时改为 `false`，程序会继续读取已有 `template_library.json`。
+模板库管理器每次启动都从当前注册索引重建seed状态，不复用上次运行的 `template_library.json`。
 
-Windows 下杀毒软件、文件索引器或同步程序可能短暂占用 `template_library.json`，使原子替换返回 `WinError 5`。程序会使用唯一临时文件并按退避间隔重试；默认重试后仍无法替换时，不中断整批评估，而是把最新完整状态保存到 `template_library.json.pending`。后续写盘会再次尝试更新主索引；使用 `reset_library_on_start: false` 启动时，也会在主索引、`.pending` 和完整临时文件中加载修改时间最新且结构有效的状态。若工程部署要求索引写盘失败必须立即终止，可设置 `persist_strict: true`。
+Windows 下杀毒软件、文件索引器或同步程序可能短暂占用 `template_library.json`，使原子替换返回 `WinError 5`。程序会使用唯一临时文件并按退避间隔重试；默认重试后仍无法替换时，不中断当前运行，而是把最新完整状态保存到 `template_library.json.pending`。后续写盘会再次尝试更新主索引。若工程部署要求索引写盘失败必须立即终止，可设置 `persist_strict: true`。
 
 ---
 
@@ -295,7 +294,7 @@ Windows 下杀毒软件、文件索引器或同步程序可能短暂占用 `temp
 
 **作用**：在已有模板基础上，扫描不同匹配参数组合（`top_k`、`ratio_threshold`、`candidate_policy`），快速比较调参效果。不重新提特征。
 
-**前置条件**：先运行 `run_hardnet_matching.py` 生成 `image_templates/`、`metadata_with_split_20.csv`、`identity_templates_20.json`。
+**前置条件**：先运行 `run_hardnet_matching.py` 生成 `image_templates/`、`metadata_all.csv`、`identity_templates_20.json`；query 划分由注册模板索引在内存中推导。
 
 **命令**：
 
@@ -390,7 +389,7 @@ python match_new\visualize_hardnet_inliers.py `
 | `--image_root` | 输入原始图像目录，默认 `pair_build/select_top500` |
 | `--output_dir` | 可视化输出目录，默认 `match_new/hardnet_inlier_visuals` |
 | `--model_path` | 覆盖配置中的 HardNet checkpoint |
-| `--skip_template_build` | 复用 `<output_dir>/image_templates` 和 `metadata_success.csv` |
+| `--skip_template_build` | 按当前原图 metadata 复用 `<output_dir>/image_templates` 中已存在的模板 |
 | `--enrollment_count` | 覆盖每个 identity 的注册模板数量，默认读取 config |
 | `--random_seed` | 覆盖注册模板随机种子，默认读取 config |
 | `--top_k` | 导出内点数最高的 case 数量，默认 10 |
@@ -406,8 +405,6 @@ python match_new\visualize_hardnet_inliers.py `
 match_new/hardnet_inlier_visuals/
   image_templates/
   metadata_all.csv
-  metadata_success.csv
-  metadata_with_split_20.csv
   identity_templates_20.json
   top_unique_inliers/
   bottom_unique_inliers_nonzero/

@@ -44,7 +44,7 @@ from match_new.descriptor_contract import (
 from match_new.evaluation import run_hardnet_evaluation, summary_row
 from match_new.input_loader import load_raw_image_metadata, validate_identity_image_counts
 from match_new.template_builder import build_hardnet_templates, build_identity_templates, load_image_template
-from match_new.utils import ensure_dir, load_config, read_csv_rows, resolve_path, template_filename, write_csv_rows, write_json
+from match_new.utils import ensure_dir, load_config, resolve_path, template_filename, write_csv_rows, write_json
 
 
 MATCH_NEW_DIR = Path(__file__).resolve().parent
@@ -439,14 +439,10 @@ def main() -> None:
         }
     )
 
-    # 评估数据集名称是实验契约的一部分，避免配置文件指向了同结构但不同来源的数据。
-    image_root = resolve_path(config, dict(config.get("data", {})).get("image_root", ""))
-    expected_dataset = str(dict(config.get("experiment", {})).get("dataset", "")).strip()
-    if expected_dataset and image_root.name != expected_dataset:
-        raise ValueError(
-            "Configured evaluation dataset does not match data.image_root: "
-            f"expected={expected_dataset!r}, actual={image_root.name!r}, root={image_root}"
-        )
+    image_root = resolve_path(
+        config,
+        dict(config.get("data", {})).get("image_root", ""),
+    )
 
     # 1. 直接扫描原始图像；调试时可按 identity 数和每个 identity 的图像数裁剪数据。
     output_dir = ensure_dir(settings["output_dir"])
@@ -459,23 +455,18 @@ def main() -> None:
     validate_identity_image_counts(rows, enrollment_count + 1, context="raw image input")
     write_csv_rows(output_dir / "metadata_all.csv", rows)
 
-    # 2. 构建图像级模板；如果 skip_template_build，则复用已有模板。
+    # 2. 构建图像级模板；如果 skip_template_build，则按原始 metadata 复用已有模板。
     template_dir = output_dir / "image_templates"
-    metadata_success_path = output_dir / "metadata_success.csv"
     if settings["skip_template_build"]:
-        candidate_rows = read_csv_rows(metadata_success_path) if metadata_success_path.exists() else rows
-        raw_keys = {(row["identity_id"], row["image_id"]) for row in rows}
         success_rows = []
-        for candidate in candidate_rows:
+        for candidate in rows:
             key = (candidate["identity_id"], candidate["image_id"])
             template_path = template_dir / template_filename(*key)
-            if key not in raw_keys or not template_path.exists():
+            if not template_path.exists():
                 continue
-            # 复用模板时统一使用本次 output 下的路径，避免把旧实验的路径
-            # 泄漏到 identity_templates 和后续评估产物中。
             row = dict(candidate)
             row["template_path"] = str(template_path)
-            row.setdefault("status", "success")
+            row["status"] = "success"
             success_rows.append(row)
         if not success_rows:
             raise RuntimeError("skip_template_build was set but no image templates were found.")
@@ -486,36 +477,29 @@ def main() -> None:
         success_rows = report["success_rows"]
         if not success_rows:
             raise RuntimeError("No templates were built successfully.")
-    write_csv_rows(metadata_success_path, success_rows)
     validate_identity_image_counts(success_rows, enrollment_count + 1, context="successfully built templates")
-    write_json(
-        output_dir / "template_validation.json",
-        validate_templates(
-            template_dir,
-            success_rows,
-            config,
-            descriptor_dim=descriptor_dim,
-        ),
+    validate_templates(
+        template_dir,
+        success_rows,
+        config,
+        descriptor_dim=descriptor_dim,
     )
 
     # 3. 固定随机种子，为每个 identity 选择注册模板，其余作为 query。
     identity_templates_path = output_dir / f"identity_templates_{enrollment_count}.json"
-    split_metadata_path = output_dir / f"metadata_with_split_{enrollment_count}.csv"
-    identity_payload = build_identity_templates(
+    identity_payload, split_rows = build_identity_templates(
         success_rows,
         identity_templates_path,
-        split_metadata_path,
         enrollment_count=enrollment_count,
         seed=int(enrollment.get("random_seed", 42)),
     )
-    write_json(output_dir / f"identity_templates_{enrollment_count}_summary.json", {k: v for k, v in identity_payload.items() if k != "identities"})
     enrollment_timing = build_enrollment_timing_report(success_rows, identity_payload)
     write_csv_rows(output_dir / "enrollment_timing.csv", enrollment_timing["per_identity"])
     write_json(output_dir / "enrollment_timing.json", enrollment_timing)
 
     # 4. 执行身份验证评估，并在目标阈值下导出失败样本。
     result = run_hardnet_evaluation(
-        metadata_path=split_metadata_path,
+        metadata_rows=split_rows,
         identity_templates_path=identity_templates_path,
         template_dir=template_dir,
         config=config,
@@ -523,39 +507,9 @@ def main() -> None:
         max_impostor_identities_per_query=int(settings["max_impostor_identities_per_query"]),
         export_failures=bool(settings["export_failures"]),
     )
-    effective_config = result["metrics"].get("effective_config") or {}
-    write_json(
-        output_dir / "run_manifest.json",
-        {
-            "experiment": config.get("experiment", {}),
-            "dataset": {
-                "name": image_root.name,
-                "image_root": str(image_root),
-                "num_indexed_rows": len(rows),
-            },
-            "checkpoint": {
-                "path": str(checkpoint),
-                **checkpoint_metadata,
-            },
-            "descriptor_source": "hardnet",
-            "descriptor_dim": int(descriptor_dim),
-            "enrollment": {
-                "images_per_identity": enrollment_count,
-                "random_seed": int(enrollment.get("random_seed", 42)),
-            },
-            "artifacts": {
-                "image_templates": str(template_dir),
-                "identity_templates": str(identity_templates_path),
-                "split_metadata": str(split_metadata_path),
-                "evaluation": str(output_dir / "eval_hardnet_l2"),
-            },
-            "effective_config": effective_config,
-        },
-    )
     # 5. 汇总一行 CSV/JSON，方便和其他实验横向比较。
     far_points = [float(point) for point in dict(config.get("evaluation", {})).get("far_points", [0.001, 0.0001])]
     summary_record = {
-        "experiment_id": dict(config.get("experiment", {})).get("id", ""),
         "evaluation_dataset": image_root.name,
         "model_architecture": checkpoint_metadata.get("model_architecture", ""),
         "descriptor_dim": int(descriptor_dim),
@@ -570,7 +524,6 @@ def main() -> None:
         summary_json,
         {
             "summary": summary,
-            "metadata": str(split_metadata_path),
             "identity_templates": str(identity_templates_path),
             "image_templates": str(template_dir),
             "eval_dir": str(output_dir / "eval_hardnet_l2"),

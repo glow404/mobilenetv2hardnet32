@@ -12,7 +12,7 @@
 
 输出：
     outputs/hardnet_train/
-        best.pt              固定协议 `val_fpr_at_tpr95` 最好的模型
+        best.pt              固定协议 `matching_composite_v1` 综合分数最高的模型
         last.pt              最后一个 epoch 的模型
         metrics.csv          每个 epoch 的训练/固定验证指标
         resolved_config.json 实际使用的配置快照
@@ -41,6 +41,11 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
+from hardnet_train.checkpoint_selection import (
+    checkpoint_selection_metrics,
+    checkpoint_selection_state_from_metrics,
+    normalize_checkpoint_selection_config,
+)
 from hardnet_train.data import FingerImagePairBatchSampler, FingerprintPairDataset
 from hardnet_train.loss import HardNetLoss, normalize_hard_negative_strategy
 from hardnet_train.metrics import RunningMean
@@ -170,6 +175,37 @@ def negative_sampling_contract(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def descriptor_loss_contract(config: Mapping[str, Any]) -> dict[str, Any]:
+    """提取会改变描述子优化目标的 loss 契约，防止错误续训。"""
+
+    training = config.get("training", {})
+    if not isinstance(training, Mapping):
+        raise ValueError("training config section must be a mapping.")
+    return {
+        "contract_version": 1,
+        "margin": float(training.get("margin", 1.0)),
+        "hard_negative_top_k": int(training.get("hard_negative_top_k", 3)),
+        "hard_negative_top1_weight": float(
+            training.get("hard_negative_top1_weight", 0.6)
+        ),
+        "positive_tail_loss_weight": float(
+            training.get("positive_tail_loss_weight", 0.10)
+        ),
+        "positive_tail_p95_weight": float(
+            training.get("positive_tail_p95_weight", 0.7)
+        ),
+        "positive_tail_p99_weight": float(
+            training.get("positive_tail_p99_weight", 0.3)
+        ),
+        "positive_tail_p95_target": float(
+            training.get("positive_tail_p95_target", 0.75)
+        ),
+        "positive_tail_p99_target": float(
+            training.get("positive_tail_p99_target", 0.90)
+        ),
+    }
+
+
 _LEGACY_FIXED_PAIR_VALIDATION_KEYS = {
     "positive_count",
     "same_finger_negatives_per_anchor",
@@ -263,6 +299,20 @@ def validate_resume_negative_sampling_contract(
             "The fixed in-batch protocol changes validation batches and candidate "
             "selection; start a new output directory instead of resuming this "
             "checkpoint."
+        )
+    saved_loss_contract = checkpoint.get("descriptor_loss_contract")
+    if not isinstance(saved_loss_contract, Mapping):
+        raise ValueError(
+            "Checkpoint predates the weighted-hard-negative/positive-tail loss "
+            "contract; do not resume its optimizer state under the new loss. "
+            "Start a new experiment and use the checkpoint only as pretrained weights."
+        )
+    current_loss_contract = descriptor_loss_contract(current_config)
+    if dict(saved_loss_contract) != current_loss_contract:
+        raise ValueError(
+            "Checkpoint descriptor-loss contract mismatch: "
+            f"checkpoint={dict(saved_loss_contract)}, configured={current_loss_contract}. "
+            "Start a new output directory instead of resuming this checkpoint."
         )
 
 
@@ -469,6 +519,9 @@ def train_one_epoch(
     loss_meter = RunningMean()
     pos_meter = RunningMean()
     neg_meter = RunningMean()
+    tail_meter = RunningMean()
+    pos_p95_meter = RunningMean()
+    pos_p99_meter = RunningMean()
     start = time.time()
     lr = base_lr
 
@@ -526,19 +579,36 @@ def train_one_epoch(
         loss_meter.update(float(loss.item()), batch_size)
         pos_meter.update(float(stats["pos_dist"].mean().item()), batch_size)
         if torch.any(valid):
-            neg_meter.update(float(stats["neg_dist"][valid].mean().item()), int(valid.sum().item()))
+            valid_count = int(valid.sum().item())
+            neg_meter.update(float(stats["neg_dist"][valid].mean().item()), valid_count)
+            positive_p95 = stats["positive_p95"]
+            positive_p99 = stats["positive_p99"]
+            if bool(torch.isfinite(positive_p95).item()) and bool(torch.isfinite(positive_p99).item()):
+                pos_p95_meter.update(float(positive_p95.item()), batch_size)
+                pos_p99_meter.update(float(positive_p99.item()), batch_size)
+            tail_meter.update(float(stats["positive_tail_loss"].item()), batch_size)
 
         if log_interval > 0 and step % log_interval == 0:
             elapsed = max(time.time() - start, 1e-6)
             print(
                 f"epoch={epoch} step={step}/{len(loader)} lr={lr:.4g} "
                 f"loss={loss_meter.value:.4g} pos={pos_meter.value:.4g} "
-                f"neg={neg_meter.value:.4g} samples/s={loss_meter.count / elapsed:.4g}",
+                f"neg={neg_meter.value:.4g} pos_tail={tail_meter.value:.4g} "
+                f"pos_p95={pos_p95_meter.value:.4g} pos_p99={pos_p99_meter.value:.4g} "
+                f"samples/s={loss_meter.count / elapsed:.4g}",
                 flush=True,
             )
         global_step += 1
 
-    return {"loss": loss_meter.value, "pos_dist": pos_meter.value, "neg_dist": neg_meter.value, "lr": lr}, global_step
+    return {
+        "loss": loss_meter.value,
+        "pos_dist": pos_meter.value,
+        "neg_dist": neg_meter.value,
+        "positive_tail_loss": tail_meter.value,
+        "positive_p95": pos_p95_meter.value,
+        "positive_p99": pos_p99_meter.value,
+        "lr": lr,
+    }, global_step
 
 
 def save_checkpoint(
@@ -565,6 +635,7 @@ def save_checkpoint(
         "descriptor_kind": "float",
         "descriptor_metric": "l2",
         "negative_sampling_contract": negative_sampling_contract(resolved_config),
+        "descriptor_loss_contract": descriptor_loss_contract(resolved_config),
         "model_architecture": model_architecture(model),
         "descriptor_dim": model_descriptor_dim(model),
         "model_parameter_count": count_parameters(model),
@@ -577,7 +648,12 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "optimizer_name": optimizer_name(optimizer),
         "metrics": metrics,
-        # ``config`` 保留旧读取方兼容；``resolved_config`` 明确表示已应用命令行覆盖。
+        "checkpoint_selection_strategy": (
+            resolved_config.get("checkpoint_selection", {}).get("strategy")
+            if isinstance(resolved_config.get("checkpoint_selection"), Mapping)
+            else None
+        ),
+        "checkpoint_selection_score": metrics.get("checkpoint_selection_score"),
         "config": resolved_config,
         "resolved_config": resolved_config,
     }
@@ -829,6 +905,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Number of hardest legal negatives used per positive pair (default from YAML, normally 3).",
     )
+    parser.add_argument(
+        "--hard-negative-top1-weight",
+        type=float,
+        default=None,
+        help="Weight assigned to the nearest selected negative; remaining top-k weight is shared.",
+    )
+    parser.add_argument("--positive-tail-loss-weight", type=float, default=None)
+    parser.add_argument("--positive-tail-p95-weight", type=float, default=None)
+    parser.add_argument("--positive-tail-p99-weight", type=float, default=None)
+    parser.add_argument("--positive-tail-p95-target", type=float, default=None)
+    parser.add_argument("--positive-tail-p99-target", type=float, default=None)
     parser.add_argument("--early-stop-patience", type=int, default=None)
     parser.add_argument("--early-stop-min-delta", type=float, default=None)
     parser.add_argument("--scheduler", choices=["linear", "warmup_cosine"], default=None)
@@ -898,6 +985,18 @@ def main() -> None:
         train_cfg["hard_negative_strategy"] = args.hard_negative_strategy
     if args.hard_negative_top_k is not None:
         train_cfg["hard_negative_top_k"] = int(args.hard_negative_top_k)
+    if args.hard_negative_top1_weight is not None:
+        train_cfg["hard_negative_top1_weight"] = float(args.hard_negative_top1_weight)
+    if args.positive_tail_loss_weight is not None:
+        train_cfg["positive_tail_loss_weight"] = float(args.positive_tail_loss_weight)
+    if args.positive_tail_p95_weight is not None:
+        train_cfg["positive_tail_p95_weight"] = float(args.positive_tail_p95_weight)
+    if args.positive_tail_p99_weight is not None:
+        train_cfg["positive_tail_p99_weight"] = float(args.positive_tail_p99_weight)
+    if args.positive_tail_p95_target is not None:
+        train_cfg["positive_tail_p95_target"] = float(args.positive_tail_p95_target)
+    if args.positive_tail_p99_target is not None:
+        train_cfg["positive_tail_p99_target"] = float(args.positive_tail_p99_target)
     if args.early_stop_patience is not None:
         train_cfg["early_stop_patience"] = int(args.early_stop_patience)
     if args.early_stop_min_delta is not None:
@@ -929,6 +1028,9 @@ def main() -> None:
     normalize_fixed_in_batch_validation_config(
         validation_cfg,
         default_seed=seed + 10_000,
+    )
+    config["checkpoint_selection"] = normalize_checkpoint_selection_config(
+        config.get("checkpoint_selection")
     )
     train_cfg["same_finger_min_coordinate_separation_px"] = (
         normalize_min_coordinate_separation(
@@ -1033,6 +1135,24 @@ def main() -> None:
         margin=float(train_cfg.get("margin", 1.0)),
         hard_negative_strategy=str(train_cfg.get("hard_negative_strategy", "same_finger_allowed")),
         hard_negative_top_k=int(train_cfg.get("hard_negative_top_k", 3)),
+        hard_negative_top1_weight=float(
+            train_cfg.get("hard_negative_top1_weight", 0.6)
+        ),
+        positive_tail_loss_weight=float(
+            train_cfg.get("positive_tail_loss_weight", 0.10)
+        ),
+        positive_tail_p95_weight=float(
+            train_cfg.get("positive_tail_p95_weight", 0.7)
+        ),
+        positive_tail_p99_weight=float(
+            train_cfg.get("positive_tail_p99_weight", 0.3)
+        ),
+        positive_tail_p95_target=float(
+            train_cfg.get("positive_tail_p95_target", 0.75)
+        ),
+        positive_tail_p99_target=float(
+            train_cfg.get("positive_tail_p99_target", 0.90)
+        ),
         same_finger_min_coordinate_separation_px=float(
             train_cfg["same_finger_min_coordinate_separation_px"]
         ),
@@ -1063,6 +1183,11 @@ def main() -> None:
         f"margin={train_cfg.get('margin', 1.0)} steps_per_epoch={steps_per_epoch} epochs={epochs} "
         f"hard_negative_strategy={train_cfg.get('hard_negative_strategy', 'same_finger_allowed')} "
         f"hard_negative_top_k={train_cfg.get('hard_negative_top_k', 3)} "
+        f"hard_negative_top1_weight={train_cfg.get('hard_negative_top1_weight', 0.6)} "
+        f"positive_tail_loss_weight={train_cfg.get('positive_tail_loss_weight', 0.10)} "
+        f"positive_tail_targets="
+        f"{train_cfg.get('positive_tail_p95_target', 0.75)}/"
+        f"{train_cfg.get('positive_tail_p99_target', 0.90)} "
         f"same_finger_min_coordinate_separation_px="
         f"{train_cfg['same_finger_min_coordinate_separation_px']} "
         f"scheduler={scheduler} warmup_epochs={warmup_epochs} eta_min={eta_min} "
@@ -1081,10 +1206,10 @@ def main() -> None:
         flush=True,
     )
 
-    best_fpr_at_tpr95, early_stop_best_fpr_at_tpr95, no_improve_epochs = (
-        best_fpr_at_tpr95_from_metrics(metrics_path)
+    best_selection_score, early_best_selection_score, no_improve_epochs = (
+        checkpoint_selection_state_from_metrics(metrics_path)
         if resume_path is not None
-        else (float("inf"), float("inf"), 0)
+        else (float("-inf"), float("-inf"), 0)
     )
     start_epoch = 1
     global_step = 0
@@ -1139,6 +1264,13 @@ def main() -> None:
             amp_dtype=amp_dtype,
             channels_last=channels_last,
         )
+        selection_metrics = checkpoint_selection_metrics(val_metrics, config)
+        val_metrics.update(selection_metrics)
+        current_selection_score = val_metrics["checkpoint_selection_score"]
+        current_fpr_at_tpr95 = val_metrics["fpr_at_tpr95"]
+        is_best = current_selection_score >= best_selection_score
+        if is_best:
+            best_selection_score = current_selection_score
         save_checkpoint(
             output_dir / "last.pt",
             model,
@@ -1150,10 +1282,7 @@ def main() -> None:
             scaler=scaler,
             model_macs_per_patch=model_macs_per_patch,
         )
-        # 固定协议的 FPR@TPR=95% 越低越好，以它选择 best checkpoint。
-        current_fpr_at_tpr95 = val_metrics["fpr_at_tpr95"]
-        if current_fpr_at_tpr95 <= best_fpr_at_tpr95:
-            best_fpr_at_tpr95 = current_fpr_at_tpr95
+        if is_best:
             save_checkpoint(
                 output_dir / "best.pt",
                 model,
@@ -1166,15 +1295,15 @@ def main() -> None:
                 model_macs_per_patch=model_macs_per_patch,
             )
 
-        # 只有相对下降达到 min_delta，才重置早停计数。
-        if early_stop_best_fpr_at_tpr95 == float("inf"):
-            early_stop_best_fpr_at_tpr95 = current_fpr_at_tpr95
+        # 综合分数越高越好；min_delta 表示相对分数提升比例。
+        if early_best_selection_score == float("-inf"):
+            early_best_selection_score = current_selection_score
             no_improve_epochs = 0
             early_stop_message = "early_stop=init"
         else:
-            improvement_threshold = early_stop_best_fpr_at_tpr95 * (1.0 - early_stop_min_relative)
-            if current_fpr_at_tpr95 < improvement_threshold:
-                early_stop_best_fpr_at_tpr95 = current_fpr_at_tpr95
+            improvement_threshold = early_best_selection_score * (1.0 + early_stop_min_relative)
+            if current_selection_score > improvement_threshold:
+                early_best_selection_score = current_selection_score
                 no_improve_epochs = 0
                 early_stop_message = "early_stop=improved"
             else:
@@ -1184,9 +1313,18 @@ def main() -> None:
         metric_row = {
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
+            "train_positive_tail_loss": train_metrics["positive_tail_loss"],
+            "train_positive_p95": train_metrics["positive_p95"],
+            "train_positive_p99": train_metrics["positive_p99"],
             "val_loss": val_metrics["loss"],
             "val_same_finger_loss": val_metrics["same_finger_loss"],
+            "val_pos_mean": val_metrics["pos_mean"],
             "val_pos_p95": val_metrics["pos_p95"],
+            "val_neg_mean": val_metrics["neg_mean"],
+            "val_same_finger_pos_mean": val_metrics["same_finger_pos_mean"],
+            "val_same_finger_neg_mean": val_metrics["same_finger_neg_mean"],
+            "val_cross_finger_pos_mean": val_metrics["cross_finger_pos_mean"],
+            "val_cross_finger_neg_mean": val_metrics["cross_finger_neg_mean"],
             "val_same_finger_neg_p01": val_metrics["same_finger_neg_p01"],
             "val_same_finger_tail_gap": (
                 val_metrics["same_finger_neg_p01"] - val_metrics["pos_p95"]
@@ -1195,16 +1333,41 @@ def main() -> None:
             "val_same_finger_fpr_at_tpr95": val_metrics[
                 "same_finger_fpr_at_tpr95"
             ],
+            "val_cross_finger_fpr_at_tpr95": val_metrics[
+                "cross_finger_fpr_at_tpr95"
+            ],
             "val_same_finger_tpr_at_fpr_1e_4": val_metrics[
                 "same_finger_tpr_at_fpr_1e_4"
+            ],
+            "val_cross_finger_tpr_at_fpr_1e_4": val_metrics[
+                "cross_finger_tpr_at_fpr_1e_4"
             ],
             "val_same_finger_recall_at_1": val_metrics[
                 "same_finger_recall_at_1"
             ],
+            "val_cross_finger_recall_at_1": val_metrics[
+                "cross_finger_recall_at_1"
+            ],
+            "val_checkpoint_selection_score": current_selection_score,
+            "val_checkpoint_selection_false_acceptance": val_metrics[
+                "checkpoint_selection_false_acceptance"
+            ],
+            "val_checkpoint_selection_low_fpr_recall": val_metrics[
+                "checkpoint_selection_low_fpr_recall"
+            ],
+            "val_checkpoint_selection_hard_negative_recall": val_metrics[
+                "checkpoint_selection_hard_negative_recall"
+            ],
+            "val_checkpoint_selection_mean_gap": val_metrics[
+                "checkpoint_selection_mean_gap"
+            ],
+            "val_checkpoint_selection_tail_gap": val_metrics[
+                "checkpoint_selection_tail_gap"
+            ],
             "val_valid_anchor_count": int(val_metrics["valid_anchor_count"]),
             "val_skipped_anchor_count": int(val_metrics["skipped_anchor_count"]),
             "lr": train_metrics["lr"],
-            "early_stop_best_fpr_at_tpr95": early_stop_best_fpr_at_tpr95,
+            "early_stop_best_selection_score": early_best_selection_score,
             "no_improve_epochs": no_improve_epochs,
         }
         append_metrics(output_dir / "metrics.csv", metric_row)
@@ -1212,6 +1375,9 @@ def main() -> None:
         print(
             f"epoch={epoch} done "
             f"train_loss={train_metrics['loss']:.4g} "
+            f"train_pos_tail={train_metrics['positive_tail_loss']:.4g} "
+            f"train_pos_p95={train_metrics['positive_p95']:.4g} "
+            f"train_pos_p99={train_metrics['positive_p99']:.4g} "
             f"val_same_loss={val_metrics['same_finger_loss']:.4g} "
             f"val_fpr95={current_fpr_at_tpr95:.4g} "
             f"same_fpr95={val_metrics['same_finger_fpr_at_tpr95']:.4g} "
@@ -1220,13 +1386,13 @@ def main() -> None:
             f"valid_anchors={int(val_metrics['valid_anchor_count'])} "
             f"skipped_anchors={int(val_metrics['skipped_anchor_count'])} "
             f"tail_gap={metric_row['val_same_finger_tail_gap']:.4g} "
-            f"best_for_stop={early_stop_best_fpr_at_tpr95:.4g} "
+            f"best_for_stop={early_best_selection_score:.4g} "
             f"{early_stop_message}",
             flush=True,
         )
         if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
             print(
-                f"early stopping: val_fpr_at_tpr95 has not improved by "
+                f"early stopping: matching checkpoint score has not improved by "
                 f"{early_stop_min_relative * 100:.4g}% for {early_stop_patience} epochs.",
                 flush=True,
             )

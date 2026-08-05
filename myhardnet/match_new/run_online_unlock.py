@@ -5,8 +5,8 @@
     2. ``--benchmark``，复用同一个在线引擎遍历离线划分中的本人查询，
        输出单次耗时明细和汇总统计。
 
-运行前必须先由 ``run_hardnet_matching.py`` 生成注册模板和 query 划分。
-脚本通过 ``--artifacts`` 与 ``online_unlock`` 配置直接定位这些文件；在线模型、
+运行前必须先由 ``run_hardnet_matching.py`` 生成注册模板、metadata_all.csv 和图像模板。
+benchmark 会根据注册模板索引在内存中推导 query，不依赖额外 split CSV；在线模型、
 预处理、匹配和阈值参数使用当前配置，可以独立调整以测量优化效果。
 """
 
@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from match_new.online_unlock import OnlineUnlockEngine
+from match_new.template_builder import apply_identity_template_split
 from match_new.utils import ensure_dir, load_config, read_csv_rows, resolve_path, write_csv_rows, write_json
 
 
@@ -73,18 +74,22 @@ def main() -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
-    split_path = engine.split_metadata_path
-    if not split_path.exists():
-        raise FileNotFoundError(f"query 划分文件不存在: {split_path}")
+    metadata_path = engine.metadata_path
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"原始 metadata 不存在: {metadata_path}")
+    split_rows = apply_identity_template_split(
+        read_csv_rows(metadata_path),
+        engine.identities,
+    )
     query_rows = [
         row
-        for row in read_csv_rows(split_path)
+        for row in split_rows
         if str(row.get("split", "")).lower() == "query"
     ]
     if args.limit > 0:
         query_rows = query_rows[: int(args.limit)]
     if not query_rows:
-        raise RuntimeError(f"no benchmark query rows found in {split_path}")
+        raise RuntimeError(f"no benchmark query rows found in {metadata_path}")
 
     benchmark = engine.benchmark(query_rows)
     if args.output_dir:

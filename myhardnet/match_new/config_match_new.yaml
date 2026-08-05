@@ -8,16 +8,10 @@
 #   5. 在目标阈值下导出 false reject / false accept 原图，方便人工排查失败原因。
 
 # ---------------------------------------------------------------------------
-experiment:
-  id: A0_hardnet128_ysjz_V4
-  dataset: ysjz_V4
-  protocol: identity_verification_v1
-  descriptor_variant: hardnet_128
-
 output:
   # 实验结果根目录。相对路径相对本配置文件所在目录解析。
   # A0 与后续 Strong-256 使用不同目录，禁止复用模板和阈值产物。
-  output_dir: ../outputs/ysjz_V4/A0_hardnet128
+  output_dir: ../outputs/newdata-8-lr10+nomobilelearn+模板数20
 
 runtime:
   skip_template_build: false
@@ -33,8 +27,8 @@ runtime:
   limit_images_per_identity: 0
 
 data:
-  # 原始指纹图像根目录。匹配任务会直接扫描原图，不依赖 pair_build 产物。
-  image_root: ../datasets/ysjz_V4
+  # 原始指纹图像根目录。匹配任务会直接扫描原图
+  image_root: ../datasets/new_data
 
   # 相对 image_root 的前几级目录共同组成一个手指的 identity_id。
   # 当前目录形如 dy_L0/pair_1.bmp，因此使用前 1 级。
@@ -51,11 +45,11 @@ model:
   descriptor_dim: auto
 
   # checkpoint 相对路径按本配置文件所在目录解析。
-  checkpoint: ../outputs/models/hardnet_train_post_nips_lr10/best.pt
+  checkpoint: ..\outputs\models\hardnet_train_post_nips_lr10\best.pt
 
   # 显式值会覆盖 checkpoint 中对应的模型参数，必须与训练结构兼容。
   # A0 保持旧 checkpoint 的训练配置；Strong-256 使用独立配置/命令行覆盖。
-  dropout: 0.3
+  dropout: 0.12
   final_bn_affine: false
 
   # auto 表示优先使用 CUDA；CUDA 不可用时自动使用 CPU。
@@ -199,10 +193,6 @@ template_management:
   # 动态模板库总开关。初始20张注册模板全部作为受保护seed，之后只学习HardNet模板。
   enabled: false
 
-  # true保证每次实验从同一批20张初始模板开始，便于重复对比。
-  # 实际长期在线运行时应改为false，继续读取上次保存的template_library.json。
-  reset_library_on_start: true
-
   # 初始20张模板全部受保护；模板库最多再容纳20张学习模板。
   max_active_templates: 40
   protected_seed_templates: 20
@@ -252,10 +242,10 @@ identification:
   early_stop_threshold:
 
 online_unlock:
-  # 在线入口直接从 output.output_dir（或命令行 --artifacts）下读取这些离线产物。
+  # 在线入口直接从 output.output_dir（或命令行 --artifacts）读取注册模板索引、
+  # metadata_all.csv 和图像模板。query 划分由注册模板索引在内存中推导。
   # 相对路径相对于产物目录解析；留空时按注册模板数量自动推导默认文件名。
   identity_templates:
-  split_metadata:
   image_templates_dir: image_templates
 
   # 启动时将注册模板加载到内存，模板加载时间不计入单次解锁耗时。
@@ -278,13 +268,10 @@ online_unlock:
     percentiles: [50, 90, 95, 99]
 
 evaluation:
+  # 全部未注册 query 使用同一个池计算阈值曲线、选择阈值并报告最终指标。
   # 正式手机解锁目标：FAR < 1/50000，FRR < 2%。
   target_far: 0.00002
   target_frr: 0.02
-
-  # query pool 在每个 identity 内固定拆分；validation 只选阈值，test 只报告冻结阈值。
-  validation_query_fraction: 0.5
-  query_partition_seed: 100042
 
   # 额外报告 TAR/FRR@FAR 的点。
   far_points: [0.001, 0.0001, 0.00002]

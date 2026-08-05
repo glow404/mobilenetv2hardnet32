@@ -229,6 +229,12 @@ class HardNetLoss(nn.Module):
         margin: float = 1.0,
         hard_negative_strategy: str = "same_finger_allowed",
         hard_negative_top_k: int = 3,
+        hard_negative_top1_weight: float = 0.6,
+        positive_tail_loss_weight: float = 0.10,
+        positive_tail_p95_weight: float = 0.7,
+        positive_tail_p99_weight: float = 0.3,
+        positive_tail_p95_target: float = 0.75,
+        positive_tail_p99_target: float = 0.90,
         same_finger_min_coordinate_separation_px: float = (
             DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX
         ),
@@ -237,6 +243,12 @@ class HardNetLoss(nn.Module):
         self.margin = float(margin)
         self.hard_negative_strategy = normalize_hard_negative_strategy(hard_negative_strategy)
         self.hard_negative_top_k = int(hard_negative_top_k)
+        self.hard_negative_top1_weight = float(hard_negative_top1_weight)
+        self.positive_tail_loss_weight = float(positive_tail_loss_weight)
+        self.positive_tail_p95_weight = float(positive_tail_p95_weight)
+        self.positive_tail_p99_weight = float(positive_tail_p99_weight)
+        self.positive_tail_p95_target = float(positive_tail_p95_target)
+        self.positive_tail_p99_target = float(positive_tail_p99_target)
         self.same_finger_min_coordinate_separation_px = (
             normalize_min_coordinate_separation(
                 same_finger_min_coordinate_separation_px
@@ -244,6 +256,22 @@ class HardNetLoss(nn.Module):
         )
         if self.hard_negative_top_k < 1:
             raise ValueError(f"hard_negative_top_k must be >= 1, got {hard_negative_top_k!r}.")
+        if not 0.0 < self.hard_negative_top1_weight <= 1.0:
+            raise ValueError(
+                "hard_negative_top1_weight must be in (0, 1], "
+                f"got {hard_negative_top1_weight!r}."
+            )
+        if self.positive_tail_loss_weight < 0.0:
+            raise ValueError(
+                "positive_tail_loss_weight must be >= 0, "
+                f"got {positive_tail_loss_weight!r}."
+            )
+        if self.positive_tail_p95_weight < 0.0 or self.positive_tail_p99_weight < 0.0:
+            raise ValueError("positive tail percentile weights must be >= 0.")
+        if self.positive_tail_p95_weight + self.positive_tail_p99_weight <= 0.0:
+            raise ValueError("At least one positive tail percentile weight must be > 0.")
+        if self.positive_tail_p95_target < 0.0 or self.positive_tail_p99_target < 0.0:
+            raise ValueError("positive tail targets must be >= 0.")
 
     def forward(
         self,
@@ -312,24 +340,57 @@ class HardNetLoss(nn.Module):
                 "selected_negative_candidate_index": (
                     selection.topk_candidate_index.detach()
                 ),
+                "positive_p95": selection.positive_dist.new_tensor(float("nan")),
+                "positive_p99": selection.positive_dist.new_tensor(float("nan")),
+                "positive_tail_loss": zero.detach(),
             }
             return zero, stats
 
-        # 每个 top-k 负样本各自计算 triplet margin loss；先在单条正样本内部
-        # 对有效负样本求均值，再在有效正样本间求均值，避免候选较少的样本权重变低。
+        valid_positive_dist = selection.positive_dist[selection.valid_anchor]
+        positive_p95 = torch.quantile(valid_positive_dist, 0.95)
+        positive_p99 = torch.quantile(valid_positive_dist, 0.99)
+        p95_tail = torch.clamp(
+            positive_p95 - self.positive_tail_p95_target,
+            min=0.0,
+        ).square()
+        p99_tail = torch.clamp(
+            positive_p99 - self.positive_tail_p99_target,
+            min=0.0,
+        ).square()
+        percentile_weight_sum = (
+            self.positive_tail_p95_weight + self.positive_tail_p99_weight
+        )
+        positive_tail_loss = (
+            self.positive_tail_loss_weight
+            * (
+                self.positive_tail_p95_weight * p95_tail
+                + self.positive_tail_p99_weight * p99_tail
+            )
+            / percentile_weight_sum
+        )
+
+        # top-k 候选已经按距离从近到远排序。top-1 使用更高权重，剩余权重
+        # 在其他有效候选之间均分；有效候选不足 k 个时重新归一化，避免样本
+        # 因为合法候选数量不同而改变整体 loss 权重。
+        selected_k = int(selection.topk_negative_dist.shape[1])
+        negative_weights = torch.full(
+            (selected_k,),
+            (1.0 - self.hard_negative_top1_weight) / max(selected_k - 1, 1),
+            dtype=selection.topk_negative_dist.dtype,
+            device=selection.topk_negative_dist.device,
+        )
+        negative_weights[0] = 1.0 if selected_k == 1 else self.hard_negative_top1_weight
         per_negative = torch.clamp(
             self.margin
             + selection.positive_dist[:, None]
             - selection.topk_negative_dist,
             min=0.0,
         )
-        per_sample = torch.where(
-            selection.valid_topk,
-            per_negative,
-            torch.zeros_like(per_negative),
-        ).sum(dim=1)
-        per_sample = per_sample / selection.negative_count.clamp_min(1)
-        loss = per_sample[selection.valid_anchor].mean()
+        weighted_mask = selection.valid_topk * negative_weights[None, :]
+        per_sample = (weighted_mask * per_negative).sum(dim=1)
+        per_sample = per_sample / weighted_mask.sum(dim=1).clamp_min(1e-8)
+        ranking_loss = per_sample[selection.valid_anchor].mean()
+        loss = ranking_loss + positive_tail_loss
         stats = {
             "pos_dist": selection.positive_dist.detach(),
             "neg_dist": selection.mean_negative_dist.detach(),
@@ -343,5 +404,8 @@ class HardNetLoss(nn.Module):
             "selected_negative_candidate_index": (
                 selection.topk_candidate_index.detach()
             ),
+            "positive_p95": positive_p95.detach(),
+            "positive_p99": positive_p99.detach(),
+            "positive_tail_loss": positive_tail_loss.detach(),
         }
         return loss, stats

@@ -39,7 +39,7 @@ from match_new.runtime import (
     patchable_keypoints,
 )
 
-from .utils import ensure_dir, template_filename, write_csv_rows, write_json
+from .utils import ensure_dir, template_filename, write_json
 
 
 LOGGER = logging.getLogger(__name__)
@@ -477,21 +477,43 @@ def build_hardnet_templates(
     }
 
 
+def apply_identity_template_split(
+    rows: list[dict[str, str]],
+    identities: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """根据注册模板索引在内存中标记 enroll/query，避免持久化中间 split CSV。"""
+
+    enrolled = {
+        (str(identity["identity_id"]), str(image_id))
+        for identity in identities
+        for image_id in identity.get("template_image_ids", [])
+    }
+    return [
+        {
+            **row,
+            "split": (
+                "enroll"
+                if (str(row["identity_id"]), str(row["image_id"])) in enrolled
+                else "query"
+            ),
+        }
+        for row in rows
+    ]
+
+
 def build_identity_templates(
     rows: list[dict[str, str]],
     output_path: str | Path,
-    split_metadata_output: str | Path,
     enrollment_count: int,
     seed: int,
-) -> dict[str, Any]:
-    """为每个 identity 随机选择注册模板，并写出 split metadata。"""
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """为每个 identity 随机选择注册模板，并返回内存中的 query 划分。"""
 
     groups: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         groups[row["identity_id"]].append(row)
 
     rng = random.Random(int(seed))
-    selected: set[tuple[str, str]] = set()
     identities: list[dict[str, Any]] = []
     warnings: list[str] = []
     for identity_id in sorted(groups):
@@ -500,8 +522,6 @@ def build_identity_templates(
         chosen = candidates[: min(int(enrollment_count), len(candidates))]
         if len(chosen) < int(enrollment_count):
             warnings.append(f"{identity_id} has only {len(chosen)} templates")
-        for row in chosen:
-            selected.add((row["identity_id"], row["image_id"]))
         identities.append(
             {
                 "identity_id": identity_id,
@@ -511,10 +531,6 @@ def build_identity_templates(
             }
         )
 
-    split_rows = []
-    for row in rows:
-        split_rows.append({**row, "split": "enroll" if (row["identity_id"], row["image_id"]) in selected else "query"})
-    write_csv_rows(split_metadata_output, split_rows)
     payload = {
         "enrollment_images_per_identity": int(enrollment_count),
         "selection_strategy": "random",
@@ -523,8 +539,9 @@ def build_identity_templates(
         "identities": identities,
         "warnings": warnings,
     }
+    split_rows = apply_identity_template_split(rows, identities)
     write_json(output_path, payload)
-    return payload
+    return payload, split_rows
 
 
 def load_identity_templates(path: str | Path) -> list[dict[str, Any]]:

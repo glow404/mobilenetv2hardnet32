@@ -25,6 +25,11 @@ from hardnet_train.binary_model import (
 from hardnet_train.binary_validation import (
     evaluate_binary_fixed_validation_batches,
 )
+from hardnet_train.checkpoint_selection import (
+    checkpoint_selection_metrics,
+    checkpoint_selection_state_from_metrics,
+    normalize_checkpoint_selection_config,
+)
 from hardnet_train.data import FingerprintPairDataset
 from hardnet_train.loss import normalize_hard_negative_strategy
 from hardnet_train.metrics import RunningMean
@@ -47,7 +52,6 @@ from hardnet_train.optim import (
 )
 from hardnet_train.train import (
     append_metrics,
-    best_fpr_at_tpr95_from_metrics,
     configure_cuda,
     load_config,
     make_loader,
@@ -354,6 +358,12 @@ def save_binary_checkpoint(
         "optimizer": optimizer.state_dict(),
         "optimizer_name": optimizer_name(optimizer),
         "metrics": metrics,
+        "checkpoint_selection_strategy": (
+            resolved_config.get("checkpoint_selection", {}).get("strategy")
+            if isinstance(resolved_config.get("checkpoint_selection"), Mapping)
+            else None
+        ),
+        "checkpoint_selection_score": metrics.get("checkpoint_selection_score"),
         "config": resolved_config,
         "resolved_config": resolved_config,
     }
@@ -494,7 +504,9 @@ def main() -> None:
         validation_cfg,
         default_seed=seed + 10_000,
     )
-    configured_validation_fingers = validation_cfg["finger_count"]
+    config["checkpoint_selection"] = normalize_checkpoint_selection_config(
+        config.get("checkpoint_selection")
+    )
     if (
         train_cfg["hard_negative_strategy"] == "different_finger"
         and isinstance(configured_validation_fingers, int)
@@ -611,10 +623,10 @@ def main() -> None:
         train_cfg.get("early_stop_min_relative_improvement", 0.002)
     )
 
-    best_fpr, early_best_fpr, no_improve_epochs = (
-        best_fpr_at_tpr95_from_metrics(metrics_path)
+    best_selection_score, early_best_selection_score, no_improve_epochs = (
+        checkpoint_selection_state_from_metrics(metrics_path)
         if resume_path is not None
-        else (float("inf"), float("inf"), 0)
+        else (float("-inf"), float("-inf"), 0)
     )
     start_epoch = 1
     global_step = 0
@@ -696,6 +708,17 @@ def main() -> None:
             amp_dtype=amp_dtype,
             channels_last=channels_last,
         )
+        selection_context = dict(config)
+        selection_context["descriptor_metric"] = "hamming"
+        selection_metrics = checkpoint_selection_metrics(
+            val_metrics,
+            selection_context,
+        )
+        val_metrics.update(selection_metrics)
+        current_selection_score = val_metrics["checkpoint_selection_score"]
+        is_best = current_selection_score >= best_selection_score
+        if is_best:
+            best_selection_score = current_selection_score
         save_binary_checkpoint(
             output_dir / "last.pt",
             model,
@@ -708,9 +731,7 @@ def main() -> None:
             val_metrics,
             scaler,
         )
-        current_fpr = float(val_metrics["fpr_at_tpr95"])
-        if current_fpr <= best_fpr:
-            best_fpr = current_fpr
+        if is_best:
             save_binary_checkpoint(
                 output_dir / "best.pt",
                 model,
@@ -724,11 +745,11 @@ def main() -> None:
                 scaler,
             )
 
-        if early_best_fpr == float("inf"):
-            early_best_fpr = current_fpr
+        if early_best_selection_score == float("-inf"):
+            early_best_selection_score = current_selection_score
             no_improve_epochs = 0
-        elif current_fpr < early_best_fpr * (1.0 - early_stop_min_relative):
-            early_best_fpr = current_fpr
+        elif current_selection_score > early_best_selection_score * (1.0 + early_stop_min_relative):
+            early_best_selection_score = current_selection_score
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
@@ -737,13 +758,14 @@ def main() -> None:
             "epoch": epoch,
             **{f"train_{name}": value for name, value in train_metrics.items()},
             **{f"val_{name}": value for name, value in val_metrics.items()},
-            "early_stop_best_fpr_at_tpr95": early_best_fpr,
+            "early_stop_best_selection_score": early_best_selection_score,
             "no_improve_epochs": no_improve_epochs,
         }
         append_metrics(metrics_path, metric_row)
         print(
             f"epoch={epoch} train_loss={train_metrics['loss']:.4f} "
-            f"val_fpr_at_tpr95={current_fpr:.6f} "
+            f"val_selection_score={current_selection_score:.6f} "
+            f"val_fpr_at_tpr95={val_metrics['fpr_at_tpr95']:.6f} "
             f"val_eer={val_metrics['eer']:.6f} "
             f"val_valid_anchors={int(val_metrics['valid_anchor_count'])} "
             f"val_skipped_anchors={int(val_metrics['skipped_anchor_count'])} "

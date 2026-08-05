@@ -2,7 +2,7 @@
 
 进程启动时加载模型、SIFT 检测器和注册模板；每次请求仅从一张原始指纹图像
 在内存中构建查询模板，与指定手指的注册模板匹配并记录各阶段时间。注册模板
-和 query 划分路径直接从在线配置解析，不依赖额外部署档案。
+路径来自在线配置，benchmark 的 query 划分由 metadata_all.csv 和注册索引推导。
 """
 
 from __future__ import annotations
@@ -112,11 +112,7 @@ class OnlineUnlockEngine:
             online_cfg.get("identity_templates"),
             f"identity_templates_{enrollment_count}.json",
         )
-        self.split_metadata_path = resolve_artifact_path(
-            self.artifacts_dir,
-            online_cfg.get("split_metadata"),
-            f"metadata_with_split_{enrollment_count}.csv",
-        )
+        self.metadata_path = (self.artifacts_dir / "metadata_all.csv").resolve()
         self.image_templates_dir = resolve_artifact_path(
             self.artifacts_dir,
             online_cfg.get("image_templates_dir"),

@@ -102,6 +102,7 @@ def _distance_metrics(positive_dist: torch.Tensor, negative_dist: torch.Tensor) 
     auc = float(torch.trapz(tpr, fpr).item())
 
     return {
+        "pos_mean": float(positives.mean().item()),
         "fpr_at_tpr95": fpr_at_tpr95,
         "tpr_at_fpr_1e_4": tpr_at_fpr_1e_4,
         "roc_auc": auc,
@@ -250,6 +251,7 @@ def in_batch_descriptor_validation_metrics(
     ):
         if not torch.any(mask):
             group_metrics = {
+                "pos_mean": math.nan,
                 "fpr_at_tpr95": math.nan,
                 "tpr_at_fpr_1e_4": math.nan,
                 "roc_auc": math.nan,

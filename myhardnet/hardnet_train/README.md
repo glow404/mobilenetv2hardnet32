@@ -6,21 +6,26 @@
 ## 文件说明
 
 - `model.py`：保留原 HardNet、MobileHardNet 与 HardNet Strong V2，统一接收 `[B, 1, 32, 32]` patch。
-- `loss.py`：top-k hardest-in-batch triplet margin loss。
+- `loss.py`：top-k hardest-in-batch triplet margin loss、top-1 加权和正样本 p95/p99 尾部约束。
 - `data.py`：CSV 数据集、坐标契约、PIL patch 读取、union-find 物理点分组和训练 batch sampler。
 - `negative_sampling.py`：同指负样本的 16px 方形邻域规则，供训练和验证共同使用。
 - `validation.py`：固定验证 batch 计划；batch 构造、候选掩码和 top-k 规则与训练共用。
-- `metrics.py`：运行均值、ROC/ranking、距离分位数和 active-triplet 指标。
+- `checkpoint_selection.py`：把误接受、低 FPR 召回、排序和距离间隔合成为匹配导向的 best checkpoint 分数。
+- `binary_model.py`：浮点 teacher、residual hash head、STE 量化和 bit packing 契约。
+- `binary_loss.py`：二值排序、teacher 关系保持、正样本一致性、量化、bit balance 和去相关组合损失。
+- `binary_validation.py`：固定验证计划上的归一化 Hamming 距离和 bit 分布指标。
+- `train_binary.py`：二值网络训练、续训、验证和 checkpoint 入口。
+- `config_binary_256.yaml`：带逐项注释的 256-bit 二值网络正式训练配置。
 - `optim.py`：SGD/AdamW 工厂与 decay/no-decay 参数分组。
 - `train.py`：训练主入口，负责配置解析、训练、固定验证、checkpoint 和 metrics 输出。
-- `config.yaml`：唯一的正式训练配置，默认训练 Strong V2。
+- `config.yaml`：浮点描述子的正式训练配置，默认训练 Strong V2。
 - `smoke_config.yaml`：快速自检配置，只跑极少 step。
 
 ## 输出文件
 
 训练结果默认写入 `../outputs/models/hardnet_train_strong_v2_256_fixed_in_batch_v1/`：
 
-- `best.pt`：固定 in-batch 计划上 `val_fpr_at_tpr95` 最低的 checkpoint。
+- `best.pt`：固定 in-batch 计划上 `matching_composite_v1` 综合分数最高的 checkpoint；不是只按单一 FPR 选择。
 - `last.pt`：最后一个 epoch 的 checkpoint。
 - `metrics.csv`：每个 epoch 只记录与最终匹配最相关的精简指标，浮点值最多保留 4 位有效数字。
 - `resolved_config.json`：包含命令行覆盖后的实际配置快照。
@@ -31,22 +36,28 @@
 
 - `epoch`
 - `train_loss`
+- `train_positive_tail_loss`
+- `train_positive_p95`、`train_positive_p99`
 - `val_loss`
 - `val_same_finger_loss`
+- `val_pos_mean`、`val_neg_mean`
+- `val_same_finger_pos_mean`、`val_same_finger_neg_mean`
+- `val_cross_finger_pos_mean`、`val_cross_finger_neg_mean`
 - `val_pos_p95`
 - `val_same_finger_neg_p01`
 - `val_same_finger_tail_gap`：`val_same_finger_neg_p01 - val_pos_p95`
 - `val_fpr_at_tpr95`
 - `val_same_finger_fpr_at_tpr95`
 - `val_same_finger_tpr_at_fpr_1e_4`
-- `val_same_finger_recall_at_1`
+- `val_same_finger_recall_at_1`、`val_cross_finger_recall_at_1`
+- `val_checkpoint_selection_score` 及五个 `val_checkpoint_selection_*` 分项：综合误接受、低 FPR 召回、Recall@1、均值间隔和困难尾部间隔，越高越好。
 - `val_valid_anchor_count`：当前固定计划中至少存在一个合法负样本的 anchor 数量。
 - `val_skipped_anchor_count`：当前 batch 内完全没有合法负样本、因此未参与 loss/ROC 的 anchor 数量。
 - `lr`
-- `early_stop_best_fpr_at_tpr95`
+- `early_stop_best_selection_score`
 - `no_improve_epochs`
 
-浮点指标以 4 位有效数字写入 CSV；epoch 和早停计数保持整数。删除的 ROC AUC、EER、跨指分项和均值仍会在内存中用于 checkpoint 验证结果，但不再扩散到逐 epoch CSV。
+浮点指标以 4 位有效数字写入 CSV；epoch 和早停计数保持整数。same-finger 与 cross-finger 的均值和核心排序指标统一使用 `val_` 前缀，避免训练日志和二值日志命名分叉。
 
 训练曲线同步聚焦于同指误接受、严格低 FPR 下的 TPR、Recall@1，以及正负困难尾部。旧 schema 的 `metrics.csv` 不能与新 schema 混写，继续训练必须使用匹配新协议的新输出目录。
 
@@ -70,23 +81,170 @@ model:
 
 该切换会自动改变网络结构、描述子维度和输出目录。当前 `dropout: 0.12`、`warmup_epochs: 3`、`lr: 0.08` 是 Strong V2 默认训练参数；若要严格复现旧 Mobile 配置，还应改回 `dropout: 0.1`、`warmup_epochs: 2`、`lr: 0.1`。
 
+`matching_composite_v1` 是描述子阶段的代理目标，不替代最终 `match_new` 全量模板、双向验证和 Lowe 比率评估；正式部署前仍应在独立匹配实验中确认阈值和误报行为。
+
+## 二值网络训练
+
+二值网络不是把浮点描述子在推理时直接执行一次 `sign`。`train_binary.py` 会加载已经训练好的浮点/L2 checkpoint 作为 teacher，在其后增加 residual hash head，通过可退火的 `tanh + straight-through sign` 学习固定长度的 0/1 bit code。
+
+组合损失包含：
+
+- **Hamming 排序代理损失**：保持正样本比 hardest-in-batch 负样本更近；
+- **teacher 关系保持**：让 student 的 batch 内两两相似度接近浮点 teacher；
+- **正样本一致性**：降低同一物理点二值码的不一致；
+- **量化约束**：推动连续输出接近 `-1/+1`，减少部署时 sign 误差；
+- **bit balance / decorrelation**：减少恒定 bit 和重复 bit。
+
+### 训练前提
+
+开始二值训练前必须满足以下条件：
+
+1. 已从 `pair_build` 生成 `outputs/butieping/train_pairs.csv` 和 `outputs/butieping/val_pairs.csv`，CSV 引用的 patch PNG 路径可读取；
+2. train/val 已按 `finger_id` 隔离，同一根手指不会跨集合；
+3. 已完成浮点网络训练，并存在 float/L2 teacher，例如 `outputs/models/hardnet_train_strong_v2_256_fixed_in_batch_v1/best.pt`；
+4. `config_binary_256.yaml` 中的 `backbone.checkpoint` 指向该 teacher；程序会校验 checkpoint 类型、架构和描述子维度，并拒绝 binary/Hamming checkpoint；
+5. 正式训练使用新的 `output_dir`。目录中已有 `metrics.csv` 时，必须显式续训，程序不会覆盖旧实验；
+6. `training.device: cuda` 时，当前 PyTorch 必须能够使用 CUDA。
+
+可在项目根目录执行以下检查：
+
+```powershell
+Test-Path outputs\butieping\train_pairs.csv
+Test-Path outputs\butieping\val_pairs.csv
+Test-Path outputs\models\hardnet_train_strong_v2_256_fixed_in_batch_v1\best.pt
+python -c "import torch; print('cuda_available=', torch.cuda.is_available()); print('cuda_count=', torch.cuda.device_count())"
+```
+
+前三个 `Test-Path` 应输出 `True`；正式 CUDA 训练时 `cuda_available` 也应为 `True`。
+
+如果还没有浮点 teacher，先执行：
+
+```powershell
+$env:KMP_DUPLICATE_LIB_OK='TRUE'
+$env:OMP_NUM_THREADS='1'
+python -m hardnet_train.train --config hardnet_train/config.yaml
+```
+
+浮点训练完成后，确认其 `best.pt` 路径与二值配置中的 `backbone.checkpoint` 一致。
+
+### 配置文件
+
+正式二值配置是 `hardnet_train/config_binary_256.yaml`。文件内已经逐项注释以下内容：
+
+- 数据 CSV、DataLoader worker、预取和调试截断参数；
+- 浮点 teacher checkpoint、架构和维度校验；
+- bit 数、hash head 宽度、dropout、量化温度和 bit 打包位序；
+- 六项组合损失的职责和权重；
+- batch 结构、hard negative、学习率调度、梯度裁剪和早停；
+- 固定 Hamming 验证计划及 `best.pt` 综合选择权重。
+
+默认采用 `hash_bits: 256` 和 `backbone_trainable: false`，即冻结 teacher、只训练 hash head。这是更稳定的第一阶段。若后续需要联合微调，应复制配置到新的输出目录，将 `backbone_trainable` 改为 `true`，并显著降低学习率，避免破坏已经训练好的浮点描述子。
+
+### 小规模自检
+
+先用极小训练/验证预算确认 CSV、patch、teacher、CUDA 和 checkpoint 写入链路都正常：
+
+```powershell
+$env:KMP_DUPLICATE_LIB_OK='TRUE'
+$env:OMP_NUM_THREADS='1'
+python -m hardnet_train.train_binary `
+  --config hardnet_train/config_binary_256.yaml `
+  --device cuda `
+  --epochs 1 `
+  --steps-per-epoch 2 `
+  --batch-size 32 `
+  --val-batch-count 2 `
+  --val-batch-size 12 `
+  --output-dir ../outputs/models/hardnet_binary_256_smoke
+```
+
+若该 smoke 输出目录已经存在 `metrics.csv`，请换一个新目录名；不要删除或覆盖仍需保留的实验。
+
+### 正式训练命令
+
+配置中的正式预算为 150 epoch、每 epoch 1000 step，直接执行：
+
+```powershell
+$env:KMP_DUPLICATE_LIB_OK='TRUE'
+$env:OMP_NUM_THREADS='1'
+python -m hardnet_train.train_binary `
+  --config hardnet_train/config_binary_256.yaml `
+  --device cuda
+```
+
+也可以显式覆盖常用参数：
+
+```powershell
+python -m hardnet_train.train_binary `
+  --config hardnet_train/config_binary_256.yaml `
+  --backbone-checkpoint ../outputs/models/hardnet_train_strong_v2_256_fixed_in_batch_v1/best.pt `
+  --hash-bits 256 `
+  --batch-size 256 `
+  --val-finger-count auto `
+  --val-batch-count 256 `
+  --val-batch-size 24 `
+  --lr 0.001 `
+  --output-dir ../outputs/models/hardnet_binary_256_fixed_in_batch_v1
+```
+
+`--backbone-checkpoint` 和 `--output-dir` 会作为配置值解析，相对路径以 `hardnet_train/config_binary_256.yaml` 所在目录为基准；`--resume` 的显式相对路径则以当前工作目录为基准。为避免歧义，建议优先在 YAML 中固定数据、teacher 和输出路径，命令行只覆盖临时实验参数。
+
+### 续训命令
+
+从当前输出目录的 `last.pt` 恢复模型、optimizer、epoch、global step 和 AMP scaler：
+
+```powershell
+$env:KMP_DUPLICATE_LIB_OK='TRUE'
+$env:OMP_NUM_THREADS='1'
+python -m hardnet_train.train_binary `
+  --config hardnet_train/config_binary_256.yaml `
+  --resume auto
+```
+
+也可以显式指定 checkpoint：
+
+```powershell
+python -m hardnet_train.train_binary `
+  --config hardnet_train/config_binary_256.yaml `
+  --resume outputs/models/hardnet_binary_256_fixed_in_batch_v1/last.pt
+```
+
+续训时不能修改 backbone、hash bit 数、hash head 结构、bitorder、优化器或固定负样本协议；这些实验变量变化时必须使用新的输出目录重新训练。
+
+### 训练产物和关键指标
+
+默认输出目录为 `outputs/models/hardnet_binary_256_fixed_in_batch_v1/`：
+
+- `best.pt`：`val_checkpoint_selection_score` 最高的二值 checkpoint；
+- `last.pt`：最后完成 epoch 的 checkpoint，用于续训；
+- `metrics.csv`：训练损失、Hamming 验证、bit 分布和 checkpoint 选择指标；
+- `resolved_config.json`：应用命令行覆盖后的最终配置。
+
+每轮二值验证复用固定 batch 计划、合法负样本 mask 和双向 top-k，并统一写入 `val_` 前缀。重点观察：
+
+- `val_checkpoint_selection_score`：综合 best 选择分数，越高越好；
+- `val_pos_mean` / `val_neg_mean`：正负样本平均归一化 Hamming 距离；
+- `val_same_finger_*` / `val_cross_finger_*`：确认没有只改善某一种负样本；
+- `val_bit_balance_error`：各 bit 偏离 50% 取 1 的平均程度，越低越好；
+- `val_constant_bit_ratio`：恒 0 或恒 1 bit 比例，理想值为 0；
+- `val_valid_anchor_count` / `val_skipped_anchor_count`：确认固定计划产生了足够合法负样本。
+
+验证 Hamming 距离范围是 `[0, 1]`。`validation.batch_count` 超过 image pair 数时会确定性循环使用，主要增加验证时间和 CPU 指标缓存，不直接增加单批 GPU 峰值。
+
+二值 checkpoint 当前不能直接交给只支持浮点/L2 描述子的 `match_new`。投入匹配流程前，需要另行实现二值模板存储、bitorder 契约和 Hamming 距离分支。
+
+
 ## 早停规则
 
-训练监控固定验证 batch 计划上的 `val_fpr_at_tpr95`：阈值达到 95% 正样本 TPR 时，实际被 top-k 选中的合法负样本被误接受的比例。该指标越低越好。
+训练监控固定验证 batch 计划上的 `matching_composite_v1` 综合分数：它把误接受、低 FPR 区间召回、top-1 排序以及正负距离间隔合并为一个越高越好的分数。同指和跨指分项优先使用各自最差值，避免某一类负样本退化被总体均值掩盖。
 
-当前正式配置将 `early_stop_patience` 设为 `0`，即关闭早停。启用后，规则为：
-
-```text
-连续 patience 个 epoch 没有让 val_fpr_at_tpr95 相对历史 best 达到配置的下降比例，则停止训练。
-```
-
-例如历史 best 为 `0.9868`，那么下一次必须低于：
+当前正式配置将 `early_stop_patience` 设为 `0`，即关闭早停。启用后，连续 patience 个 epoch 没有让 `val_checkpoint_selection_score` 相对历史 best 提升配置比例，就停止训练：
 
 ```text
-0.9868 * (1 - 0.01) = 0.976932
+历史 best * (1 + early_stop_min_relative_improvement)
 ```
 
-才算一次显著改善。否则累计 `no_improve_epochs`。
+例如历史 best 为 `0.80`、比例为 `0.01`，下一次必须超过 `0.808` 才算显著改善。`val_fpr_at_tpr95` 仍保留为核心观测指标，但不再单独决定 `best.pt`。
 
 可在配置中调整：
 
@@ -129,8 +287,26 @@ HardNet 的 top-k hardest-in-batch loss 会从 batch 内选择最相似的若干
 
 难负样本数量由 `training.hard_negative_top_k` 控制，默认是 `3`。对每条正样本，loss 会合并
 anchor→positive 和 positive→anchor 两个方向的合法负样本候选，选距离最小的 k 个，分别计算
-triplet margin loss 后求均值。合法候选不足 k 个时只使用现有候选；设为 `1` 可复现原来的
-单一 hardest-negative 行为。日志中的 `neg_dist` 是实际选中 top-k 负样本的平均距离。
+triplet margin loss。`training.hard_negative_top1_weight` 默认是 `0.6`，最近的 top-1 负样本
+获得 60% 权重，其余有效候选均分剩余权重；合法候选不足 k 个时会按实际候选重新归一化。
+设 `hard_negative_top_k=1` 可复现单一 hardest-negative 行为。日志中的 `neg_dist` 是实际选中
+top-k 负样本的平均距离。
+
+为避免训练后期只优化负样本而让正样本长尾恶化，loss 还对有效正样本距离的 p95/p99 加入平方
+hinge 约束：
+
+```yaml
+training:
+  positive_tail_loss_weight: 0.10
+  positive_tail_p95_weight: 0.7
+  positive_tail_p99_weight: 0.3
+  positive_tail_p95_target: 0.75
+  positive_tail_p99_target: 0.90
+```
+
+目标是单位描述子的 L2 距离。p99 在 batch=256 时只有少量样本参与分位点梯度，因此默认低于
+p95 的权重。`train_positive_tail_loss` 记录该项加权后的损失；如果正样本 p95/p99 已低于目标，
+该项为 0，不会继续压缩已经合格的正样本。
 
 本包还采用两层采样保护：
 

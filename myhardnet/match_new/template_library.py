@@ -65,12 +65,8 @@ class TemplateLibraryManager:
         self.retired_root = ensure_dir(
             self.output_root / str(self.config.get("retired_templates_dir", "retired_templates"))
         )
-        reset = bool(self.config.get("reset_library_on_start", True))
-        if self.library_path.exists() and not reset:
-            self.state = self._load_state()
-        else:
-            self.state = self._build_seed_state(identities)
-            self.persist()
+        self.state = self._build_seed_state(identities)
+        self.persist()
         self.sync_identities(identities)
 
     def _build_seed_state(self, identities: list[dict[str, Any]]) -> dict[str, Any]:
@@ -104,36 +100,6 @@ class TemplateLibraryManager:
             "protected_seed_templates": self.protected_seed_templates,
             "identities": records,
         }
-
-    def _load_state(self) -> dict[str, Any]:
-        """读取最新的完整索引；必要时从上次失败留下的文件恢复。"""
-
-        candidates = [
-            self.library_path,
-            self.library_path.with_suffix(self.library_path.suffix + ".pending"),
-            self.library_path.with_suffix(self.library_path.suffix + ".tmp"),
-        ]
-        candidates.extend(self.library_path.parent.glob(f".{self.library_path.name}.*.tmp"))
-        existing = sorted(
-            {path for path in candidates if path.exists()},
-            key=lambda path: path.stat().st_mtime_ns,
-            reverse=True,
-        )
-        errors: list[str] = []
-        for candidate in existing:
-            try:
-                payload = json.loads(candidate.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                errors.append(f"{candidate}: {exc}")
-                continue
-            if not isinstance(payload, dict) or not isinstance(payload.get("identities"), list):
-                errors.append(f"{candidate}: invalid structure")
-                continue
-            if candidate != self.library_path:
-                LOGGER.warning("从模板库恢复文件加载最新状态: %s", candidate)
-            return payload
-        detail = "; ".join(errors) if errors else "no state file found"
-        raise ValueError(f"invalid template library: {self.library_path} ({detail})")
 
     def _identity_record(self, identity_id: str) -> dict[str, Any]:
         target = str(identity_id)

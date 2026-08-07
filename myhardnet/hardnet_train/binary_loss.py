@@ -16,6 +16,16 @@ from hardnet_train.negative_sampling import (
 )
 
 
+BINARY_METRIC_LOSS_DEFAULTS = {
+    "hard_negative_top1_weight": 0.6,
+    "positive_tail_loss_weight": 0.05,
+    "positive_tail_p95_weight": 0.7,
+    "positive_tail_p99_weight": 0.3,
+    "positive_tail_p95_target": 0.60,
+    "positive_tail_p99_target": 0.80,
+}
+
+
 class BinaryDescriptorLoss(nn.Module):
     """联合优化匹配、teacher 关系保持、量化、bit 均衡与去相关。"""
 
@@ -25,6 +35,12 @@ class BinaryDescriptorLoss(nn.Module):
         margin: float = 0.8,
         hard_negative_strategy: str = "same_finger_allowed",
         hard_negative_top_k: int = 3,
+        hard_negative_top1_weight: float = 0.6,
+        positive_tail_loss_weight: float = 0.05,
+        positive_tail_p95_weight: float = 0.7,
+        positive_tail_p99_weight: float = 0.3,
+        positive_tail_p95_target: float = 0.60,
+        positive_tail_p99_target: float = 0.80,
         same_finger_min_coordinate_separation_px: float = (
             DEFAULT_SAME_FINGER_MIN_COORDINATE_SEPARATION_PX
         ),
@@ -40,6 +56,12 @@ class BinaryDescriptorLoss(nn.Module):
             margin=margin,
             hard_negative_strategy=hard_negative_strategy,
             hard_negative_top_k=hard_negative_top_k,
+            hard_negative_top1_weight=hard_negative_top1_weight,
+            positive_tail_loss_weight=positive_tail_loss_weight,
+            positive_tail_p95_weight=positive_tail_p95_weight,
+            positive_tail_p99_weight=positive_tail_p99_weight,
+            positive_tail_p95_target=positive_tail_p95_target,
+            positive_tail_p99_target=positive_tail_p99_target,
             same_finger_min_coordinate_separation_px=(
                 same_finger_min_coordinate_separation_px
             ),
@@ -76,6 +98,42 @@ class BinaryDescriptorLoss(nn.Module):
             ),
             hard_negative_top_k=int(
                 training_config.get("hard_negative_top_k", 3)
+            ),
+            hard_negative_top1_weight=float(
+                training_config.get(
+                    "hard_negative_top1_weight",
+                    BINARY_METRIC_LOSS_DEFAULTS["hard_negative_top1_weight"],
+                )
+            ),
+            positive_tail_loss_weight=float(
+                training_config.get(
+                    "positive_tail_loss_weight",
+                    BINARY_METRIC_LOSS_DEFAULTS["positive_tail_loss_weight"],
+                )
+            ),
+            positive_tail_p95_weight=float(
+                training_config.get(
+                    "positive_tail_p95_weight",
+                    BINARY_METRIC_LOSS_DEFAULTS["positive_tail_p95_weight"],
+                )
+            ),
+            positive_tail_p99_weight=float(
+                training_config.get(
+                    "positive_tail_p99_weight",
+                    BINARY_METRIC_LOSS_DEFAULTS["positive_tail_p99_weight"],
+                )
+            ),
+            positive_tail_p95_target=float(
+                training_config.get(
+                    "positive_tail_p95_target",
+                    BINARY_METRIC_LOSS_DEFAULTS["positive_tail_p95_target"],
+                )
+            ),
+            positive_tail_p99_target=float(
+                training_config.get(
+                    "positive_tail_p99_target",
+                    BINARY_METRIC_LOSS_DEFAULTS["positive_tail_p99_target"],
+                )
             ),
             same_finger_min_coordinate_separation_px=float(
                 training_config.get(

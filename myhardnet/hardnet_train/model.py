@@ -1,8 +1,9 @@
 """HardNet 系列 32×32 灰度 patch 描述子网络。
 
-本模块保留旧 HardNet、MobileHardNet 的稳定 checkpoint 协议，并以唯一的
-Strong V2 架构提供高精度主干。所有模型通过 `forward_features()` 暴露
-归一化前特征 `q` 和 L2 单位描述子 `f`，供浮点匹配及独立 hash head 共用。
+本模块保留旧 HardNet 的稳定 checkpoint 协议，以带 Coordinate Attention 的
+MobileHardNet 提供轻量主干，并以唯一的 Strong V2 架构提供高精度主干。所有
+模型通过 `forward_features()` 暴露归一化前特征 `q` 和 L2 单位描述子 `f`，
+供浮点匹配及独立 hash head 共用。
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ class HardNet(nn.Module):
             论文原始设置为 0.1；
             小指纹数据量和噪声情况不确定时，建议先用 0.1 做基线。
         descriptor_dim:
-            HardNet/SIFT 对齐为 128 维。这里保留参数但限制为 128，
-            避免不小心改坏论文结构。
+            输出描述子维度。默认 128 保持 HardNet/SIFT 对齐以及旧 checkpoint
+            兼容；使用其他维度时只改变最后一个 8×8 空间投影的输出通道数。
         final_bn_affine:
             最后一层 BN 默认不学习 affine 参数，更接近常见 HardNet 实现。
     """
@@ -44,9 +45,9 @@ class HardNet(nn.Module):
 
     def __init__(self, dropout: float = 0.1, descriptor_dim: int = 128, final_bn_affine: bool = False) -> None:
         super().__init__()
-        if descriptor_dim != 128:
-            raise ValueError("The paper architecture expects descriptor_dim=128.")
         self.descriptor_dim = int(descriptor_dim)
+        if self.descriptor_dim <= 0:
+            raise ValueError(f"descriptor_dim must be positive, got {descriptor_dim}.")
 
         # 尺寸变化：
         #   32x32 -> 32x32 -> 32x32 -> 16x16 -> 16x16 -> 8x8 -> 8x8 -> 1x1
@@ -60,8 +61,15 @@ class HardNet(nn.Module):
             self._conv_block(64, 128, stride=2),
             self._conv_block(128, 128, stride=1),
             nn.Dropout(p=float(dropout)),
-            nn.Conv2d(128, descriptor_dim, kernel_size=8, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(descriptor_dim, affine=final_bn_affine),
+            nn.Conv2d(
+                128,
+                self.descriptor_dim,
+                kernel_size=8,
+                stride=1,
+                padding=0,
+                bias=False,
+            ),
+            nn.BatchNorm2d(self.descriptor_dim, affine=final_bn_affine),
         )
         self.reset_parameters()
 
@@ -98,7 +106,7 @@ class HardNet(nn.Module):
         return DescriptorFeatures(q=q, f=F.normalize(q, p=2, dim=1))
 
     def forward(self, patches: torch.Tensor) -> torch.Tensor:
-        """前向计算 128 维单位长度描述子。"""
+        """前向计算配置维度的单位长度描述子。"""
         return self.forward_features(patches).f
 
 
@@ -153,11 +161,79 @@ class InvertedResidual(nn.Module):
         return inputs + outputs if self.use_residual else outputs
 
 
+class CoordinateAttention(nn.Module):
+    """保留横纵坐标信息的轻量通道注意力。
+
+    分别沿宽、高方向聚合特征，将两个方向的上下文联合编码后再生成独立的
+    高度和宽度注意力图。模块不改变输入形状，适合放在全图空间投影之前。
+    """
+
+    def __init__(self, channels: int, reduction: int = 32) -> None:
+        super().__init__()
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}.")
+        if reduction <= 0:
+            raise ValueError(f"reduction must be positive, got {reduction}.")
+
+        bottleneck_channels = max(8, int(channels) // int(reduction))
+        self.channels = int(channels)
+        self.bottleneck_channels = bottleneck_channels
+        self.shared_projection = nn.Sequential(
+            nn.Conv2d(
+                self.channels,
+                self.bottleneck_channels,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(self.bottleneck_channels),
+            nn.Hardswish(inplace=True),
+        )
+        self.height_projection = nn.Conv2d(
+            self.bottleneck_channels,
+            self.channels,
+            kernel_size=1,
+        )
+        self.width_projection = nn.Conv2d(
+            self.bottleneck_channels,
+            self.channels,
+            kernel_size=1,
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if inputs.ndim != 4 or inputs.shape[1] != self.channels:
+            raise ValueError(
+                f"CoordinateAttention expects [N,{self.channels},H,W], "
+                f"got {tuple(inputs.shape)}."
+            )
+
+        height, width = int(inputs.shape[2]), int(inputs.shape[3])
+        height_context = inputs.mean(dim=3, keepdim=True)
+        width_context = inputs.mean(dim=2, keepdim=True).transpose(2, 3)
+        encoded = self.shared_projection(
+            torch.cat([height_context, width_context], dim=2)
+        )
+        height_encoded, width_encoded = torch.split(
+            encoded,
+            [height, width],
+            dim=2,
+        )
+        width_encoded = width_encoded.transpose(2, 3)
+        height_attention = torch.sigmoid(
+            self.height_projection(height_encoded)
+        )
+        width_attention = torch.sigmoid(
+            self.width_projection(width_encoded)
+        )
+        return inputs * height_attention * width_attention
+
+
 class MobileHardNet(nn.Module):
     """面向 32x32 灰度 patch 的 MobileNetV2 风格轻量描述子网络。
 
     网络只做两次空间下采样，并用全图 depthwise 卷积学习每个通道的空间布局，
-    而不是用全局平均池化抹去指纹局部结构。输出协议与 HardNet 一致。
+    adapter 后使用 Coordinate Attention 联合建模横纵方向的位置与通道信息，
+    再生成全图空间描述子。输出协议与 HardNet 一致；其他维度只改变末端
+    1×1 线性投影。
     """
 
     architecture = "mobile_hardnet"
@@ -169,9 +245,9 @@ class MobileHardNet(nn.Module):
         final_bn_affine: bool = False,
     ) -> None:
         super().__init__()
-        if descriptor_dim != 128:
-            raise ValueError("MobileHardNet currently expects descriptor_dim=128.")
         self.descriptor_dim = int(descriptor_dim)
+        if self.descriptor_dim <= 0:
+            raise ValueError(f"descriptor_dim must be positive, got {descriptor_dim}.")
 
         self.stem = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1, bias=False),
@@ -193,13 +269,14 @@ class MobileHardNet(nn.Module):
             nn.BatchNorm2d(96),
             nn.ReLU6(inplace=True),
         )
+        self.coordinate_attention = CoordinateAttention(96, reduction=32)
         self.descriptor_head = nn.Sequential(
             nn.Dropout(p=float(dropout)),
             # depth multiplier=2：每个通道保留两组完整 patch 空间响应。
             nn.Conv2d(96, 192, kernel_size=8, groups=96, bias=False),
             # 两层之间保持线性，使其近似原 HardNet 的全通道空间投影。
-            nn.Conv2d(192, descriptor_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(descriptor_dim, affine=final_bn_affine),
+            nn.Conv2d(192, self.descriptor_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(self.descriptor_dim, affine=final_bn_affine),
         )
         self.reset_parameters()
 
@@ -218,6 +295,7 @@ class MobileHardNet(nn.Module):
         q = self.stem(patches)
         q = self.features(q)
         q = self.adapter(q)
+        q = self.coordinate_attention(q)
         q = self.descriptor_head(q).flatten(start_dim=1)
         return DescriptorFeatures(q=q, f=F.normalize(q, p=2, dim=1))
 
@@ -226,20 +304,15 @@ class MobileHardNet(nn.Module):
 
 
 class ContrastAwareStem(nn.Module):
-    """同时编码原始纹理、多尺度上下文和局部对比度。"""
+    """以局部纹理和局部对比度两条互补分支编码输入 patch。"""
 
-    def __init__(self, out_channels: int = 48) -> None:
+    def __init__(self, out_channels: int = 32) -> None:
         super().__init__()
-        if out_channels % 3 != 0:
-            raise ValueError("ContrastAwareStem out_channels must be divisible by 3.")
-        branch_channels = out_channels // 3
+        if out_channels % 2 != 0:
+            raise ValueError("ContrastAwareStem out_channels must be divisible by 2.")
+        branch_channels = out_channels // 2
         self.local_branch = nn.Sequential(
             nn.Conv2d(1, branch_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(branch_channels), branch_channels),
-            nn.SiLU(inplace=True),
-        )
-        self.context_branch = nn.Sequential(
-            nn.Conv2d(1, branch_channels, kernel_size=5, padding=2, bias=False),
             nn.GroupNorm(_group_count(branch_channels), branch_channels),
             nn.SiLU(inplace=True),
         )
@@ -261,7 +334,6 @@ class ContrastAwareStem(nn.Module):
         features = torch.cat(
             [
                 self.local_branch(inputs),
-                self.context_branch(inputs),
                 self.contrast_branch(local_contrast),
             ],
             dim=1,
@@ -310,28 +382,36 @@ class ConvNormAct(nn.Sequential):
         )
 
 
-class SqueezeExcitation(nn.Module):
-    """以轻量通道注意力增强稳定脊线响应，抑制背景噪声通道。"""
+class DropPath(nn.Module):
+    """按样本随机丢弃完整残差分支，并保持其期望值不变。"""
 
-    def __init__(self, channels: int, reduction: int = 4) -> None:
+    def __init__(self, probability: float = 0.0) -> None:
         super().__init__()
-        hidden_channels = max(8, channels // max(int(reduction), 1))
-        self.projection = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, hidden_channels, kernel_size=1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_channels, channels, kernel_size=1),
-            nn.Sigmoid(),
-        )
+        self.probability = float(probability)
+        if not 0.0 <= self.probability < 1.0:
+            raise ValueError(
+                f"DropPath probability must be in [0, 1), got {probability}."
+            )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return inputs * self.projection(inputs)
+        if self.probability == 0.0 or not self.training:
+            return inputs
+        keep_probability = 1.0 - self.probability
+        mask_shape = (inputs.shape[0],) + (1,) * (inputs.ndim - 1)
+        mask = inputs.new_empty(mask_shape).bernoulli_(keep_probability)
+        return inputs * mask / keep_probability
 
 
 class StableResBlock(nn.Module):
-    """预激活残差块；抗混叠下采样与 LayerScale 提升深层训练稳定性。"""
+    """预激活残差块；以 LayerScale 和 DropPath 抑制深层过拟合。"""
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        drop_path_probability: float = 0.0,
+    ) -> None:
         super().__init__()
         if stride not in {1, 2}:
             raise ValueError(f"stride must be 1 or 2, got {stride}.")
@@ -361,81 +441,73 @@ class StableResBlock(nn.Module):
             padding=1,
             bias=False,
         )
-        self.attention = SqueezeExcitation(out_channels)
         self.layer_scale = nn.Parameter(torch.full((out_channels,), 0.1))
+        self.drop_path = DropPath(drop_path_probability)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         source = self.downsample(inputs)
         shortcut = self.shortcut(source)
         outputs = self.conv1(F.silu(self.norm1(source), inplace=True))
         outputs = self.conv2(F.silu(self.norm2(outputs), inplace=True))
-        outputs = self.attention(outputs)
         scale = self.layer_scale.view(1, -1, 1, 1)
-        return shortcut + outputs * scale
+        return shortcut + self.drop_path(outputs * scale)
 
 
-class MultiScaleContext(nn.Module):
-    """融合点响应、邻域纹理、扩张上下文和整块统计信息。"""
+class ContextMixer(nn.Module):
+    """以单条扩张深度卷积路径混合局部与上下文特征。"""
 
-    def __init__(self, in_channels: int, out_channels: int = 256) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int = 128,
+        drop_path_probability: float = 0.0,
+    ) -> None:
         super().__init__()
-        branch_channels = out_channels // 4
-        if branch_channels * 4 != out_channels:
-            raise ValueError("MultiScaleContext out_channels must be divisible by 4.")
-        self.point_branch = ConvNormAct(
-            in_channels,
-            branch_channels,
-            kernel_size=1,
-            padding=0,
+        self.input_projection = ConvNormAct(
+            in_channels, out_channels, kernel_size=1, padding=0
         )
-        self.local_branch = nn.Sequential(
-            ConvNormAct(
-                in_channels,
-                in_channels,
-                kernel_size=3,
-                groups=in_channels,
-            ),
-            ConvNormAct(in_channels, branch_channels, kernel_size=1, padding=0),
+        self.depthwise = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            padding=2,
+            dilation=2,
+            groups=out_channels,
+            bias=False,
         )
-        self.dilated_branch = nn.Sequential(
-            ConvNormAct(
-                in_channels,
-                in_channels,
-                kernel_size=3,
-                dilation=2,
-                groups=in_channels,
-            ),
-            ConvNormAct(in_channels, branch_channels, kernel_size=1, padding=0),
+        self.norm = nn.GroupNorm(_group_count(out_channels), out_channels)
+        self.pointwise = nn.Conv2d(
+            out_channels, out_channels, kernel_size=1, bias=False
         )
-        self.global_branch = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            ConvNormAct(in_channels, branch_channels, kernel_size=1, padding=0),
-        )
-        self.fuse = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(_group_count(out_channels), out_channels),
-        )
-        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
         self.layer_scale = nn.Parameter(torch.full((out_channels,), 0.1))
+        self.drop_path = DropPath(drop_path_probability)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        global_context = F.interpolate(
-            self.global_branch(inputs),
-            size=inputs.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-        context = torch.cat(
-            [
-                self.point_branch(inputs),
-                self.local_branch(inputs),
-                self.dilated_branch(inputs),
-                global_context,
-            ],
-            dim=1,
-        )
+        shortcut = self.input_projection(inputs)
+        context = self.depthwise(shortcut)
+        context = self.pointwise(F.silu(self.norm(context), inplace=True))
         scale = self.layer_scale.view(1, -1, 1, 1)
-        return self.shortcut(inputs) + self.fuse(context) * scale
+        return shortcut + self.drop_path(context * scale)
+
+
+class ScalarWeightedFusion(nn.Module):
+    """用一个可学习标量融合单位化后的空间与全局描述子。"""
+
+    def __init__(self, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.weight_logit = nn.Parameter(torch.zeros(()))
+        self.dropout = nn.Dropout(p=float(dropout))
+
+    def forward(
+        self,
+        spatial: torch.Tensor,
+        global_context: torch.Tensor,
+    ) -> torch.Tensor:
+        spatial = F.normalize(spatial, p=2, dim=1)
+        global_context = F.normalize(global_context, p=2, dim=1)
+        spatial_weight = torch.sigmoid(self.weight_logit)
+        fused = spatial_weight * spatial + (1.0 - spatial_weight) * global_context
+        return self.dropout(fused)
 
 
 class GeM(nn.Module):
@@ -453,10 +525,11 @@ class GeM(nn.Module):
 
 
 class HardNetStrongV2(nn.Module):
-    """版本化的高精度 32×32 浮点描述子主干。
+    """面向 32×32 局部块的轻量高精度浮点描述子主干。
 
-    V2 保留局部空间投影，同时引入局部对比度、多尺度上下文、抗混叠残差和
-    GeM 全局分支。输出维度不再绑定到 256，可独立训练 128/256/384/512 维模型。
+    主干使用 32/64/128 通道与 1/2/2 个阶段残差块；两分支 Stem 避免重复的
+    5×5 表达，ContextMixer 取代四分支上下文。空间分支用 depthwise 8×8
+    保留通道内空间投影，全局分支使用 GeM，最终以一个可学习标量完成融合。
     """
 
     architecture = "hardnet_strong_v2"
@@ -466,53 +539,77 @@ class HardNetStrongV2(nn.Module):
         dropout: float = 0.1,
         descriptor_dim: int = 256,
         final_bn_affine: bool = False,
+        drop_path_rate: float = 0.08,
     ) -> None:
         super().__init__()
         if descriptor_dim <= 0:
             raise ValueError(f"descriptor_dim must be positive, got {descriptor_dim}.")
         if not 0.0 <= float(dropout) < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
+        if not 0.0 <= float(drop_path_rate) < 1.0:
+            raise ValueError(
+                f"drop_path_rate must be in [0, 1), got {drop_path_rate}."
+            )
         self.descriptor_dim = int(descriptor_dim)
+        self.drop_path_rate = float(drop_path_rate)
 
-        self.stem = ContrastAwareStem(48)
+        residual_block_count = 7
+        drop_path_rates = [
+            self.drop_path_rate * index / (residual_block_count - 1)
+            for index in range(residual_block_count)
+        ]
+        rate_iterator = iter(drop_path_rates)
+
+        self.stem = ContrastAwareStem(32)
         self.stage1 = nn.Sequential(
-            StableResBlock(48, 48),
-            StableResBlock(48, 48),
+            StableResBlock(32, 32, drop_path_probability=next(rate_iterator)),
         )
-        self.down1 = StableResBlock(48, 96, stride=2)
+        self.down1 = StableResBlock(
+            32,
+            64,
+            stride=2,
+            drop_path_probability=next(rate_iterator),
+        )
         self.stage2 = nn.Sequential(
-            StableResBlock(96, 96),
-            StableResBlock(96, 96),
-            StableResBlock(96, 96),
+            StableResBlock(64, 64, drop_path_probability=next(rate_iterator)),
+            StableResBlock(64, 64, drop_path_probability=next(rate_iterator)),
         )
-        self.down2 = StableResBlock(96, 192, stride=2)
+        self.down2 = StableResBlock(
+            64,
+            128,
+            stride=2,
+            drop_path_probability=next(rate_iterator),
+        )
         self.stage3 = nn.Sequential(
-            StableResBlock(192, 192),
-            StableResBlock(192, 192),
-            StableResBlock(192, 192),
-            StableResBlock(192, 192),
+            StableResBlock(128, 128, drop_path_probability=next(rate_iterator)),
+            StableResBlock(128, 128, drop_path_probability=next(rate_iterator)),
         )
-        self.fine_projection = ConvNormAct(96, 64, kernel_size=1, padding=0)
-        self.context = MultiScaleContext(192 + 64, out_channels=256)
+        self.fine_projection = ConvNormAct(64, 32, kernel_size=1, padding=0)
+        self.context = ContextMixer(
+            128 + 32,
+            out_channels=128,
+            drop_path_probability=self.drop_path_rate,
+        )
         self.head_norm = nn.Sequential(
-            nn.GroupNorm(_group_count(256), 256),
+            nn.GroupNorm(_group_count(128), 128),
             nn.SiLU(inplace=True),
         )
         self.spatial_projection = nn.Sequential(
-            ConvNormAct(256, 256, kernel_size=3, stride=2),
-            ConvNormAct(256, 256, kernel_size=3, stride=2),
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=8,
+                groups=128,
+                bias=False,
+            ),
+            nn.GroupNorm(_group_count(128), 128),
+            nn.SiLU(inplace=True),
             nn.Dropout2d(p=float(dropout) * 0.5),
-            nn.Conv2d(256, self.descriptor_dim, kernel_size=2, bias=False),
+            nn.Conv2d(128, self.descriptor_dim, kernel_size=1, bias=False),
         )
         self.global_pool = GeM()
-        self.global_projection = nn.Linear(256, self.descriptor_dim, bias=False)
-        self.fusion_norm = nn.LayerNorm(self.descriptor_dim * 2)
-        self.fusion_dropout = nn.Dropout(p=float(dropout))
-        self.fusion = nn.Linear(
-            self.descriptor_dim * 2,
-            self.descriptor_dim,
-            bias=False,
-        )
+        self.global_projection = nn.Linear(128, self.descriptor_dim, bias=False)
+        self.fusion = ScalarWeightedFusion(dropout=float(dropout))
         self.output_norm = nn.BatchNorm1d(
             self.descriptor_dim,
             affine=bool(final_bn_affine),
@@ -565,8 +662,7 @@ class HardNetStrongV2(nn.Module):
                 "HardNetStrongV2 spatial projection did not produce one descriptor per patch: "
                 f"got {tuple(spatial.shape)}."
             )
-        fused = torch.cat([spatial, global_context], dim=1)
-        q = self.fusion(self.fusion_dropout(self.fusion_norm(fused)))
+        q = self.fusion(spatial, global_context)
         q = self.output_norm(q)
         return DescriptorFeatures(q=q, f=F.normalize(q, p=2, dim=1))
 
@@ -633,7 +729,10 @@ def build_descriptor_model(model_config: Mapping[str, Any] | None = None) -> nn.
         return HardNet(**options)
     if architecture == "mobile_hardnet":
         return MobileHardNet(**options)
-    return HardNetStrongV2(**options)
+    return HardNetStrongV2(
+        **options,
+        drop_path_rate=float(config.get("drop_path_rate", 0.08)),
+    )
 
 
 def checkpoint_model_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:

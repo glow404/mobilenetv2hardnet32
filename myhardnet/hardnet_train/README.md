@@ -6,11 +6,12 @@
 ## 文件说明
 
 - `model.py`：保留原 HardNet、MobileHardNet 与 HardNet Strong V2，统一接收 `[B, 1, 32, 32]` patch。
+- `model_report.py`：实际执行一次前向，生成逐层输入/输出、作用、参数量与 MACs/FLOPs 表。
 - `loss.py`：top-k hardest-in-batch triplet margin loss、top-1 加权和正样本 p95/p99 尾部约束。
-- `data.py`：CSV 数据集、坐标契约、PIL patch 读取、union-find 物理点分组和训练 batch sampler。
-- `negative_sampling.py`：同指负样本的 16px 方形邻域规则，供训练和验证共同使用。
+- `data.py`：CSV 数据集、轻量在线增强、坐标契约、PIL patch 读取、union-find 物理点分组和训练 batch sampler。
+- `negative_sampling.py`：空间近邻规则，供训练和验证共同使用；验证指标不按同指/跨指拆分。
 - `validation.py`：固定验证 batch 计划；batch 构造、候选掩码和 top-k 规则与训练共用。
-- `checkpoint_selection.py`：把误接受、低 FPR 召回、排序和距离间隔合成为匹配导向的 best checkpoint 分数。
+- `checkpoint_selection.py`：把验证 loss、平均距离间隔、误接受和正样本 p95 合成为 best checkpoint 分数。
 - `binary_model.py`：浮点 teacher、residual hash head、STE 量化和 bit packing 契约。
 - `binary_loss.py`：二值排序、teacher 关系保持、正样本一致性、量化、bit balance 和去相关组合损失。
 - `binary_validation.py`：固定验证计划上的归一化 Hamming 距离和 bit 分布指标。
@@ -23,12 +24,19 @@
 
 ## 输出文件
 
-训练结果默认写入 `../outputs/models/hardnet_train_strong_v2_256_fixed_in_batch_v1/`：
+训练结果默认写入 `../outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3/`：
 
-- `best.pt`：固定 in-batch 计划上 `matching_composite_v1` 综合分数最高的 checkpoint；不是只按单一 FPR 选择。
+- `best.pt`：固定候选池协议上 `matching_composite_v1` 四项综合分数最高的 checkpoint；综合全部验证候选，不拆分同指/跨指分项。
 - `last.pt`：最后一个 epoch 的 checkpoint。
 - `metrics.csv`：每个 epoch 只记录与最终匹配最相关的精简指标，浮点值最多保留 4 位有效数字。
 - `resolved_config.json`：包含命令行覆盖后的实际配置快照。
+- `model_structure.md`：当前模型的 PyTorch 模块树、汇总参数量，以及按实际前向顺序整理的逐层输入/输出、作用、参数量和计算量表。
+- `model_structure.csv`：与 Markdown 逐层表相同的机器可读版本，使用 UTF-8 BOM，便于直接用 Excel 打开。
+
+每次启动浮点或二值训练都会在 checkpoint 的同一 `output_dir` 重新生成上述结构报告。
+计算量以单个 `[1,1,32,32]` patch 为单位：MACs 统计 Conv/Linear 乘加，FLOPs
+按 `1 MAC ≈ 2 FLOPs` 约算；归一化、激活、池化、插值、拼接和逐元素运算不计入
+MACs，因此该统计适合做模型间统一比较，但不代表设备上的实际推理延迟。
 
 ### 精简训练指标
 
@@ -39,27 +47,20 @@
 - `train_positive_tail_loss`
 - `train_positive_p95`、`train_positive_p99`
 - `val_loss`
-- `val_same_finger_loss`
 - `val_pos_mean`、`val_neg_mean`
-- `val_same_finger_pos_mean`、`val_same_finger_neg_mean`
-- `val_cross_finger_pos_mean`、`val_cross_finger_neg_mean`
-- `val_pos_p95`
-- `val_same_finger_neg_p01`
-- `val_same_finger_tail_gap`：`val_same_finger_neg_p01 - val_pos_p95`
+- `val_pos_p95`、`val_neg_p01`
 - `val_fpr_at_tpr95`
-- `val_same_finger_fpr_at_tpr95`
-- `val_same_finger_tpr_at_fpr_1e_4`
-- `val_same_finger_recall_at_1`、`val_cross_finger_recall_at_1`
-- `val_checkpoint_selection_score` 及五个 `val_checkpoint_selection_*` 分项：综合误接受、低 FPR 召回、Recall@1、均值间隔和困难尾部间隔，越高越好。
+- `val_tpr_at_fpr_1e_4`
+- `val_checkpoint_selection_score`：只综合 `val_loss`、`val_neg_mean - val_pos_mean`、`val_fpr_at_tpr95` 和 `val_pos_p95`，越高越好。
 - `val_valid_anchor_count`：当前固定计划中至少存在一个合法负样本的 anchor 数量。
 - `val_skipped_anchor_count`：当前 batch 内完全没有合法负样本、因此未参与 loss/ROC 的 anchor 数量。
 - `lr`
 - `early_stop_best_selection_score`
 - `no_improve_epochs`
 
-浮点指标以 4 位有效数字写入 CSV；epoch 和早停计数保持整数。same-finger 与 cross-finger 的均值和核心排序指标统一使用 `val_` 前缀，避免训练日志和二值日志命名分叉。
+浮点指标以 4 位有效数字写入 CSV；epoch 和早停计数保持整数。验证集只记录总体指标，不按同指/跨指拆分。
 
-训练曲线同步聚焦于同指误接受、严格低 FPR 下的 TPR、Recall@1，以及正负困难尾部。旧 schema 的 `metrics.csv` 不能与新 schema 混写，继续训练必须使用匹配新协议的新输出目录。
+训练曲线同步展示四项选模信号：训练/验证 loss、正样本 p95、FPR@TPR95 和平均正负距离间隔。旧 schema 的 `metrics.csv` 不能与新 schema 混写，继续训练必须使用匹配新策略的新输出目录。
 
 ## 网络架构切换
 
@@ -67,11 +68,33 @@
 
 | `model.architecture` | 自动维度 | 自动输出目录 | 网络状态 |
 | --- | ---: | --- | --- |
-| `hardnet_strong_v2` | 256 | `outputs/models/hardnet_train_strong_v2_256_fixed_in_batch_v1` | 默认高精度主干 |
-| `mobile_hardnet` | 128 | `outputs/models/hardnet_train_mobile_128_fixed_in_batch_v1` | 保留的 MobileHardNet 轻量主干 |
-| `hardnet` | 128 | `outputs/models/hardnet_train_hardnet_128_fixed_in_batch_v1` | 论文版 HardNet 主干 |
+| `hardnet_strong_v2` | 256 | `outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3` | 默认高精度主干 |
+| `mobile_hardnet` | 128 | `outputs/models/hardnet_train_mobile_128_fixed_candidate_pool_v3` | 带 Coordinate Attention 的轻量主干 |
+| `hardnet` | 128 | `outputs/models/hardnet_train_hardnet_128_fixed_candidate_pool_v3` | 论文版 HardNet 主干 |
 
-因此，只把下面一行改为 `mobile_hardnet`，即可使用原先的 MobileHardNet 网络结构训练：
+三种架构都支持把 `model.descriptor_dim` 设置为任意正整数；表中只是 `auto` 的
+默认值。自定义维度只改变各模型的描述子输出投影和末端归一化层，不改变前面的
+特征提取主干。`output_dir: auto` 会把实际维度写进目录名，避免不同维度的
+checkpoint 混放。原 HardNet 配置为 128 时仍与旧版本保持 checkpoint 兼容。
+
+当前 MobileHardNet 在 96 通道 adapter 与全图 depthwise 描述子投影之间加入一个
+Coordinate Attention，通过横、纵两个方向的池化保留位置敏感的脊线信息。
+架构标识仍为 `mobile_hardnet`，但结构已经更新，旧 MobileHardNet checkpoint
+不再兼容，必须重新训练；原 HardNet checkpoint 兼容性不受影响。
+
+当前 Strong V2 是针对 32×32 patch 收缩后的轻量高精度版本：Stem 只保留
+3×3 局部纹理和局部对比度两条分支；三个 stage 使用 32/64/128 通道及
+1/2/2 个普通残差块。逐块 SE 已移除，包含下采样块在内的 7 个残差块按照深度
+把 Stochastic Depth 从 0 线性增加到 `model.drop_path_rate`。原四分支上下文被
+单路扩张 depthwise ContextMixer 替代；8×8 特征通过 depthwise 8×8 空间投影和
+GeM 全局投影得到两个同维描述子，分别 L2 单位化后由一个可学习标量融合。
+
+Strong V2 的架构标识仍为 `hardnet_strong_v2`，但参数形状已经改变，旧 Strong V2
+checkpoint 不兼容。必须使用新的输出目录从头训练，并在浮点训练完成后把二值配置
+的 `backbone.checkpoint` 更新到新生成的 `best.pt`。
+
+因此，只把下面一行改为 `mobile_hardnet`，即可使用当前带 Coordinate Attention
+的 MobileHardNet 网络训练：
 
 ```yaml
 model:
@@ -80,6 +103,28 @@ model:
 ```
 
 该切换会自动改变网络结构、描述子维度和输出目录。当前 `dropout: 0.12`、`warmup_epochs: 3`、`lr: 0.08` 是 Strong V2 默认训练参数；若要严格复现旧 Mobile 配置，还应改回 `dropout: 0.1`、`warmup_epochs: 2`、`lr: 0.1`。
+
+## 训练在线增强
+
+浮点训练的三种架构和二值训练共用 `FingerprintPairDataset`，默认只对训练集启用
+轻量在线增强；固定验证集不增强。anchor 与 positive 独立采样扰动，使模型学习对
+关键点定位和成像误差的稳定性，而不是记忆固定 patch。默认参数为：
+
+| 扰动 | 默认强度 |
+| --- | ---: |
+| 整体增强概率 | 0.80 |
+| 旋转 | ±5° |
+| 平移 | ±1 px |
+| 缩放 | ±3% |
+| 对比度 | ±10% |
+| Gamma | ±10% |
+| 高斯模糊 | 概率 0.15，半径不超过 0.40 |
+| 高斯噪声 | 概率 0.25，标准差不超过 2/255 满量程 |
+
+增强发生在单 patch 标准化之前，不使用水平/垂直翻转和大角度旋转，避免破坏已经
+完成的关键点方向对齐。设置 `data.train_augmentation.enabled: false` 可关闭。
+实际增强参数会写入 `resolved_config.json` 和 checkpoint 契约；启用增强后不能把旧的
+无增强 checkpoint 作为同一实验恢复优化器状态，应使用新输出目录重新训练。
 
 `matching_composite_v1` 是描述子阶段的代理目标，不替代最终 `match_new` 全量模板、双向验证和 Lowe 比率评估；正式部署前仍应在独立匹配实验中确认阈值和误报行为。
 
@@ -101,7 +146,7 @@ model:
 
 1. 已从 `pair_build` 生成 `outputs/butieping/train_pairs.csv` 和 `outputs/butieping/val_pairs.csv`，CSV 引用的 patch PNG 路径可读取；
 2. train/val 已按 `finger_id` 隔离，同一根手指不会跨集合；
-3. 已完成浮点网络训练，并存在 float/L2 teacher，例如 `outputs/models/hardnet_train_strong_v2_256_fixed_in_batch_v1/best.pt`；
+3. 已完成当前轻量 Strong V2 浮点网络训练，并存在 float/L2 teacher，例如 `outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3/best.pt`；
 4. `config_binary_256.yaml` 中的 `backbone.checkpoint` 指向该 teacher；程序会校验 checkpoint 类型、架构和描述子维度，并拒绝 binary/Hamming checkpoint；
 5. 正式训练使用新的 `output_dir`。目录中已有 `metrics.csv` 时，必须显式续训，程序不会覆盖旧实验；
 6. `training.device: cuda` 时，当前 PyTorch 必须能够使用 CUDA。
@@ -111,7 +156,7 @@ model:
 ```powershell
 Test-Path outputs\butieping\train_pairs.csv
 Test-Path outputs\butieping\val_pairs.csv
-Test-Path outputs\models\hardnet_train_strong_v2_256_fixed_in_batch_v1\best.pt
+Test-Path outputs\models\hardnet_train_strong_v2_256_fixed_candidate_pool_v3\best.pt
 python -c "import torch; print('cuda_available=', torch.cuda.is_available()); print('cuda_count=', torch.cuda.device_count())"
 ```
 
@@ -139,6 +184,13 @@ python -m hardnet_train.train --config hardnet_train/config.yaml
 - 固定 Hamming 验证计划及 `best.pt` 综合选择权重。
 
 默认采用 `hash_bits: 256` 和 `backbone_trainable: false`，即冻结 teacher、只训练 hash head。这是更稳定的第一阶段。若后续需要联合微调，应复制配置到新的输出目录，将 `backbone_trainable` 改为 `true`，并显著降低学习率，避免破坏已经训练好的浮点描述子。
+
+二值训练虽然复用 `HardNetLoss` 作为 metric loss，但不会再依赖其中隐藏的默认值。
+`training.hard_negative_top1_weight` 和五个 `positive_tail_*` 参数会写入
+`resolved_config.json`、checkpoint 续训契约，并被显式传给实际损失。默认尾部权重
+为 `0.05`，低于浮点训练的 `0.10`，因为二值组合损失已经另有权重 `0.10` 的
+`positive_consistency_loss`。二值 p95/p99 L2 目标 `0.60/0.80` 分别约对应
+`9%/16%` 的正样本 bit 差异比例。
 
 ### 小规模自检
 
@@ -177,14 +229,14 @@ python -m hardnet_train.train_binary `
 ```powershell
 python -m hardnet_train.train_binary `
   --config hardnet_train/config_binary_256.yaml `
-  --backbone-checkpoint ../outputs/models/hardnet_train_strong_v2_256_fixed_in_batch_v1/best.pt `
+  --backbone-checkpoint ../outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3/best.pt `
   --hash-bits 256 `
   --batch-size 256 `
   --val-finger-count auto `
   --val-batch-count 256 `
   --val-batch-size 24 `
   --lr 0.001 `
-  --output-dir ../outputs/models/hardnet_binary_256_fixed_in_batch_v1
+  --output-dir ../outputs/models/hardnet_binary_256_fixed_candidate_pool_v3
 ```
 
 `--backbone-checkpoint` 和 `--output-dir` 会作为配置值解析，相对路径以 `hardnet_train/config_binary_256.yaml` 所在目录为基准；`--resume` 的显式相对路径则以当前工作目录为基准。为避免歧义，建议优先在 YAML 中固定数据、teacher 和输出路径，命令行只覆盖临时实验参数。
@@ -206,14 +258,14 @@ python -m hardnet_train.train_binary `
 ```powershell
 python -m hardnet_train.train_binary `
   --config hardnet_train/config_binary_256.yaml `
-  --resume outputs/models/hardnet_binary_256_fixed_in_batch_v1/last.pt
+  --resume outputs/models/hardnet_binary_256_fixed_candidate_pool_v3/last.pt
 ```
 
 续训时不能修改 backbone、hash bit 数、hash head 结构、bitorder、优化器或固定负样本协议；这些实验变量变化时必须使用新的输出目录重新训练。
 
 ### 训练产物和关键指标
 
-默认输出目录为 `outputs/models/hardnet_binary_256_fixed_in_batch_v1/`：
+默认输出目录为 `outputs/models/hardnet_binary_256_fixed_candidate_pool_v3/`：
 
 - `best.pt`：`val_checkpoint_selection_score` 最高的二值 checkpoint；
 - `last.pt`：最后完成 epoch 的 checkpoint，用于续训；
@@ -224,7 +276,8 @@ python -m hardnet_train.train_binary `
 
 - `val_checkpoint_selection_score`：综合 best 选择分数，越高越好；
 - `val_pos_mean` / `val_neg_mean`：正负样本平均归一化 Hamming 距离；
-- `val_same_finger_*` / `val_cross_finger_*`：确认没有只改善某一种负样本；
+- `val_pos_p95`：正样本 Hamming 距离 p95，越低越好；
+- `val_fpr_at_tpr95` / `val_tpr_at_fpr_1e_4`：总体 ROC 指标；
 - `val_bit_balance_error`：各 bit 偏离 50% 取 1 的平均程度，越低越好；
 - `val_constant_bit_ratio`：恒 0 或恒 1 bit 比例，理想值为 0；
 - `val_valid_anchor_count` / `val_skipped_anchor_count`：确认固定计划产生了足够合法负样本。
@@ -236,7 +289,7 @@ python -m hardnet_train.train_binary `
 
 ## 早停规则
 
-训练监控固定验证 batch 计划上的 `matching_composite_v1` 综合分数：它把误接受、低 FPR 区间召回、top-1 排序以及正负距离间隔合并为一个越高越好的分数。同指和跨指分项优先使用各自最差值，避免某一类负样本退化被总体均值掩盖。
+训练监控固定验证 batch 计划上的 `matching_composite_v1` 四项综合分数。它只使用四项总体指标：动态 hard top-k 的 `val_loss`、完整合法候选池的 `val_neg_mean - val_pos_mean` 和 `val_fpr_at_tpr95`，以及总体正样本的 `val_pos_p95`。
 
 当前正式配置将 `early_stop_patience` 设为 `0`，即关闭早停。启用后，连续 patience 个 epoch 没有让 `val_checkpoint_selection_score` 相对历史 best 提升配置比例，就停止训练：
 
@@ -300,8 +353,8 @@ training:
   positive_tail_loss_weight: 0.10
   positive_tail_p95_weight: 0.7
   positive_tail_p99_weight: 0.3
-  positive_tail_p95_target: 0.75
-  positive_tail_p99_target: 0.90
+  positive_tail_p95_target: 0.60
+  positive_tail_p99_target: 0.80
 ```
 
 目标是单位描述子的 L2 距离。p99 在 batch=256 时只有少量样本参与分位点梯度，因此默认低于
@@ -316,20 +369,20 @@ p95 的权重。`train_positive_tail_loss` 记录该项加权后的损失；如�
 4. loss 计算时屏蔽同一 `point_group` 的候选负样本。
 5. 对同指候选，anchor→positive 方向使用 A 图坐标，positive→anchor 方向使用 B 图坐标；只有同一坐标参考图内、位于锚点中心 32x32 方形邻域之外的点才合法。
 
-固定验证使用 `fixed_in_batch_v1`，不再为每个 anchor 预先凑固定数量的同指/跨指负样本。训练启动时按固定 `seed`：
+固定验证使用 `fixed_candidate_pool_v3`。训练启动时按固定 `seed` 固化正样本 batch 和所有合法负样本身份：
 
 1. `validation.finger_count: auto` 时使用 `min(验证集可用手指数, validation.batch_size)`，并把实际值写入 `resolved_config.json` 和 checkpoint；
 2. 构造 `validation.batch_count` 个固定验证 batch；
 3. 每根手指的 `image_pair_id` 固定洗牌后依次使用，全部用完时重新洗牌循环；
 4. 同一 batch 中每根手指仍只使用一个 `image_pair_id`；
-5. 每轮验证复用完全相同的 batch 顺序；
-6. 直接复用训练的 `point_group`、同指 16px 空间过滤、双向候选和 top-k 规则。
+5. 每轮验证复用完全相同的 batch 顺序和合法候选 mask；
+6. 完整合法候选池计算 ROC、FPR、TPR、EER 和负样本距离分布；每轮动态 top-k 只计算 active-triplet 和 margin loss。
 
 例如：
 
 ```yaml
 validation:
-  protocol: fixed_in_batch_v1
+  protocol: fixed_candidate_pool_v3
   seed: 10042
   finger_count: auto
   batch_count: 256
@@ -376,7 +429,7 @@ python -m hardnet_train.train `
 - **patch 文件不存在或损坏**：CSV 可以正常读取，但 DataLoader 真正打开图片时仍会失败；错误路径中会包含具体 patch 文件。
 - **没有合法负样本**：空间过滤、`point_group` 屏蔽和手指数量可能让部分 anchor 被跳过；若整个验证计划都没有有效 anchor，验证会明确报错。
 - **验证预算过大**：image pair 不足只会循环使用，不会报错；每批指标计算完会立即转存 CPU，因此 `batch_count` 不直接提高单步 GPU 显存峰值，但固定计划、验证耗时和 CPU 指标缓存仍会随 `batch_count × batch_size` 近似线性增长。超过十万个正样本槽位会发出警告，超过一千万会提前拒绝。
-- **自动手指数过多**：若 `auto` 最终解析为 `finger_count == batch_size`，每根手指每 batch 只有一对样本，同指负样本指标不可用，程序会发出警告。
+- **自动手指数过多**：若 `auto` 最终解析为 `finger_count == batch_size`，每根手指每 batch 只有一对样本，合法负样本数量会减少；程序会发出警告。
 
 启动日志会显示实际验证手指数、固定 batch 数、每根手指使用的唯一 image pair 范围，以及发生 image pair 循环的手指数。
 

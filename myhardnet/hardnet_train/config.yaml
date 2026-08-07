@@ -11,6 +11,22 @@ data:
   train_csv: ../outputs/butieping/train_pairs.csv
   val_csv: ../outputs/butieping/val_pairs.csv
   normalize: true
+  # 只对训练 patch 在线增强；anchor/positive 独立采样，验证集始终保持原图。
+  # patch 已按关键点方向对齐，因此几何扰动保持轻微，不使用翻转或大角度旋转。
+  train_augmentation:
+    enabled: true
+    # 20% patch 保持原样，80% 执行下列随机扰动。
+    probability: 0.80
+    max_rotation_degrees: 5.0
+    max_translation_pixels: 1.0
+    scale_jitter: 0.03
+    contrast_jitter: 0.10
+    gamma_jitter: 0.10
+    blur_probability: 0.15
+    max_blur_radius: 0.40
+    # 灰度值范围为 0～255，最大噪声标准差 2 约等于 0.8% 满量程。
+    noise_probability: 0.25
+    max_noise_std: 2.0
   # Windows 下使用多个常驻 worker 提前读取 patch，减少 GPU 等待磁盘/PIL 解码。
   num_workers: 4
   pin_memory: false
@@ -22,11 +38,13 @@ data:
   max_val_rows_per_finger:
 
 model:
-  #  可选hardnet_strong_v2和mobile_hardnet
+  # 可选 hardnet_strong_v2、mobile_hardnet、hardnet。
   architecture: hardnet_strong_v2
-  # auto 按 architecture 解析：Strong V2=256，MobileHardNet/HardNet=128。
-  descriptor_dim: auto
+  # 三种架构均支持自定义正整数维度；auto 使用默认值：Strong V2=256，其余=128。
+  descriptor_dim: 256
   dropout: 0.12
+  # Strong V2 的 7 个残差块按深度从 0 线性增加到该概率；其他架构忽略此项。
+  drop_path_rate: 0.08
   final_bn_affine: false
 
 training:
@@ -60,10 +78,10 @@ training:
   positive_tail_loss_weight: 0.10
   positive_tail_p95_weight: 0.7
   positive_tail_p99_weight: 0.3
-  positive_tail_p95_target: 0.75
-  positive_tail_p99_target: 0.90
+  positive_tail_p95_target: 0.60
+  positive_tail_p99_target: 0.80
   # 论文 margin 是 1.0；当前指纹 patch 先保留较温和的 0.8。
-  margin: 0.8
+  margin: 0.9
   # 长训练先禁用早停；需要时可命令行设置 --early-stop-patience。
   early_stop_patience: 0
   early_stop_min_relative_improvement: 0.002
@@ -73,26 +91,30 @@ training:
   log_interval: 50
 
 validation:
-  # 固定 in-batch 协议：batch 构造、非法候选屏蔽和双向 top-k 均与训练一致。
-  protocol: fixed_in_batch_v1
+  # 固定候选池协议：完整合法候选计算 ROC/FPR，动态 top-k 仅计算排序与 loss。
+  protocol: fixed_candidate_pool_v3
   seed: 10042
   # auto 使用 min(验证集可用手指数, batch_size)，保证每根手指至少贡献 1 对样本。
   # batch_count 只控制固定验证 batch 数；image_pair 不足时会确定性循环，不会因此报错。
   finger_count: auto
   batch_count: 256
-  # batch_size 会尽量均匀分配到所选手指；无合法负样本的 anchor 只跳过并计数。
-  batch_size: 64
+  # batch_size=正样本对数
+  batch_size: 32
 
-# 匹配导向的综合选择：同时考虑误接受、低 FPR 召回、top-1 排序和距离间隔。
-# 各分项先归一化到 [0, 1]，再按权重加权；分数越高越好。
+# 匹配导向的综合选择：各指标先转换为 [0, 1] 的“越大越好”分量，
+# 再按以下权重求和：score = sum(normalized_weight_i * component_i)。
+# 非负权重会按总和自动归一化，但权重总和必须大于 0。
 checkpoint_selection:
   strategy: matching_composite_v1
   weights:
-    false_acceptance: 0.45
-    low_fpr_recall: 0.20
-    hard_negative_recall: 0.15
-    mean_gap: 0.10
-    tail_gap: 0.10
+    # 动态 hard top-k margin loss：1 - clamp(val_loss / (2 + margin), 0, 1)。
+    loss: 0.30
+    # 完整合法候选池均值间隔：clamp((val_neg_mean - val_pos_mean) / 2, 0, 1)。
+    distance_gap: 0.20
+    # 完整合法候选池误接受：1 - clamp(val_fpr_at_tpr95, 0, 1)。
+    fpr_at_tpr95: 0.35
+    # 正样本尾部距离：1 - clamp(val_pos_p95 / 2, 0, 1)。
+    pos_p95: 0.15
 
 optimizer:
   # 默认使用 SGD + Nesterov。切换为 adamw 时也要显式设置对应学习率，

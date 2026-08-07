@@ -1,16 +1,15 @@
-"""HardNet L2 图像级匹配器。工具脚本
+"""HardNet 图像级匹配器。工具脚本
 
 作用：
     对一张 query 指纹图模板和一张 gallery/template 指纹图模板进行匹配，
-    输出图像级分数和诊断指标。这个文件是 match_new 的核心：
+    输出图像级分数和诊断指标。距离由模板契约自动选择：
 
-    1. 不再使用 Hadamard/Hamming 二值化；
-    2. 直接在 HardNet 连续 descriptor 上计算 L2 距离，维度由模板元数据约束；
-    3. 用 top-k / ratio 生成较宽松候选；
-    4. 候选过多时做方向软排序截断，而不是方向峰硬裁剪；
-    5. 用 RANSAC 估计局部仿射变换；
-    6. 对 RANSAC inliers 做 one-to-one 去重；
-    7. 融合归一化 unique inlier 分数与脊线纹理分数，得到图像级 match score。
+    1. float32 描述子使用 L2；packed_uint8 二值描述子使用归一化 Hamming；
+    2. 用 top-k / ratio 生成较宽松候选；
+    3. 候选过多时做方向软排序截断，而不是方向峰硬裁剪；
+    4. 用 RANSAC 估计局部仿射变换；
+    5. 对 RANSAC inliers 做 one-to-one 去重；
+    6. 融合归一化 unique inlier 分数与脊线纹理分数，得到图像级 match score。
 
 输入：
     query/gallery 都是 `.npz` 模板读出的 dict，至少包含：
@@ -19,7 +18,7 @@
         - hardnet_descriptors
 
 输出：
-    一个 dict，包含 score、unique_inliers、raw_inliers、mean_l2_distance、
+    一个 dict，包含 score、unique_inliers、raw_inliers、描述子距离、
     mean_reproj_error、orientation_consistency 等字段。
 """
 
@@ -34,8 +33,14 @@ import cv2
 import numpy as np
 
 from match_new.descriptor_contract import (
+    BINARY_DESCRIPTOR_KIND,
+    HAMMING_DISTANCE_METRIC,
+    L2_DISTANCE_METRIC,
+    DescriptorContract,
+    descriptor_columns,
     require_compatible_contracts,
     require_l2_float_contract,
+    require_supported_contract,
     resolve_descriptor_contract,
 )
 
@@ -45,7 +50,7 @@ class MatchCandidate:
     """一个 HardNet 候选匹配。
 
     query_idx / gallery_idx 指向两张图中的 keypoint 下标；
-    distance 是 HardNet L2 距离，越小越像；
+    distance 是当前模板契约对应的描述子距离，越小越像；
     angle_delta 只用于软排序和诊断，不作为前置硬门槛。
     """
 
@@ -74,47 +79,84 @@ def wrap_angle_deg(angle: float) -> float:
     return float(angle)
 
 
-def select_l2_descriptors(template: dict[str, Any], descriptor_source: str) -> np.ndarray:
-    """读取并归一化连续描述子，维度和类型完全由模板契约约束。"""
+def descriptor_array_key(descriptor_source: str) -> tuple[str, str]:
+    """把描述子来源映射到模板数组字段和可用性标记。"""
 
     source = str(descriptor_source).strip().lower()
     if source == "hardnet":
-        key = "hardnet_descriptors"
-        has_flag = "has_hardnet"
-    elif source in {"sift", "rootsift"}:
-        key = "sift_descriptors"
-        has_flag = "has_sift"
-    else:
-        raise ValueError(f"unsupported descriptor_source: {descriptor_source}")
+        return "hardnet_descriptors", "has_hardnet"
+    if source in {"sift", "rootsift"}:
+        return "sift_descriptors", "has_sift"
+    raise ValueError(f"unsupported descriptor_source: {descriptor_source}")
+
+
+def select_descriptors(
+    template: dict[str, Any],
+    descriptor_source: str,
+) -> tuple[np.ndarray, DescriptorContract]:
+    """按模板契约读取浮点或打包二值描述子。"""
+
+    key, has_flag = descriptor_array_key(descriptor_source)
     if has_flag in template and not bool(template.get(has_flag)):
         template_path = template.get("template_path", "<unknown>")
         raise ValueError(
             f"template has no {key}: {template_path}. "
-            "请使用对应的单描述子模板目录，不要复用双描述子或错误类型的模板。"
+            "请使用对应的单描述子模板目录，不要复用错误类型的模板。"
         )
 
-    contract = resolve_descriptor_contract(template, source)
-    label = str(template.get("template_path", template.get("image_id", "<in-memory-template>")))
-    require_l2_float_contract(contract, label=label)
-
+    contract = resolve_descriptor_contract(template, descriptor_source)
+    label = str(
+        template.get(
+            "template_path",
+            template.get("image_id", "<in-memory-template>"),
+        )
+    )
+    require_supported_contract(contract, label=label)
+    dtype = np.uint8 if contract.kind == BINARY_DESCRIPTOR_KIND else np.float32
     raw = template.get(key)
-    desc = np.asarray(raw if raw is not None else [], dtype=np.float32)
+    desc = np.asarray(raw if raw is not None else [], dtype=dtype)
+    expected_columns = descriptor_columns(contract)
     if desc.size == 0:
-        if desc.ndim == 2 and desc.shape[1] not in {0, contract.dimension}:
+        if desc.ndim == 2 and desc.shape[1] not in {0, expected_columns}:
             raise ValueError(
                 f"{key} metadata/array dimension mismatch for {label}: "
                 f"contract={contract.dimension}, array={desc.shape}."
             )
-        return np.zeros((0, contract.dimension), dtype=np.float32)
-    if desc.ndim != 2 or desc.shape[1] != contract.dimension:
+        return np.zeros((0, expected_columns), dtype=dtype), contract
+    if desc.ndim != 2 or desc.shape[1] != expected_columns:
         raise ValueError(
-            f"{key} must be [N,{contract.dimension}] for {label}, got {desc.shape}. "
+            f"{key} must be [N,{expected_columns}] for {label}, got {desc.shape}. "
             "Implicit reshape, truncation and padding are not supported."
         )
-    if not np.all(np.isfinite(desc)):
-        raise ValueError(f"{key} contains NaN or infinite values: {label}")
-    norms = np.linalg.norm(desc, axis=1, keepdims=True)
-    return desc / np.maximum(norms, 1e-12)
+    if contract.kind != BINARY_DESCRIPTOR_KIND:
+        if not np.all(np.isfinite(desc)):
+            raise ValueError(f"{key} contains NaN or infinite values: {label}")
+        norms = np.linalg.norm(desc, axis=1, keepdims=True)
+        desc = desc / np.maximum(norms, 1e-12)
+    return np.ascontiguousarray(desc), contract
+
+
+def select_l2_descriptors(template: dict[str, Any], descriptor_source: str) -> np.ndarray:
+    """兼容旧调用：读取并归一化连续描述子。"""
+
+    descriptors, contract = select_descriptors(template, descriptor_source)
+    require_l2_float_contract(contract, label=str(template.get("template_path", "template")))
+    return descriptors
+
+
+def require_compatible_templates(
+    query: dict[str, Any],
+    gallery: dict[str, Any],
+    descriptor_source: str,
+) -> DescriptorContract:
+    """验证 query/gallery 契约一致，并返回统一契约。"""
+
+    query_contract = resolve_descriptor_contract(query, descriptor_source)
+    gallery_contract = resolve_descriptor_contract(gallery, descriptor_source)
+    require_supported_contract(query_contract, label="query")
+    require_supported_contract(gallery_contract, label="gallery")
+    require_compatible_contracts(query_contract, gallery_contract)
+    return query_contract
 
 
 def require_compatible_l2_templates(
@@ -122,13 +164,10 @@ def require_compatible_l2_templates(
     gallery: dict[str, Any],
     descriptor_source: str,
 ) -> None:
-    """在距离计算前验证 query/gallery 的类型、度量和维度完全一致。"""
+    """兼容旧调用：验证 query/gallery 都是相同的浮点 L2 契约。"""
 
-    query_contract = resolve_descriptor_contract(query, descriptor_source)
-    gallery_contract = resolve_descriptor_contract(gallery, descriptor_source)
-    require_l2_float_contract(query_contract, label="query")
-    require_l2_float_contract(gallery_contract, label="gallery")
-    require_compatible_contracts(query_contract, gallery_contract)
+    contract = require_compatible_templates(query, gallery, descriptor_source)
+    require_l2_float_contract(contract, label="query/gallery")
 
 
 def select_hardnet_descriptors(template: dict[str, Any]) -> np.ndarray:
@@ -170,6 +209,109 @@ def pairwise_l2(query: np.ndarray, gallery: np.ndarray) -> np.ndarray:
     return np.sqrt(d2, dtype=np.float32)
 
 
+def pairwise_hamming(
+    query: np.ndarray,
+    gallery: np.ndarray,
+    hash_bits: int,
+) -> np.ndarray:
+    """使用 OpenCV SIMD 后端计算归一化 Hamming 全距离矩阵。"""
+
+    if query.ndim != 2 or gallery.ndim != 2:
+        raise ValueError(
+            f"pairwise_hamming expects [N,B] arrays, got {query.shape} and {gallery.shape}."
+        )
+    if query.shape[1] != gallery.shape[1]:
+        raise ValueError(
+            "pairwise_hamming packed width mismatch: "
+            f"query={query.shape[1]}, gallery={gallery.shape[1]}."
+        )
+    bits = int(hash_bits)
+    if bits <= 0 or bits % 8 != 0 or query.shape[1] != bits // 8:
+        raise ValueError(
+            "pairwise_hamming requires byte-aligned hash bits: "
+            f"hash_bits={bits}, width={query.shape[1]}."
+        )
+    if query.shape[0] == 0 or gallery.shape[0] == 0:
+        return np.zeros(
+            (int(query.shape[0]), int(gallery.shape[0])),
+            dtype=np.float32,
+        )
+
+    sorted_distances, sorted_indices = cv2.batchDistance(
+        np.ascontiguousarray(query, dtype=np.uint8),
+        np.ascontiguousarray(gallery, dtype=np.uint8),
+        cv2.CV_32S,
+        normType=cv2.NORM_HAMMING,
+        K=int(gallery.shape[0]),
+    )
+    distances = np.empty(sorted_distances.shape, dtype=np.float32)
+    np.put_along_axis(
+        distances,
+        np.asarray(sorted_indices, dtype=np.int32),
+        np.asarray(sorted_distances, dtype=np.float32) / float(bits),
+        axis=1,
+    )
+    return distances
+
+
+def hamming_knn(
+    query: np.ndarray,
+    gallery: np.ndarray,
+    hash_bits: int,
+    k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """使用 OpenCV SIMD 后端返回归一化距离和近邻下标矩阵。"""
+
+    if query.ndim != 2 or gallery.ndim != 2:
+        raise ValueError(
+            f"hamming_knn expects [N,B] arrays, got {query.shape} and {gallery.shape}."
+        )
+    if query.shape[1] != gallery.shape[1]:
+        raise ValueError(
+            "hamming_knn packed width mismatch: "
+            f"query={query.shape[1]}, gallery={gallery.shape[1]}."
+        )
+    bits = int(hash_bits)
+    if bits <= 0 or bits % 8 != 0 or query.shape[1] != bits // 8:
+        raise ValueError(
+            "hamming_knn requires byte-aligned hash bits: "
+            f"hash_bits={bits}, width={query.shape[1]}."
+        )
+    neighbors = min(max(int(k), 0), int(gallery.shape[0]))
+    if query.shape[0] == 0 or neighbors == 0:
+        shape = (int(query.shape[0]), 0)
+        return (
+            np.zeros(shape, dtype=np.float32),
+            np.zeros(shape, dtype=np.int32),
+        )
+
+    distances, indices = cv2.batchDistance(
+        np.ascontiguousarray(query, dtype=np.uint8),
+        np.ascontiguousarray(gallery, dtype=np.uint8),
+        cv2.CV_32S,
+        normType=cv2.NORM_HAMMING,
+        K=neighbors,
+    )
+    return (
+        np.asarray(distances, dtype=np.float32) / float(bits),
+        np.asarray(indices, dtype=np.int32),
+    )
+
+
+def pairwise_descriptor_distance(
+    query: np.ndarray,
+    gallery: np.ndarray,
+    contract: DescriptorContract,
+) -> np.ndarray:
+    """按描述子契约选择 L2 或归一化 Hamming 距离。"""
+
+    if contract.metric == L2_DISTANCE_METRIC:
+        return pairwise_l2(query, gallery)
+    if contract.metric == HAMMING_DISTANCE_METRIC:
+        return pairwise_hamming(query, gallery, contract.dimension)
+    raise ValueError(f"unsupported descriptor metric: {contract.metric}")
+
+
 def top_indices(values: np.ndarray, count: int) -> np.ndarray:
     """返回最小的 count 个下标。
 
@@ -187,14 +329,36 @@ def top_indices(values: np.ndarray, count: int) -> np.ndarray:
     return order.astype(np.int64)
 
 
-def build_l2_candidates(
+def metric_matching_config(
+    config: dict[str, Any],
+    metric: str,
+) -> dict[str, Any]:
+    """合并通用候选参数与指定距离度量的专用阈值。"""
+
+    configured = str(config.get("distance", "auto")).strip().lower()
+    if configured == "euclidean":
+        configured = L2_DISTANCE_METRIC
+    if configured not in {"", "auto", metric}:
+        raise ValueError(
+            "matching.distance does not match template/checkpoint metric: "
+            f"config={configured}, descriptor={metric}."
+        )
+    overrides = config.get(metric, {})
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict):
+        raise ValueError(f"matching.{metric} must be a mapping.")
+    return {**config, **overrides, "distance": metric}
+
+
+def build_descriptor_candidates(
     query: dict[str, Any],
     gallery: dict[str, Any],
     cfg: dict[str, Any],
     descriptor_source: str = "hardnet",
     diagnostics: dict[str, Any] | None = None,
 ) -> list[MatchCandidate]:
-    """生成 RANSAC 前的 HardNet L2 候选。
+    """生成 RANSAC 前的描述子候选，支持 L2 与归一化 Hamming。
 
     支持三种策略：
         - ratio_only：只要最近邻通过 Lowe ratio；
@@ -208,14 +372,16 @@ def build_l2_candidates(
     这里默认允许 many-to-one，因为指纹局部纹理重复，过早强制一对一会删掉真匹配。
     """
 
-    require_compatible_l2_templates(query, gallery, descriptor_source)
-    desc_q = select_l2_descriptors(query, descriptor_source)
-    desc_g = select_l2_descriptors(gallery, descriptor_source)
+    contract = require_compatible_templates(query, gallery, descriptor_source)
+    desc_q, query_contract = select_descriptors(query, descriptor_source)
+    desc_g, gallery_contract = select_descriptors(gallery, descriptor_source)
+    require_compatible_contracts(query_contract, gallery_contract)
     if desc_q.shape[1] != desc_g.shape[1]:
         raise ValueError(
-            "Query/gallery descriptor dimension mismatch: "
+            "Query/gallery descriptor storage width mismatch: "
             f"query={desc_q.shape[1]}, gallery={desc_g.shape[1]}."
         )
+    cfg = metric_matching_config(cfg, contract.metric)
     if diagnostics is not None:
         diagnostics.update(
             {
@@ -233,7 +399,6 @@ def build_l2_candidates(
 
     q_angles = keypoint_angles(query, desc_q.shape[0])
     g_angles = keypoint_angles(gallery, desc_g.shape[0])
-    distances = pairwise_l2(desc_q, desc_g)
     policy = str(cfg.get("candidate_policy", "topk_or_ratio")).lower()
     top_k = max(1, int(cfg.get("top_k", 5)))
     ratio_threshold = float(cfg.get("ratio_threshold", 0.95))
@@ -241,25 +406,68 @@ def build_l2_candidates(
     abs_threshold = float(cfg.get("abs_distance_threshold", 1.10))
     margin = float(cfg.get("distance_margin", 0.12))
     allow_many = bool(cfg.get("allow_many_to_one_before_ransac", True))
+    forward_k = min(max(top_k, 2), int(desc_g.shape[0]))
+
+    if contract.metric == HAMMING_DISTANCE_METRIC:
+        # Hamming 只查询候选生成真正需要的近邻，避免创建 Nq×Ng×bytes 的 XOR
+        # 中间数组，也避免 Python 按 query descriptor 循环执行 popcount。
+        forward_distances, forward_indices = hamming_knn(
+            desc_q,
+            desc_g,
+            contract.dimension,
+            forward_k,
+        )
+        distances = None
+    else:
+        distances = pairwise_descriptor_distance(desc_q, desc_g, contract)
+        forward_distances = None
+        forward_indices = None
 
     # 双向 Lowe 验证需要预先得到每个 gallery 描述子的 query 侧最近邻和次近邻。
     # 只在开关启用且当前策略包含 ratio 分支时计算；topk_only 不受此开关影响。
-    reverse_best_query = np.full((distances.shape[1],), -1, dtype=np.int64)
-    reverse_ratio_ok = np.zeros((distances.shape[1],), dtype=bool)
+    reverse_best_query = np.full((desc_g.shape[0],), -1, dtype=np.int64)
+    reverse_ratio_ok = np.zeros((desc_g.shape[0],), dtype=bool)
     if bidirectional_ratio and policy in {"ratio_only", "topk_or_ratio"}:
-        for gallery_idx in range(distances.shape[1]):
-            column = distances[:, gallery_idx]
-            reverse_order = top_indices(column, min(2, column.size))
-            if reverse_order.size == 0:
-                continue
-            reverse_best_idx = int(reverse_order[0])
-            reverse_best_dist = float(column[reverse_best_idx])
-            reverse_second_dist = float(column[int(reverse_order[1])]) if reverse_order.size > 1 else float("inf")
-            reverse_best_query[gallery_idx] = reverse_best_idx
-            reverse_ratio_ok[gallery_idx] = bool(
-                reverse_second_dist > 1e-12
-                and reverse_best_dist < ratio_threshold * reverse_second_dist
+        reverse_k = min(2, int(desc_q.shape[0]))
+        if contract.metric == HAMMING_DISTANCE_METRIC:
+            reverse_distances, reverse_indices = hamming_knn(
+                desc_g,
+                desc_q,
+                contract.dimension,
+                reverse_k,
             )
+            for gallery_idx in range(desc_g.shape[0]):
+                reverse_best_idx = int(reverse_indices[gallery_idx, 0])
+                reverse_best_dist = float(reverse_distances[gallery_idx, 0])
+                reverse_second_dist = (
+                    float(reverse_distances[gallery_idx, 1])
+                    if reverse_k > 1
+                    else float("inf")
+                )
+                reverse_best_query[gallery_idx] = reverse_best_idx
+                reverse_ratio_ok[gallery_idx] = bool(
+                    reverse_second_dist > 1e-12
+                    and reverse_best_dist
+                    < ratio_threshold * reverse_second_dist
+                )
+        else:
+            assert distances is not None
+            for gallery_idx in range(distances.shape[1]):
+                column = distances[:, gallery_idx]
+                reverse_order = top_indices(column, reverse_k)
+                reverse_best_idx = int(reverse_order[0])
+                reverse_best_dist = float(column[reverse_best_idx])
+                reverse_second_dist = (
+                    float(column[int(reverse_order[1])])
+                    if reverse_order.size > 1
+                    else float("inf")
+                )
+                reverse_best_query[gallery_idx] = reverse_best_idx
+                reverse_ratio_ok[gallery_idx] = bool(
+                    reverse_second_dist > 1e-12
+                    and reverse_best_dist
+                    < ratio_threshold * reverse_second_dist
+                )
 
     # candidates 保存所有进入后续几何验证的候选；
     # best_gallery 只在 allow_many=false 时使用，用于提前做 gallery 侧去重。
@@ -268,15 +476,30 @@ def build_l2_candidates(
     num_abs_distance_pass = 0
     num_one_way_ratio_pass = 0
     num_ratio_pass = 0
-    for query_idx in range(distances.shape[0]):
-        row = distances[query_idx]
-        need = min(max(top_k, 2), row.size)
-        order = top_indices(row, need)
-        if order.size == 0:
-            continue
-        best_idx = int(order[0])
-        best_dist = float(row[best_idx])
-        second_dist = float(row[int(order[1])]) if order.size > 1 else float("inf")
+    for query_idx in range(desc_q.shape[0]):
+        if contract.metric == HAMMING_DISTANCE_METRIC:
+            assert forward_distances is not None
+            assert forward_indices is not None
+            order = forward_indices[query_idx]
+            ordered_distances = forward_distances[query_idx]
+            best_idx = int(order[0])
+            best_dist = float(ordered_distances[0])
+            second_dist = (
+                float(ordered_distances[1])
+                if ordered_distances.size > 1
+                else float("inf")
+            )
+        else:
+            assert distances is not None
+            row = distances[query_idx]
+            order = top_indices(row, forward_k)
+            best_idx = int(order[0])
+            best_dist = float(row[best_idx])
+            second_dist = (
+                float(row[int(order[1])])
+                if order.size > 1
+                else float("inf")
+            )
         if best_dist <= abs_threshold:
             num_abs_distance_pass += 1
         one_way_ratio_ok = bool(
@@ -296,25 +519,49 @@ def build_l2_candidates(
         adaptive_limit = min(abs_threshold, best_dist + margin)
 
         # 自适应距离上限防止 top-k 把明显过远的候选也塞进 RANSAC。
-        keep: list[int] = []
+        keep: list[tuple[int, float]] = []
         if policy == "ratio_only":
             if ratio_ok and best_dist <= abs_threshold:
-                keep = [best_idx]
-        elif policy == "topk_only":
-            keep = [int(i) for i in order[:top_k] if float(row[int(i)]) <= adaptive_limit]
-        elif policy == "topk_or_ratio":
-            if ratio_ok and best_dist <= abs_threshold:
-                keep = [best_idx]
-            else:
-                keep = [int(i) for i in order[:top_k] if float(row[int(i)]) <= adaptive_limit]
+                keep = [(best_idx, best_dist)]
         else:
-            raise ValueError(f"unsupported candidate_policy: {policy}")
+            if contract.metric == HAMMING_DISTANCE_METRIC:
+                top_neighbors = [
+                    (int(gallery_idx), float(distance))
+                    for gallery_idx, distance in zip(
+                        order[:top_k],
+                        ordered_distances[:top_k],
+                    )
+                ]
+            else:
+                assert distances is not None
+                row = distances[query_idx]
+                top_neighbors = [
+                    (int(gallery_idx), float(row[int(gallery_idx)]))
+                    for gallery_idx in order[:top_k]
+                ]
+            if policy == "topk_only":
+                keep = [
+                    (gallery_idx, distance)
+                    for gallery_idx, distance in top_neighbors
+                    if distance <= adaptive_limit
+                ]
+            elif policy == "topk_or_ratio":
+                if ratio_ok and best_dist <= abs_threshold:
+                    keep = [(best_idx, best_dist)]
+                else:
+                    keep = [
+                        (gallery_idx, distance)
+                        for gallery_idx, distance in top_neighbors
+                        if distance <= adaptive_limit
+                    ]
+            else:
+                raise ValueError(f"unsupported candidate_policy: {policy}")
 
-        for gallery_idx in keep:
+        for gallery_idx, distance in keep:
             candidate = MatchCandidate(
                 query_idx=int(query_idx),
                 gallery_idx=int(gallery_idx),
-                distance=float(row[gallery_idx]),
+                distance=float(distance),
                 angle_delta=wrap_angle_deg(float(g_angles[gallery_idx]) - float(q_angles[query_idx])),
             )
             if allow_many:
@@ -367,7 +614,7 @@ def soft_gate_candidates(candidates: list[MatchCandidate], cfg: dict[str, Any]) 
     """候选过多时做轻量截断。
 
     如果候选数未超过 max_candidates_for_ransac，原样返回。
-    如果超过，则按“归一化 L2 距离 + 少量方向惩罚”排序，只保留前 N 个。
+    如果超过，则按“归一化描述子距离 + 少量方向惩罚”排序，只保留前 N 个。
     方向惩罚权重很小，目的是让 RANSAC 少看一点明显方向离群的候选，
     而不是复刻 SIFT 方向峰硬过滤。
     """
@@ -753,7 +1000,9 @@ def empty_result(query: dict[str, Any], gallery: dict[str, Any]) -> dict[str, An
         "unique_query_inliers": 0,
         "unique_gallery_inliers": 0,
         "inlier_ratio": 0.0,
+        "mean_descriptor_distance": 0.0,
         "mean_l2_distance": 0.0,
+        "mean_hamming_distance": 0.0,
         "mean_reproj_error": 0.0,
         "orientation_consistency": 0.0,
         "dominant_angle_delta": 0.0,
@@ -774,12 +1023,12 @@ def empty_result(query: dict[str, Any], gallery: dict[str, Any]) -> dict[str, An
     }
 
 
-def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any], config: dict[str, Any], descriptor_source: str = "hardnet", include_debug: bool = False) -> dict[str, Any]:
-    """使用指定 descriptor 匹配一对图像模板并返回图像级分数。
+def match_templates_descriptor(query: dict[str, Any], gallery: dict[str, Any], config: dict[str, Any], descriptor_source: str = "hardnet", include_debug: bool = False) -> dict[str, Any]:
+    """使用模板声明的 L2 或 Hamming 距离匹配一对图像模板。
 
     主流程：
-        1. 读取并归一化 descriptor；
-        2. 生成 L2/top-k/ratio 候选；
+        1. 按描述子契约读取浮点或打包二值 descriptor；
+        2. 生成 top-k/ratio 候选；
         3. 候选过多时做方向软门控；
         4. 用 cv2.estimateAffinePartial2D 做 RANSAC；
         5. 对 RANSAC inliers 做 one-to-one 去重；
@@ -815,33 +1064,34 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
         return result
 
     stage_started = time.perf_counter()
-    require_compatible_l2_templates(query, gallery, source)
-    desc_q = select_l2_descriptors(query, source)
-    desc_g = select_l2_descriptors(gallery, source)
+    contract = require_compatible_templates(query, gallery, source)
+    desc_q, _query_contract = select_descriptors(query, source)
+    desc_g, _gallery_contract = select_descriptors(gallery, source)
     if desc_q.shape[1] != desc_g.shape[1]:
         raise ValueError(
-            "Query/gallery descriptor dimension mismatch: "
+            "Query/gallery descriptor storage width mismatch: "
             f"query={desc_q.shape[1]}, gallery={desc_g.shape[1]}."
         )
+    cfg = metric_matching_config(cfg, contract.metric)
     timings["descriptor_prepare_ms"] = (
         time.perf_counter() - stage_started
     ) * 1000.0
     base["num_keypoints_q"] = int(desc_q.shape[0])
     base["num_keypoints_g"] = int(desc_g.shape[0])
     base["descriptor_source"] = source
-    base["descriptor_kind"] = "float"
-    base["descriptor_metric"] = "l2"
-    base["descriptor_dim"] = int(desc_q.shape[1])
+    base["descriptor_kind"] = contract.kind
+    base["descriptor_metric"] = contract.metric
+    base["descriptor_dim"] = contract.dimension
     if desc_q.shape[0] < 2 or desc_g.shape[0] < 2:
         return finish(base)
 
     query_xy = np.asarray(query["keypoints_xy"], dtype=np.float32)
     gallery_xy = np.asarray(gallery["keypoints_xy"], dtype=np.float32)
 
-    # 阶段 1：L2 候选生成。
+    # 阶段 1：按契约生成 L2 或 Hamming 候选。
     stage_started = time.perf_counter()
     candidate_diagnostics: dict[str, Any] = {}
-    candidates = build_l2_candidates(
+    candidates = build_descriptor_candidates(
         query,
         gallery,
         cfg,
@@ -929,7 +1179,7 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
 
     unique_count = int(len(kept))
     distances = np.asarray([item.distance for item in kept], dtype=np.float32)
-    mean_l2 = float(np.mean(distances)) if distances.size else 0.0
+    mean_distance = float(np.mean(distances)) if distances.size else 0.0
     mean_reproj = float(np.mean(final_errors)) if final_errors.size else 0.0
     inlier_ratio = float(unique_count / max(len(candidates_for_ransac), 1))
     orient = orientation_consistency(
@@ -959,10 +1209,15 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
         score_elapsed_ms - timings["texture_similarity_ms"],
     )
     stage_started = time.perf_counter()
+    distance_cap = 1.0 if contract.metric == HAMMING_DISTANCE_METRIC else 2.0
+    distance_similarity = min(
+        max(1.0 - mean_distance / distance_cap, 0.0),
+        1.0,
+    )
     quality_score = (
         0.55 * min(unique_count / 40.0, 1.0)
         + 0.20 * min(inlier_ratio, 1.0)
-        + 0.15 * min(max(1.0 - mean_l2 / 1.4, 0.0), 1.0)
+        + 0.15 * distance_similarity
         + 0.10 * min(max(1.0 - mean_reproj / 5.0, 0.0), 1.0)
     )
     raw_src, raw_dst = points_from_candidates(raw_inliers, query_xy, gallery_xy)
@@ -989,11 +1244,21 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
         "unique_query_inliers": int(len({item.query_idx for item in kept})),
         "unique_gallery_inliers": int(len({item.gallery_idx for item in kept})),
         "inlier_ratio": inlier_ratio,
-        "mean_l2_distance": mean_l2,
+        "mean_descriptor_distance": mean_distance,
+        "mean_l2_distance": (
+            mean_distance if contract.metric == L2_DISTANCE_METRIC else 0.0
+        ),
+        "mean_hamming_distance": (
+            mean_distance if contract.metric == HAMMING_DISTANCE_METRIC else 0.0
+        ),
         "mean_reproj_error": mean_reproj,
         "orientation_consistency": orient,
         "dominant_angle_delta": float(dominant),
-        "mean_similarity": float(np.mean(1.0 - distances / 2.0)) if distances.size else 0.0,
+        "mean_similarity": (
+            float(np.mean(1.0 - distances / distance_cap))
+            if distances.size
+            else 0.0
+        ),
         "affine_matrix": np.asarray(matrix, dtype=float).tolist(),
         "affine_scale": float(affine_scale),
         "scale_rejected": False,
@@ -1002,7 +1267,37 @@ def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any]
     }, debug_matches)
 
 
-def match_templates_hardnet_l2(query: dict[str, Any], gallery: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """兼容旧入口：使用 HardNet descriptor 的 L2 匹配。"""
+def match_templates_descriptor_l2(query: dict[str, Any], gallery: dict[str, Any], config: dict[str, Any], descriptor_source: str = "hardnet", include_debug: bool = False) -> dict[str, Any]:
+    """兼容旧调用名；实际距离由模板契约选择。"""
 
-    return match_templates_descriptor_l2(query, gallery, config, descriptor_source="hardnet")
+    return match_templates_descriptor(
+        query,
+        gallery,
+        config,
+        descriptor_source=descriptor_source,
+        include_debug=include_debug,
+    )
+
+
+def build_l2_candidates(
+    query: dict[str, Any],
+    gallery: dict[str, Any],
+    cfg: dict[str, Any],
+    descriptor_source: str = "hardnet",
+    diagnostics: dict[str, Any] | None = None,
+) -> list[MatchCandidate]:
+    """兼容旧调用名；实际距离由模板契约选择。"""
+
+    return build_descriptor_candidates(
+        query,
+        gallery,
+        cfg,
+        descriptor_source=descriptor_source,
+        diagnostics=diagnostics,
+    )
+
+
+def match_templates_hardnet_l2(query: dict[str, Any], gallery: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """兼容旧入口；实际距离由 HardNet 模板契约选择。"""
+
+    return match_templates_descriptor(query, gallery, config, descriptor_source="hardnet")

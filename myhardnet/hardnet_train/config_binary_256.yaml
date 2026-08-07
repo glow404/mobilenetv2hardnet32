@@ -12,15 +12,14 @@
 #   5. 使用 device=cuda 时，当前 PyTorch 必须支持 CUDA。
 #
 # 二值训练不会修改浮点 teacher checkpoint。它在 teacher 后增加 residual hash head，
-# 输出 0/1 bit code，使用归一化 Hamming 距离。当前 match_new 只实现浮点 L2
-# 描述子，不能直接加载这里生成的二值 checkpoint。
+# 输出 0/1 bit code，使用归一化 Hamming 距离；match_new 可直接加载对应 checkpoint。
 
 # 控制数据采样、hash head 初始化和固定验证计划的随机性。
 seed: 42
 
 # 二值实验必须与浮点实验分开保存。
 # 相对路径统一相对于本配置文件所在目录 hardnet_train 解析。
-output_dir: ../outputs/models/hardnet_binary_256float_512bit
+output_dir: ../outputs/models/hardnet_binary_256float_512bit_fixed_candidate_pool_v3
 
 data:
   # 二值 student 与浮点 teacher 必须使用相同的 patch/正样本数据契约。
@@ -30,6 +29,21 @@ data:
 
   # true：把灰度 patch 映射到训练网络使用的标准化输入范围。
   normalize: true
+
+  # 与浮点训练使用相同的轻微在线增强。仅训练集启用，验证集不增强；
+  # anchor/positive 独立采样扰动，增强二值码对定位和成像误差的鲁棒性。
+  train_augmentation:
+    enabled: true
+    probability: 0.80
+    max_rotation_degrees: 5.0
+    max_translation_pixels: 1.0
+    scale_jitter: 0.03
+    contrast_jitter: 0.10
+    gamma_jitter: 0.10
+    blur_probability: 0.15
+    max_blur_radius: 0.40
+    noise_probability: 0.25
+    max_noise_std: 2.0
 
   # Windows DataLoader worker 数。若出现 worker 启动、卡死或文件句柄错误，先设为 0。
   num_workers: 4
@@ -55,7 +69,8 @@ data:
 backbone:
   # 必填：已经训练完成的浮点/L2 teacher。
   # 程序会拒绝 binary/Hamming checkpoint，并校验架构和描述子维度。
-  checkpoint: ../outputs/models/hardnet_train_strong_256float/best.pt
+  # 必须使用本次轻量 Strong V2 重新训练得到的 checkpoint；旧 Strong V2 权重不兼容。
+  checkpoint: ../outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3/best.pt
 
   # auto：直接采用 checkpoint 中记录的真实网络架构，避免手工配置不一致。
   architecture: auto
@@ -148,6 +163,21 @@ training:
   # 每个 anchor 从双向合法候选中选择的最难负样本数；候选不足时按实际数量使用。
   hard_negative_top_k: 3
 
+  # 最近的 top-1 难负样本占 60% 权重，其余有效 top-k 候选均分剩余权重。
+  # 显式配置，避免二值训练静默使用 HardNetLoss 的代码默认值。
+  hard_negative_top1_weight: 0.60
+
+  # 二值模型已有 positive_consistency_loss，因此正样本尾部项从浮点训练的 0.10
+  # 降为 0.05，避免两项正样本约束叠加过强。
+  positive_tail_loss_weight: 0.05
+  positive_tail_p95_weight: 0.70
+  positive_tail_p99_weight: 0.30
+
+  # 目标作用于单位化 {-1,+1} code 的 L2 距离。由 d=2*sqrt(hamming_ratio)，
+  # 0.60/0.80 分别约等于 9%/16% 的正样本 bit 差异比例。
+  positive_tail_p95_target: 0.60
+  positive_tail_p99_target: 0.80
+
   # 二值 metric loss 的 triplet margin。这里作用于归一化 {-1,+1} code 的 L2 距离，
   # 不是 validation.margin 使用的归一化 Hamming 距离。
   margin: 0.50
@@ -174,9 +204,8 @@ training:
   log_interval: 50
 
 validation:
-  # 固定 in-batch 协议：batch 构造、point_group/空间 mask、双向 top-k
-  # 与训练使用同一负样本候选规则；每个 epoch 复用同一固定计划。
-  protocol: fixed_in_batch_v1
+  # 固定候选池协议：完整合法候选计算 ROC/FPR，动态 top-k 仅计算排序与 loss。
+  protocol: fixed_candidate_pool_v3
 
   # 固定验证计划随机种子。修改后验证样本计划会变化，不能直接横向比较旧实验。
   seed: 10042
@@ -190,29 +219,25 @@ validation:
   batch_count: 256
 
   # 单个验证 batch 的正样本对数量。至少为 2；影响单批 GPU 峰值。
-  batch_size: 24
+  batch_size: 32
 
   # 验证 loss 使用归一化 Hamming 距离 [0, 1]，因此独立于 training.margin。
   margin: 0.10
 
 checkpoint_selection:
-  # 匹配导向的综合 checkpoint 选择策略；分数越高越好。
-  # same-finger/cross-finger 分项存在时优先使用两者中的最差表现，
-  # 防止某一类负样本退化被总体平均值掩盖。
+  # 四项总体验证指标的综合 checkpoint 选择策略；分数越高越好。
   strategy: matching_composite_v1
 
   # 权重会自动归一化，总和不强制等于 1；所有值必须非负且总和 > 0。
   weights:
-    # 1 - FPR@TPR95，控制误接受，是主权重。
-    false_acceptance: 0.45
-    # TPR@FPR=1e-4，关注严格低误报区间的召回。
-    low_fpr_recall: 0.20
-    # 正样本能否排在所选 hard negative 前面，对应 Recall@1。
-    hard_negative_recall: 0.15
-    # neg_mean - pos_mean，经 Hamming 距离范围 [0,1] 归一化。
-    mean_gap: 0.10
-    # neg_p01 - pos_p95，关注困难正负样本尾部是否仍有间隔。
-    tail_gap: 0.10
+    # 动态 hard top-k Hamming margin loss，越低越好。
+    loss: 0.30
+    # 完整合法候选池的 val_neg_mean - val_pos_mean，越高越好。
+    distance_gap: 0.20
+    # 完整合法候选池的 FPR@TPR95，越低越好。
+    fpr_at_tpr95: 0.35
+    # 正样本 Hamming 距离 p95，越低越好。
+    pos_p95: 0.15
 
 optimizer:
   # AdamW 只更新 requires_grad=true 的参数；默认即 residual hash head。

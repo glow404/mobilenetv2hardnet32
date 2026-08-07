@@ -20,15 +20,22 @@ import cv2
 import numpy as np
 import torch
 
+from hardnet_train.binary_model import (
+    BINARY_DESCRIPTOR_KIND,
+    BINARY_STORAGE,
+    HAMMING_DISTANCE_METRIC,
+    build_binary_descriptor_model,
+)
 from hardnet_train.model import (
     build_descriptor_model,
     checkpoint_descriptor_dim,
     checkpoint_model_architecture,
     checkpoint_model_config,
-    model_descriptor_dim,
     normalize_model_architecture,
 )
 from match_new.descriptor_contract import (
+    DEFAULT_BINARY_BITORDER,
+    FLOAT32_STORAGE,
     FLOAT_DESCRIPTOR_KIND,
     L2_DISTANCE_METRIC,
 )
@@ -349,28 +356,23 @@ class HardNetDescriptor:
         descriptor_metric = str(
             checkpoint.get("descriptor_metric", L2_DISTANCE_METRIC)
         ).strip().lower()
-        if (
-            descriptor_kind != FLOAT_DESCRIPTOR_KIND
-            or descriptor_metric != L2_DISTANCE_METRIC
-        ):
+        supported = {
+            (FLOAT_DESCRIPTOR_KIND, L2_DISTANCE_METRIC),
+            (BINARY_DESCRIPTOR_KIND, HAMMING_DISTANCE_METRIC),
+        }
+        if (descriptor_kind, descriptor_metric) not in supported:
             raise ValueError(
-                "HardNetDescriptor only loads continuous float/L2 checkpoints: "
+                "Unsupported descriptor checkpoint contract: "
                 f"kind={descriptor_kind}, metric={descriptor_metric}, path={checkpoint_path}."
             )
-
-        saved_architecture = checkpoint_model_architecture(checkpoint)
-        requested_architecture = str(
-            get_nested(config, "model", "architecture", default="auto")
+        requested_kind = str(
+            get_nested(config, "model", "descriptor_kind", default="auto")
         ).strip().lower()
-        if requested_architecture in {"", "auto"}:
-            architecture = saved_architecture
-        else:
-            architecture = normalize_model_architecture(requested_architecture)
-            if architecture != saved_architecture:
-                raise ValueError(
-                    "Configured model architecture does not match checkpoint: "
-                    f"config={architecture}, checkpoint={saved_architecture}."
-                )
+        if requested_kind not in {"", "auto", descriptor_kind}:
+            raise ValueError(
+                "Configured descriptor kind does not match checkpoint: "
+                f"config={requested_kind}, checkpoint={descriptor_kind}."
+            )
 
         saved_descriptor_dim = checkpoint_descriptor_dim(checkpoint)
         requested_descriptor_dim = get_nested(
@@ -390,19 +392,141 @@ class HardNetDescriptor:
                     f"config={configured_descriptor_dim}, checkpoint={saved_descriptor_dim}."
                 )
 
-        saved_model_config = checkpoint_model_config(checkpoint)
-        runtime_model_config = config.get("model")
-        if isinstance(runtime_model_config, Mapping):
-            for key in ("dropout", "final_bn_affine"):
-                if key in runtime_model_config:
-                    saved_model_config[key] = runtime_model_config[key]
-        saved_model_config["architecture"] = architecture
-        saved_model_config["descriptor_dim"] = saved_descriptor_dim
-        self.model = build_descriptor_model(saved_model_config)
-        self.descriptor_dim = model_descriptor_dim(self.model)
-
         state = checkpoint["model"] if "model" in checkpoint else checkpoint
-        self.model.load_state_dict(state)
+        requested_architecture = str(
+            get_nested(config, "model", "architecture", default="auto")
+        ).strip().lower()
+        if descriptor_kind == FLOAT_DESCRIPTOR_KIND:
+            saved_architecture = checkpoint_model_architecture(checkpoint)
+            if requested_architecture in {"", "auto"}:
+                architecture = saved_architecture
+            else:
+                architecture = normalize_model_architecture(requested_architecture)
+                if architecture != saved_architecture:
+                    raise ValueError(
+                        "Configured model architecture does not match checkpoint: "
+                        f"config={architecture}, checkpoint={saved_architecture}."
+                    )
+
+            saved_model_config = checkpoint_model_config(checkpoint)
+            runtime_model_config = config.get("model")
+            if isinstance(runtime_model_config, Mapping):
+                for key in ("dropout", "final_bn_affine"):
+                    if key in runtime_model_config:
+                        saved_model_config[key] = runtime_model_config[key]
+            saved_model_config["architecture"] = architecture
+            saved_model_config["descriptor_dim"] = saved_descriptor_dim
+            self.model = build_descriptor_model(saved_model_config)
+            self.model.load_state_dict(state)
+            self.descriptor_storage = FLOAT32_STORAGE
+            self.descriptor_bitorder = ""
+        else:
+            binary_architecture = str(
+                checkpoint.get("model_architecture", "residual_binary_hash_v1")
+            ).strip().lower()
+            if requested_architecture not in {"", "auto", binary_architecture}:
+                raise ValueError(
+                    "Configured model architecture does not match binary checkpoint: "
+                    f"config={requested_architecture}, checkpoint={binary_architecture}."
+                )
+            saved_config = checkpoint.get("resolved_config", checkpoint.get("config", {}))
+            saved_config = saved_config if isinstance(saved_config, Mapping) else {}
+            saved_backbone = saved_config.get("backbone", {})
+            saved_backbone = saved_backbone if isinstance(saved_backbone, Mapping) else {}
+            backbone_architecture = str(
+                checkpoint.get(
+                    "backbone_architecture",
+                    saved_backbone.get("architecture", "hardnet"),
+                )
+            )
+            float_descriptor_dim = int(
+                checkpoint.get(
+                    "float_descriptor_dim",
+                    saved_backbone.get("descriptor_dim", 128),
+                )
+            )
+            hidden_dim = int(
+                checkpoint.get("hash_head_hidden_dim", saved_descriptor_dim * 2)
+            )
+            binary_config = {
+                "hash_bits": saved_descriptor_dim,
+                "hidden_multiplier": hidden_dim / saved_descriptor_dim,
+                "dropout": float(checkpoint.get("hash_head_dropout", 0.1)),
+                "temperature_start": float(
+                    checkpoint.get("quantization_temperature", 1.0)
+                ),
+                "backbone_trainable": bool(
+                    checkpoint.get("backbone_trainable", False)
+                ),
+                "bitorder": str(
+                    checkpoint.get("binary_bitorder", DEFAULT_BINARY_BITORDER)
+                ),
+            }
+            backbone_config = {
+                "architecture": backbone_architecture,
+                "descriptor_dim": float_descriptor_dim,
+                "dropout": float(saved_backbone.get("dropout", 0.1)),
+            }
+            load_error: RuntimeError | None = None
+            self.model = None
+            for final_bn_affine in (False, True):
+                backbone_config["final_bn_affine"] = final_bn_affine
+                candidate = build_binary_descriptor_model(
+                    build_descriptor_model(backbone_config),
+                    binary_config,
+                )
+                try:
+                    candidate.load_state_dict(state)
+                except RuntimeError as exc:
+                    load_error = exc
+                    continue
+                self.model = candidate
+                break
+            if self.model is None:
+                raise ValueError(
+                    f"Binary checkpoint model structure is incompatible: {checkpoint_path}"
+                ) from load_error
+            self.descriptor_storage = str(
+                checkpoint.get("binary_storage", BINARY_STORAGE)
+            ).strip().lower()
+            self.descriptor_bitorder = str(
+                checkpoint.get("binary_bitorder", DEFAULT_BINARY_BITORDER)
+            ).strip().lower()
+            requested_storage = str(
+                get_nested(
+                    config,
+                    "model",
+                    "binary_storage",
+                    default=self.descriptor_storage,
+                )
+            ).strip().lower()
+            requested_bitorder = str(
+                get_nested(
+                    config,
+                    "model",
+                    "binary_bitorder",
+                    default="auto",
+                )
+            ).strip().lower()
+            if requested_storage not in {"", "auto", self.descriptor_storage}:
+                raise ValueError(
+                    "Configured binary storage does not match checkpoint: "
+                    f"config={requested_storage}, checkpoint={self.descriptor_storage}."
+                )
+            if requested_bitorder not in {"", "auto", self.descriptor_bitorder}:
+                raise ValueError(
+                    "Configured binary bitorder does not match checkpoint: "
+                    f"config={requested_bitorder}, checkpoint={self.descriptor_bitorder}."
+                )
+
+        self.descriptor_kind = descriptor_kind
+        self.descriptor_metric = descriptor_metric
+        self.descriptor_dim = saved_descriptor_dim
+        self.descriptor_columns = (
+            (self.descriptor_dim + 7) // 8
+            if self.descriptor_kind == BINARY_DESCRIPTOR_KIND
+            else self.descriptor_dim
+        )
         try:
             self.model.to(self.device)
             if self.channels_last:
@@ -543,7 +667,12 @@ class HardNetDescriptor:
         """在当前设备上执行描述子推理，并隐藏固定 batch 的 padding。"""
 
         if len(patches) == 0:
-            return np.zeros((0, self.descriptor_dim), dtype=np.float32)
+            dtype = (
+                np.uint8
+                if self.descriptor_kind == BINARY_DESCRIPTOR_KIND
+                else np.float32
+            )
+            return np.zeros((0, self.descriptor_columns), dtype=dtype)
         patch_array = np.ascontiguousarray(
             patches,
             dtype=np.float32,
@@ -587,14 +716,27 @@ class HardNetDescriptor:
                 dtype=self.amp_dtype,
                 enabled=self.amp_enabled,
             ):
-                batch_output = self.model(batch)
+                if self.descriptor_kind == BINARY_DESCRIPTOR_KIND:
+                    batch_output = self.model.encode_binary(batch, packed=True)
+                else:
+                    batch_output = self.model(batch)
             outputs.append(batch_output[:valid_count])
         if not outputs:
-            return np.zeros((0, self.descriptor_dim), dtype=np.float32)
-        descriptors = torch.cat(outputs, dim=0).float().cpu().numpy()
-        if descriptors.ndim != 2 or descriptors.shape[1] != self.descriptor_dim:
+            dtype = (
+                np.uint8
+                if self.descriptor_kind == BINARY_DESCRIPTOR_KIND
+                else np.float32
+            )
+            return np.zeros((0, self.descriptor_columns), dtype=dtype)
+        output = torch.cat(outputs, dim=0).cpu()
+        descriptors = (
+            output.to(dtype=torch.uint8).numpy()
+            if self.descriptor_kind == BINARY_DESCRIPTOR_KIND
+            else output.float().numpy()
+        )
+        if descriptors.ndim != 2 or descriptors.shape[1] != self.descriptor_columns:
             raise ValueError(
                 "Descriptor model output shape mismatch: "
-                f"expected [N,{self.descriptor_dim}], got {descriptors.shape}."
+                f"expected [N,{self.descriptor_columns}], got {descriptors.shape}."
             )
         return descriptors

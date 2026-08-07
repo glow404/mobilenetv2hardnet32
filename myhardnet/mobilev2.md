@@ -934,7 +934,7 @@ python -m hardnet_train.train --config hardnet_train/config.yaml
   → 反向传播与 optimizer step
   → 固定验证协议
   → 保存 last.pt
-  → 若 FPR@TPR95 更低则保存 best.pt
+  → 按四项 val_checkpoint_selection_score 保存 best.pt
   → 追加 metrics.csv
 ```
 
@@ -946,7 +946,7 @@ outputs/models/hardnet_train_strong_v2_256
 
 主要产物：
 
-- `best.pt`：固定验证协议下 `FPR@TPR95` 最低的 checkpoint。
+- `best.pt`：固定验证协议下 `val_checkpoint_selection_score` 最高的 checkpoint。
 - `last.pt`：最后完成 epoch 的 checkpoint。
 - `metrics.csv`：每个 epoch 的训练和验证指标。
 - `resolved_config.json`：命令行覆盖后的实际配置。
@@ -1074,15 +1074,18 @@ d_H(x,y)=\frac{1}{B}\sum_{i=1}^{B}[x_i\ne y_i]
 
 主要验证指标：
 
-- `FPR@TPR95`：主选模指标，越低越好。
+- `val_loss`：动态 hard top-k Hamming margin loss，越低越好。
+- `val_neg_mean - val_pos_mean`：完整合法候选池的平均距离间隔，越高越好。
+- `FPR@TPR95`：完整合法候选池误接受指标，越低越好。
+- `val_pos_p95`：正样本 Hamming 距离 p95，越低越好。
 - `EER`：等错误率，越低越好。
 - `ROC AUC`：越高越好。
-- 正样本、同手指负样本、跨手指负样本距离分布。
+- 正负样本距离分布。
 - 二值专用 `bit_one_fraction`。
 - 二值专用 `bit_balance_error`。
 - 二值专用 `constant_bit_ratio`。
 
-`best.pt` 统一按最低 `FPR@TPR95` 选择。
+`best.pt` 统一按上述四项组成的 `val_checkpoint_selection_score` 选择。
 
 ---
 

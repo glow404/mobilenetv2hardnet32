@@ -1,17 +1,17 @@
 # match_new 正式实验配置
 #
-# 这个配置对应一套“更适配 HardNet 连续描述子”的手机解锁式指纹验证实验：
+# 这个配置对应一套支持 HardNet 浮点或二值描述子的手机解锁式指纹验证实验：
 #   1. 每个 identity 随机选 20 张图作为注册模板；
 #   2. 其余图作为 query；
 #   3. query 分别对本人模板库和所有非本人模板库打 identity 级分数；
-#   4. 使用 HardNet L2/top-k/RANSAC/脊线纹理融合 match score 输出 FAR、FRR、EER 和推荐阈值；
+#   4. 使用 checkpoint 对应的 L2/Hamming 距离生成候选，再通过 RANSAC/脊线纹理融合输出 match score；
 #   5. 在目标阈值下导出 false reject / false accept 原图，方便人工排查失败原因。
 
 # ---------------------------------------------------------------------------
 output:
   # 实验结果根目录。相对路径相对本配置文件所在目录解析。
   # A0 与后续 Strong-256 使用不同目录，禁止复用模板和阈值产物。
-  output_dir: ../outputs/newdata-8-lr10+nomobilelearn+模板数20
+  output_dir: ..\outputs\检查是否有异常手指\hardnet_lr10_best.pt-模板数40-数据集normal_pic
 
 runtime:
   skip_template_build: false
@@ -28,7 +28,7 @@ runtime:
 
 data:
   # 原始指纹图像根目录。匹配任务会直接扫描原图
-  image_root: ../datasets/new_data
+  image_root: ../datasets/normal_pic
 
   # 相对 image_root 的前几级目录共同组成一个手指的 identity_id。
   # 当前目录形如 dy_L0/pair_1.bmp，因此使用前 1 级。
@@ -40,12 +40,20 @@ data:
   validate_readable: true
 
 model:
-  # 模型架构和描述子维度默认从 checkpoint 元数据读取；旧 checkpoint 自动识别为 HardNet-128。
+  # auto：由 checkpoint 自动选择 float/L2 或 binary/Hamming。
+  descriptor_kind: auto
+
+  # 模型架构和描述子维度默认从 checkpoint 元数据读取；
   architecture: auto
   descriptor_dim: auto
 
+  # 二值 checkpoint 的模板存储契约。packed_uint8 表示每 8 bit 存为 1 byte；
+  # storage/bitorder 均可设为 auto 跟随 checkpoint。显式值不一致时会立即报错。
+  binary_storage: auto
+  binary_bitorder: auto
+
   # checkpoint 相对路径按本配置文件所在目录解析。
-  checkpoint: ..\outputs\models\hardnet_train_post_nips_lr10\best.pt
+  checkpoint: ..\outputs\models\hardnet_lr10\best.pt
 
   # 显式值会覆盖 checkpoint 中对应的模型参数，必须与训练结构兼容。
   # A0 保持旧 checkpoint 的训练配置；Strong-256 使用独立配置/命令行覆盖。
@@ -63,7 +71,7 @@ model:
   # 0 表示保留动态 batch；当前最多 500 个关键点，因此固定为 512。
   fixed_inference_batch_size: 512
 
-  # GPU 推理优化。FP16 仅用于 CNN 前向，返回的描述子仍转换为 FP32。
+  # GPU 推理优化。FP16 仅用于 CNN 前向；浮点描述子返回 FP32，二值描述子返回打包 uint8。
   inference_precision: fp16
   channels_last: true
   pin_memory: false
@@ -101,11 +109,12 @@ keypoint_filter:
   max_keypoints: 500
 
 matching:
-  # 主实验只使用 HardNet 连续 descriptor。
+  # 主实验使用 checkpoint 产出的 HardNet 浮点或二值 descriptor。
   descriptor_source: hardnet
 
-  # 使用 L2 距离。HardNet 输出已 L2 normalize 时，L2 排序和 cosine 排序等价。
-  distance: l2
+  # auto：浮点 checkpoint 使用 L2，二值 checkpoint 使用归一化 Hamming。
+  # 也可显式写 l2/hamming 作为 checkpoint 契约校验。
+  distance: auto
 
   # 候选生成策略：
   #   ratio_only     : 只保留通过 Lowe ratio 的最近邻；
@@ -116,7 +125,7 @@ matching:
   # 每个 query keypoint 最多向 gallery 取几个近邻候选。
   top_k: 1
 
-  # HardNet L2 的 Lowe ratio 阈值。比 SIFT/Hamming 方案更宽松。
+  # HardNet 描述子的候选匹配。下方为 L2 默认值，Hamming 可由 matching.hamming 覆盖。
   ratio_threshold: 0.85
 
   # 是否启用双向 Lowe 比值验证。
@@ -129,6 +138,17 @@ matching:
   # 自适应距离上限：nearest_distance + distance_margin。topk只才有用。
   # 实际上限取 min(abs_distance_threshold, nearest + margin)。
   distance_margin: 0.15
+
+  # 二值描述子使用 XOR + popcount / hash_bits 的归一化 Hamming 距离，范围 [0,1]。
+  # 下列字段只覆盖 Hamming 路径；未列出的候选/RANSAC参数继续使用 matching 顶层值。
+  # 首次正式实验后应根据验证集重新标定这三个阈值。
+  hamming:
+    ratio_threshold: 0.90
+    abs_distance_threshold: 0.40
+    distance_margin: 0.05
+
+  # 可选的 L2 专用覆盖项。当前为空时沿用 matching 顶层的浮点实验阈值。
+  l2: {}
 
   # RANSAC 前允许一对多候选，避免局部纹理重复时过早删掉真匹配；
   # RANSAC 后再做 one-to-one 去重。  开启双向验证时，这个参数不起作用。
@@ -144,7 +164,7 @@ matching:
   orientation_consistency_thresh_deg: 20.0
 
   # one-to-one 去重时的排序分数：
-  #   hardnet_l2_distance + reproj_error_weight * reprojection_error
+  #   descriptor_distance + reproj_error_weight * reprojection_error
   reproj_error_weight: 0.05
 
   # RANSAC 几何验证参数。使用 estimateAffinePartial2D，适合局部旋转/缩放/平移。
@@ -183,7 +203,7 @@ texture_verification:
 
 enrollment:
   # 每个手指随机选多少张图作为模板库。
-  enrollment_images_per_identity: 20
+  enrollment_images_per_identity: 40
   selection_strategy: random
 
   # 注册/query 划分随机种子。固定后多次实验可复现。

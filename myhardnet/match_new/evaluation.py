@@ -1,14 +1,14 @@
-"""HardNet L2 身份验证评估与失败样本导出。
+"""HardNet 身份验证评估与失败样本导出。
 
 作用：
-    这个脚本负责把“图像级匹配器”扩展成“手机解锁式 identity 级验证实验”：
+    这个脚本负责把“图像级匹配器”扩展成“手机解锁式 identity 级验证实验”。
+    HardNet 模板可使用 float/L2 或 binary/Hamming 描述子，后续评估流程保持一致。
 
-    1. 每个 query 对本人 identity 的 20 张注册模板打分，得到 genuine attempt；
-    2. 同一个 query 对所有非本人 identity 的 20 张注册模板打分，得到 impostor attempts；
-    3. identity 级分数默认取 20 张模板中的最大图像级 score；
+    1. 每个 query 对本人 identity 的注册模板打分，得到 genuine attempt；
+    2. 同一个 query 对非本人 identity 的注册模板打分，得到 impostor attempts；
+    3. identity 级分数默认取注册模板中的最大图像级 score；
     4. 根据 identity 级 score 计算 FAR、FRR、EER、AUC、TAR@FAR；
-    5. 按目标约束 FAR < 1/50000、FRR < 2% 选择 target_operating_point； todo：这个可以去掉了
-    6. 在该阈值下导出 false reject / false accept 原图和拼接预览图。
+    5. 在该阈值下导出 false reject / false accept 原图和拼接预览图。
 
 注意：
     这里所有 FAR/FRR 都是 identity 级 attempt 统计，不是单图对单图统计。
@@ -89,7 +89,9 @@ SCORE_FIELDNAMES = [
     "unique_query_inliers",
     "unique_gallery_inliers",
     "inlier_ratio",
+    "mean_descriptor_distance",
     "mean_l2_distance",
+    "mean_hamming_distance",
     "mean_reproj_error",
     "orientation_consistency",
     "dominant_angle_delta",
@@ -418,6 +420,134 @@ def build_threshold_curve(labels: np.ndarray, scores: np.ndarray, config: dict[s
     )
     thresholds = sorted({round(value, 10) for value in thresholds if 0.0 <= value <= 1.0})
     return [rate_at_threshold(labels, scores, threshold) for threshold in thresholds]
+
+
+def build_far_frr_table(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    start: int = 30,
+    stop: int = 70,
+) -> list[dict[str, Any]]:
+    """构建 0.30--0.70（步长 0.01）的固定 FAR/FRR 表格。
+
+    用整数百分位生成阈值，避免浮点累加产生诸如
+    ``0.6000000000000002`` 的阈值。返回值保留接受/拒绝计数，便于检查
+    FAR 和 FRR 的分母是否符合预期。
+    """
+
+    if start < 0 or stop > 100 or start > stop:
+        raise ValueError(
+            f"FAR/FRR threshold bounds must satisfy 0 <= start <= stop <= 100, "
+            f"got start={start}, stop={stop}."
+        )
+    return [rate_at_threshold(labels, scores, value / 100.0) for value in range(start, stop + 1)]
+
+
+def select_zero_far_min_frr_threshold(
+    labels: np.ndarray,
+    scores: np.ndarray,
+) -> dict[str, Any]:
+    """选择使全体 impostor FAR=0 且 FRR 最小的精确阈值。
+
+    ``score >= threshold`` 视为接受，因此阈值必须严格大于最大 impostor
+    分数。FAR 在阈值升高时单调不增，FRR 单调不减，所以最大 impostor
+    分数之上的最小 float64 值就是 FAR=0 约束下 FRR 最小的工作点。
+    """
+
+    label_values = np.asarray(labels, dtype=np.int32).reshape(-1)
+    score_values = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if label_values.size != score_values.size:
+        raise ValueError(
+            "labels and scores must have the same length: "
+            f"labels={label_values.size}, scores={score_values.size}."
+        )
+    if score_values.size and not np.all(np.isfinite(score_values)):
+        raise ValueError("Cannot select a FAR=0 threshold from non-finite scores.")
+
+    impostor_scores = score_values[label_values == 0]
+    if impostor_scores.size == 0:
+        point = rate_at_threshold(label_values, score_values, 0.0)
+        return {
+            **point,
+            "selection_status": "unavailable_no_impostor_attempts",
+            "selection_rule": "global_far_0_then_min_frr",
+            "max_impostor_score": None,
+        }
+
+    max_impostor_score = float(np.max(impostor_scores))
+    threshold = float(np.nextafter(max_impostor_score, np.inf))
+    point = rate_at_threshold(label_values, score_values, threshold)
+    if point["far"] != 0.0:
+        raise RuntimeError(
+            "Internal error: selected threshold did not produce FAR=0: "
+            f"threshold={threshold}, FAR={point['far']}."
+        )
+    return {
+        **point,
+        "selection_status": "selected",
+        "selection_rule": "global_far_0_then_min_frr",
+        "max_impostor_score": max_impostor_score,
+    }
+
+
+def build_per_finger_far_frr_table(
+    score_rows: list[dict[str, Any]],
+    operating_point: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """在同一个全局 FAR=0 工作点下汇总总体及每个注册手指的 FAR/FRR。
+
+    第一行固定为全体统计。每个手指采用 owner-centric 口径：
+    ``owner_identity`` 等于该手指的所有尝试构成分母，其中本人 query 是
+    genuine，其他手指 query 是 impostor。
+    """
+
+    threshold = float(operating_point["threshold"])
+
+    def table_row(
+        scope: str,
+        identity_id: str,
+        labels: np.ndarray,
+        scores: np.ndarray,
+    ) -> dict[str, Any]:
+        rates = rate_at_threshold(labels, scores, threshold)
+        return {
+            "scope": scope,
+            "identity_id": identity_id,
+            "threshold": rates["threshold"],
+            "far": rates["far"],
+            "frr": rates["frr"],
+            "tar": rates["tar"],
+            "genuine_accept": rates["genuine_accept"],
+            "genuine_reject": rates["genuine_reject"],
+            "genuine_total": rates["genuine_total"],
+            "impostor_accept": rates["impostor_accept"],
+            "impostor_reject": rates["impostor_reject"],
+            "impostor_total": rates["impostor_total"],
+            "selection_status": operating_point.get("selection_status", ""),
+            "selection_rule": operating_point.get("selection_rule", ""),
+            "max_impostor_score_all_fingers": operating_point.get(
+                "max_impostor_score"
+            ),
+        }
+
+    all_labels = np.asarray(
+        [int(row["label"]) for row in score_rows], dtype=np.int32
+    )
+    all_scores = np.asarray(
+        [float(row["score"]) for row in score_rows], dtype=np.float64
+    )
+    table = [table_row("all_fingers", "__ALL__", all_labels, all_scores)]
+    rows_by_owner: dict[str, list[dict[str, Any]]] = {}
+    for row in score_rows:
+        rows_by_owner.setdefault(
+            str(row.get("owner_identity", "")), []
+        ).append(row)
+    for identity_id in sorted(rows_by_owner):
+        rows = rows_by_owner[identity_id]
+        labels = np.asarray([int(row["label"]) for row in rows], dtype=np.int32)
+        scores = np.asarray([float(row["score"]) for row in rows], dtype=np.float64)
+        table.append(table_row("finger", identity_id, labels, scores))
+    return table
 
 
 def recommend_unlock_threshold(curve: list[dict[str, Any]], far_points: list[float]) -> dict[str, Any] | None:
@@ -816,7 +946,13 @@ def export_failure_cases(
                 "num_candidates": row.get("num_candidates", ""),
                 "raw_inliers": row.get("raw_inliers", ""),
                 "unique_inliers": row.get("unique_inliers", ""),
+                "mean_descriptor_distance": row.get(
+                    "mean_descriptor_distance", ""
+                ),
                 "mean_l2_distance": row.get("mean_l2_distance", ""),
+                "mean_hamming_distance": row.get(
+                    "mean_hamming_distance", ""
+                ),
                 "mean_reproj_error": row.get("mean_reproj_error", ""),
                 "orientation_consistency": row.get("orientation_consistency", ""),
                 "geometry_similarity": row.get("geometry_similarity", ""),
@@ -1015,8 +1151,9 @@ def run_descriptor_l2_evaluation(
     max_impostor_identities_per_query: int = 0,
     export_failures: bool = True,
 ) -> dict[str, Any]:
-    """执行完整 identity 级 L2 descriptor 验证评估。
+    """执行完整 identity 级 descriptor 验证评估。
 
+    距离算法由 matching.distance 与模板契约共同约束，可为 L2 或 Hamming。
     输入是已经固定好的 split metadata、identity_templates_20.json 和 image_templates。
     本函数不再重新构建模板，只负责：
         1. 遍历 query；
@@ -1059,7 +1196,10 @@ def run_descriptor_l2_evaluation(
     with scores_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SCORE_FIELDNAMES)
         writer.writeheader()
-        for row in tqdm(query_rows, desc=f"evaluate {source}_l2"):
+        for row in tqdm(
+            query_rows,
+            desc=f"evaluate {source}_{dict(config.get('matching', {})).get('distance', 'auto')}",
+        ):
             query_template_path = Path(template_dir) / template_filename(row["identity_id"], row["image_id"])
             query_template = load_template_cached(query_template_path, cache, require=source)
             true_identity = row["identity_id"]
@@ -1118,6 +1258,15 @@ def run_descriptor_l2_evaluation(
         curve,
         config,
     )
+    # FAR=0 工作点使用 CSV 中的原始 float64 分数，避免 float32 舍入把
+    # 最大 impostor 分数压低后产生一个实际仍会误接受的阈值。
+    zero_far_scores = np.asarray(
+        [float(row["score"]) for row in score_rows], dtype=np.float64
+    )
+    zero_far_operating_point = select_zero_far_min_frr_threshold(
+        labels, zero_far_scores
+    )
+    metrics["zero_far_min_frr_operating_point"] = zero_far_operating_point
     target = metrics.get("target_operating_point") or {}
     selected_threshold = float(target.get("threshold", configured_threshold))
     metrics["configured_threshold"] = configured_threshold
@@ -1188,10 +1337,22 @@ def run_descriptor_l2_evaluation(
         }
     )
     write_csv_rows(out / "match_score_threshold_curve.csv", curve)
+    far_frr_table_path = out / "far_frr_thresholds_0.30_0.70.csv"
+    write_csv_rows(far_frr_table_path, build_far_frr_table(labels, scores))
+    per_finger_far_frr_path = out / "per_finger_far_frr_at_global_zero_far.csv"
+    write_csv_rows(
+        per_finger_far_frr_path,
+        build_per_finger_far_frr_table(score_rows, zero_far_operating_point),
+    )
     write_json(out / "metrics.json", metrics)
     write_yaml(out / "effective_config.yaml", effective_config)
     write_plots(labels, scores, curve, selected_threshold, out)
-    return {"metrics": metrics, "scores_path": str(scores_path)}
+    return {
+        "metrics": metrics,
+        "scores_path": str(scores_path),
+        "far_frr_table_path": str(far_frr_table_path),
+        "per_finger_far_frr_path": str(per_finger_far_frr_path),
+    }
 
 
 def run_hardnet_evaluation(
@@ -1203,7 +1364,7 @@ def run_hardnet_evaluation(
     max_impostor_identities_per_query: int = 0,
     export_failures: bool = True,
 ) -> dict[str, Any]:
-    """兼容旧入口：只评估 HardNet L2。"""
+    """兼容旧入口：按 HardNet 模板契约评估 L2 或 Hamming。"""
 
     return run_descriptor_l2_evaluation(
         metadata_rows=metadata_rows,
@@ -1229,7 +1390,7 @@ def summary_row(metrics: dict[str, Any], far_points: list[float]) -> dict[str, A
     genuine_stages = stage_summary.get("genuine") or {}
     row: dict[str, Any] = {
         "descriptor_source": metrics.get("descriptor_source", "hardnet"),
-        "matching_backend": metrics.get("matching_backend", "hardnet_l2_unknown_ransac"),
+        "matching_backend": metrics.get("matching_backend", "hardnet_unknown_unknown_ransac"),
         "num_queries": metrics.get("num_queries", ""),
         "configured_threshold": metrics.get("configured_threshold", ""),
         "num_identities": metrics.get("num_identities", ""),

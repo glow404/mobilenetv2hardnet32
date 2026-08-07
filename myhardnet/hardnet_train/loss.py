@@ -63,15 +63,16 @@ def pairwise_l2_for_unit_vectors(anchor: torch.Tensor, positive: torch.Tensor, e
 
 @dataclass(frozen=True)
 class HardNegativeSelection:
-    """一次 batch 内 top-k 负样本选择的完整结果。"""
+    """一次 batch 内合法候选池与 top-k 难负样本选择结果。"""
 
     positive_dist: torch.Tensor
+    candidate_dist: torch.Tensor
+    valid_candidate: torch.Tensor
     topk_negative_dist: torch.Tensor
     valid_topk: torch.Tensor
     negative_count: torch.Tensor
     valid_anchor: torch.Tensor
     mean_negative_dist: torch.Tensor
-    topk_same_finger: torch.Tensor
     topk_candidate_index: torch.Tensor
 
 
@@ -181,10 +182,6 @@ def select_hard_negatives(
         ],
         dim=1,
     )
-    candidate_same_finger = torch.cat(
-        [same_finger, same_finger.t()],
-        dim=1,
-    )
     selected_k = min(top_k, int(negative_candidates.size(1)))
     topk_negative_dist, topk_indices = torch.topk(
         negative_candidates,
@@ -193,7 +190,6 @@ def select_hard_negatives(
         largest=False,
         sorted=True,
     )
-    topk_same_finger = torch.gather(candidate_same_finger, 1, topk_indices)
 
     valid_topk = topk_negative_dist < large_value / 2.0
     negative_count = valid_topk.sum(dim=1)
@@ -211,12 +207,13 @@ def select_hard_negatives(
     )
     return HardNegativeSelection(
         positive_dist=positive_dist,
+        candidate_dist=negative_candidates,
+        valid_candidate=negative_candidates < large_value / 2.0,
         topk_negative_dist=topk_negative_dist,
         valid_topk=valid_topk,
         negative_count=negative_count,
         valid_anchor=valid_anchor,
         mean_negative_dist=mean_negative_dist,
-        topk_same_finger=topk_same_finger,
         topk_candidate_index=topk_indices,
     )
 
@@ -334,9 +331,8 @@ class HardNetLoss(nn.Module):
                 "hard_negative_count": selection.negative_count.detach(),
                 "selected_negative_dist": selection.topk_negative_dist.detach(),
                 "selected_negative_mask": selection.valid_topk.detach(),
-                "selected_negative_is_same_finger": (
-                    selection.topk_same_finger.detach()
-                ),
+                "candidate_dist": selection.candidate_dist.detach(),
+                "candidate_mask": selection.valid_candidate.detach(),
                 "selected_negative_candidate_index": (
                     selection.topk_candidate_index.detach()
                 ),
@@ -373,22 +369,42 @@ class HardNetLoss(nn.Module):
         # 在其他有效候选之间均分；有效候选不足 k 个时重新归一化，避免样本
         # 因为合法候选数量不同而改变整体 loss 权重。
         selected_k = int(selection.topk_negative_dist.shape[1])
-        negative_weights = torch.full(
-            (selected_k,),
-            (1.0 - self.hard_negative_top1_weight) / max(selected_k - 1, 1),
+        valid_topk = selection.valid_topk.to(
             dtype=selection.topk_negative_dist.dtype,
-            device=selection.topk_negative_dist.device,
         )
-        negative_weights[0] = 1.0 if selected_k == 1 else self.hard_negative_top1_weight
+        valid_count = selection.negative_count.to(
+            dtype=selection.topk_negative_dist.dtype,
+        )
+        negative_weights = torch.zeros_like(selection.topk_negative_dist)
+        if selected_k == 1:
+            negative_weights[:, 0] = valid_topk[:, 0]
+        else:
+            has_multiple = valid_count > 1.0
+            top1_weight = torch.where(
+                has_multiple,
+                valid_count.new_full(valid_count.shape, self.hard_negative_top1_weight),
+                valid_count.new_ones(valid_count.shape),
+            )
+            negative_weights[:, 0] = valid_topk[:, 0] * top1_weight
+            remaining_weight = torch.where(
+                has_multiple,
+                1.0 - top1_weight,
+                torch.zeros_like(top1_weight),
+            )
+            remaining_count = (valid_count - 1.0).clamp_min(1.0)
+            negative_weights[:, 1:] = (
+                valid_topk[:, 1:]
+                * remaining_weight[:, None]
+                / remaining_count[:, None]
+            )
         per_negative = torch.clamp(
             self.margin
             + selection.positive_dist[:, None]
             - selection.topk_negative_dist,
             min=0.0,
         )
-        weighted_mask = selection.valid_topk * negative_weights[None, :]
-        per_sample = (weighted_mask * per_negative).sum(dim=1)
-        per_sample = per_sample / weighted_mask.sum(dim=1).clamp_min(1e-8)
+        per_sample = (negative_weights * per_negative).sum(dim=1)
+        per_sample = per_sample / negative_weights.sum(dim=1).clamp_min(1e-8)
         ranking_loss = per_sample[selection.valid_anchor].mean()
         loss = ranking_loss + positive_tail_loss
         stats = {
@@ -398,9 +414,8 @@ class HardNetLoss(nn.Module):
             "hard_negative_count": selection.negative_count.detach(),
             "selected_negative_dist": selection.topk_negative_dist.detach(),
             "selected_negative_mask": selection.valid_topk.detach(),
-            "selected_negative_is_same_finger": (
-                selection.topk_same_finger.detach()
-            ),
+            "candidate_dist": selection.candidate_dist.detach(),
+            "candidate_mask": selection.valid_candidate.detach(),
             "selected_negative_candidate_index": (
                 selection.topk_candidate_index.detach()
             ),

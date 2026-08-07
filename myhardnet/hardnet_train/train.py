@@ -16,6 +16,8 @@
         last.pt              最后一个 epoch 的模型
         metrics.csv          每个 epoch 的训练/固定验证指标
         resolved_config.json 实际使用的配置快照
+        model_structure.md   可读的模型树、汇总和逐层结构表
+        model_structure.csv  可供 Excel/脚本分析的逐层结构表
 """
 
 from __future__ import annotations
@@ -46,7 +48,11 @@ from hardnet_train.checkpoint_selection import (
     checkpoint_selection_state_from_metrics,
     normalize_checkpoint_selection_config,
 )
-from hardnet_train.data import FingerImagePairBatchSampler, FingerprintPairDataset
+from hardnet_train.data import (
+    FingerImagePairBatchSampler,
+    FingerprintPairDataset,
+    PatchAugmentationConfig,
+)
 from hardnet_train.loss import HardNetLoss, normalize_hard_negative_strategy
 from hardnet_train.metrics import RunningMean
 from hardnet_train.negative_sampling import (
@@ -64,6 +70,7 @@ from hardnet_train.model import (
     normalize_model_architecture,
     resolve_descriptor_dim,
 )
+from hardnet_train.model_report import write_model_structure_report
 from hardnet_train.optim import build_optimizer, normalize_optimizer_name, optimizer_name
 from hardnet_train.validation import (
     build_fixed_validation_batch_plan,
@@ -95,18 +102,20 @@ def resolve_path(config: dict[str, Any], raw_path: str | Path) -> Path:
     return (Path(config["_config_path"]).parent / path).resolve()
 
 
-def default_output_dir(architecture: str) -> str:
-    """返回统一训练配置在各架构下互不冲突的默认输出目录。"""
+def default_output_dir(architecture: str, descriptor_dim: Any = None) -> str:
+    """按架构和描述子维度返回互不冲突的默认训练输出目录。"""
 
-    return {
-        "hardnet_strong_v2": (
-            "../outputs/models/hardnet_train_strong_v2_256_fixed_in_batch_v1"
-        ),
-        "mobile_hardnet": (
-            "../outputs/models/hardnet_train_mobile_128_fixed_in_batch_v1"
-        ),
-        "hardnet": "../outputs/models/hardnet_train_hardnet_128_fixed_in_batch_v1",
-    }[normalize_model_architecture(architecture)]
+    normalized = normalize_model_architecture(architecture)
+    dimension = resolve_descriptor_dim(normalized, descriptor_dim)
+    architecture_label = {
+        "hardnet_strong_v2": "strong_v2",
+        "mobile_hardnet": "mobile",
+        "hardnet": "hardnet",
+    }[normalized]
+    return (
+        f"../outputs/models/hardnet_train_{architecture_label}_{dimension}_"
+        "fixed_candidate_pool_v3"
+    )
 
 
 def resolve_resume_checkpoint(
@@ -132,14 +141,14 @@ def resolve_resume_checkpoint(
 
 
 def negative_sampling_contract(config: Mapping[str, Any]) -> dict[str, Any]:
-    """提取会改变训练标签与验证配对的负样本协议。"""
+    """提取会改变训练标签、验证配对与 checkpoint 选模的协议。"""
 
     training = config.get("training", {})
     validation = config.get("validation", {})
     if not isinstance(training, Mapping) or not isinstance(validation, Mapping):
         raise ValueError("training and validation config sections must be mappings.")
     return {
-        "contract_version": 3,
+        "contract_version": 5,
         "training_hard_negative_strategy": normalize_hard_negative_strategy(
             training.get("hard_negative_strategy", "same_finger_allowed")
         ),
@@ -155,7 +164,7 @@ def negative_sampling_contract(config: Mapping[str, Any]) -> dict[str, Any]:
             )
         ),
         "validation_protocol": str(
-            validation.get("protocol", "fixed_in_batch_v1")
+            validation.get("protocol", "fixed_candidate_pool_v3")
         )
         .strip()
         .lower(),
@@ -169,9 +178,10 @@ def negative_sampling_contract(config: Mapping[str, Any]) -> dict[str, Any]:
         "validation_batch_size": int(
             validation.get("batch_size", 24)
         ),
-        "same_finger_coordinate_rule": "outside_square",
-        "same_finger_coordinate_scope": "same_finger_same_image",
-        "validation_candidate_rule": "same_as_training_in_batch",
+        "validation_candidate_rule": "fixed_full_legal_pool_for_roc_topk_for_loss",
+        "checkpoint_selection": normalize_checkpoint_selection_config(
+            config.get("checkpoint_selection")
+        ),
     }
 
 
@@ -206,10 +216,24 @@ def descriptor_loss_contract(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def train_augmentation_contract(config: Mapping[str, Any]) -> dict[str, bool | float]:
+    """返回会改变训练输入分布的在线增强契约。"""
+
+    data_config = config.get("data", {})
+    if not isinstance(data_config, Mapping):
+        raise ValueError("data config section must be a mapping.")
+    augmentation = data_config.get("train_augmentation")
+    if augmentation is None:
+        # 训练入口默认启用轻量增强；FingerprintPairDataset 本身仍默认关闭，
+        # 因此固定验证与其他只读调用不会被意外扰动。
+        augmentation = {"enabled": True}
+    if augmentation is not None and not isinstance(augmentation, Mapping):
+        raise ValueError("data.train_augmentation must be a mapping.")
+    return PatchAugmentationConfig.from_mapping(augmentation).as_dict()
+
+
 _LEGACY_FIXED_PAIR_VALIDATION_KEYS = {
     "positive_count",
-    "same_finger_negatives_per_anchor",
-    "cross_finger_negatives_per_anchor",
     "same_finger_min_coordinate_separation_px",
 }
 
@@ -219,16 +243,17 @@ def normalize_fixed_in_batch_validation_config(
     *,
     default_seed: int,
 ) -> None:
-    """规范化唯一支持的固定 in-batch 验证配置，并拒绝旧配额字段。"""
+    """规范化固定候选池验证配置，并拒绝旧协议和旧配额字段。"""
 
     protocol = str(
-        validation_config.get("protocol", "fixed_in_batch_v1")
+        validation_config.get("protocol", "fixed_candidate_pool_v3")
     ).strip().lower()
-    if protocol != "fixed_in_batch_v1":
+    if protocol != "fixed_candidate_pool_v3":
         raise ValueError(
             f"Unsupported validation.protocol: {protocol!r}. Expected "
-            "'fixed_in_batch_v1'; old fixed-pair protocols require a new "
-            "configuration and output directory."
+            "'fixed_candidate_pool_v3'; older protocols use grouped validation "
+            "metrics or dynamic top-k for ROC and cannot share an output directory "
+            "with the new overall metrics."
         )
     legacy_keys = sorted(
         key
@@ -238,7 +263,7 @@ def normalize_fixed_in_batch_validation_config(
     if legacy_keys:
         raise ValueError(
             "Legacy fixed-pair validation fields are not supported by "
-            f"fixed_in_batch_v1: {legacy_keys}. Configure finger_count, "
+            f"fixed_candidate_pool_v3: {legacy_keys}. Configure finger_count, "
             "batch_count and batch_size instead."
         )
     if "image_pairs_per_finger" in validation_config:
@@ -314,6 +339,22 @@ def validate_resume_negative_sampling_contract(
             f"checkpoint={dict(saved_loss_contract)}, configured={current_loss_contract}. "
             "Start a new output directory instead of resuming this checkpoint."
         )
+    current_augmentation_contract = train_augmentation_contract(current_config)
+    saved_augmentation_contract = checkpoint.get("train_augmentation_contract")
+    if not isinstance(saved_augmentation_contract, Mapping):
+        if bool(current_augmentation_contract["enabled"]):
+            raise ValueError(
+                "Checkpoint predates the online-augmentation contract, but "
+                "data.train_augmentation.enabled=true. Start a new output directory "
+                "instead of resuming with a changed input distribution."
+            )
+    elif dict(saved_augmentation_contract) != current_augmentation_contract:
+        raise ValueError(
+            "Checkpoint online-augmentation contract mismatch: "
+            f"checkpoint={dict(saved_augmentation_contract)}, "
+            f"configured={current_augmentation_contract}. Start a new output "
+            "directory instead of resuming this checkpoint."
+        )
 
 
 def set_seed(seed: int) -> None:
@@ -334,12 +375,31 @@ def make_loader(config: dict[str, Any], split: str, batch_size: int, steps: int,
     train_cfg = config["training"]
     csv_path = resolve_path(config, data_cfg[f"{split}_csv"])
     max_rows = data_cfg.get(f"max_{split}_rows")
+    augmentation = PatchAugmentationConfig.from_mapping(
+        data_cfg.get("train_augmentation", {"enabled": True})
+        if split == "train"
+        else None
+    )
     dataset = FingerprintPairDataset(
         csv_path=csv_path,
         max_rows=max_rows,
         max_rows_per_finger=data_cfg.get(f"max_{split}_rows_per_finger"),
         normalize=bool(data_cfg.get("normalize", True)),
+        augmentation=augmentation,
     )
+    if augmentation.enabled:
+        print(
+            "online augmentation enabled: "
+            f"p={augmentation.probability} "
+            f"rotation=±{augmentation.max_rotation_degrees}deg "
+            f"translation=±{augmentation.max_translation_pixels}px "
+            f"scale=±{augmentation.scale_jitter} "
+            f"contrast=±{augmentation.contrast_jitter} "
+            f"gamma=±{augmentation.gamma_jitter} "
+            f"blur_p={augmentation.blur_probability} "
+            f"noise_p={augmentation.noise_probability}",
+            flush=True,
+        )
     available_fingers = len({record.finger_id for record in dataset.records})
     requested_fingers_per_batch = int(train_cfg.get("fingers_per_batch", 8))
     if requested_fingers_per_batch < 1:
@@ -636,6 +696,7 @@ def save_checkpoint(
         "descriptor_metric": "l2",
         "negative_sampling_contract": negative_sampling_contract(resolved_config),
         "descriptor_loss_contract": descriptor_loss_contract(resolved_config),
+        "train_augmentation_contract": train_augmentation_contract(resolved_config),
         "model_architecture": model_architecture(model),
         "descriptor_dim": model_descriptor_dim(model),
         "model_parameter_count": count_parameters(model),
@@ -727,29 +788,6 @@ def load_checkpoint(
     return finished_epoch + 1, global_step
 
 
-def best_fpr_at_tpr95_from_metrics(metrics_path: Path) -> tuple[float, float, int]:
-    """从当前指标 CSV 恢复主选模指标和早停状态。"""
-    if not metrics_path.exists():
-        return float("inf"), float("inf"), 0
-    rows: list[dict[str, str]] = []
-    with metrics_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        rows = [row for row in reader]
-    if not rows:
-        return float("inf"), float("inf"), 0
-
-    fprs = [
-        float(row["val_fpr_at_tpr95"])
-        for row in rows
-        if row.get("val_fpr_at_tpr95")
-    ]
-    best_fpr = min(fprs) if fprs else float("inf")
-    last = rows[-1]
-    early_best = float(last.get("early_stop_best_fpr_at_tpr95") or best_fpr)
-    no_improve = int(float(last.get("no_improve_epochs") or 0))
-    return best_fpr, early_best, no_improve
-
-
 def _format_metric_value(value: Any) -> Any:
     """将浮点指标压缩为 4 位有效数字，整数状态保持原样。"""
     if isinstance(value, (float, np.floating)):
@@ -780,10 +818,9 @@ def append_metrics(path: Path, row: dict[str, Any]) -> None:
 
 
 def plot_training_curves(metrics_path: Path, output_path: Path) -> None:
-    """根据精简 metrics.csv 输出与最终匹配最相关的训练曲线。
+    """根据 metrics.csv 绘制四项 checkpoint 选模信号。
 
-    图中包含 loss、正负困难尾部、总体/同指 FPR，以及同指严格 TPR
-    和 Recall@1。如果 matplotlib 不可用，则跳过绘图，不影响训练结果。
+    如果 matplotlib 不可用，则跳过绘图，不影响训练结果。
     """
     if not metrics_path.exists():
         return
@@ -815,12 +852,8 @@ def plot_training_curves(metrics_path: Path, output_path: Path) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=140)
 
     axes[0, 0].plot(epochs, values("train_loss"), label="train_loss")
-    axes[0, 0].plot(
-        epochs,
-        values("val_same_finger_loss", "val_loss"),
-        label="val_same_finger_loss",
-    )
-    axes[0, 0].set_title("Train vs Same-finger Validation Loss")
+    axes[0, 0].plot(epochs, values("val_loss"), label="val_loss")
+    axes[0, 0].set_title("Train vs Validation Loss")
     axes[0, 0].set_xlabel("Epoch")
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].legend()
@@ -830,12 +863,7 @@ def plot_training_curves(metrics_path: Path, output_path: Path) -> None:
         values("val_pos_p95", "val_pos_mean"),
         label="val_pos_p95",
     )
-    axes[0, 1].plot(
-        epochs,
-        values("val_same_finger_neg_p01", "val_neg_p01"),
-        label="same_finger_neg_p01",
-    )
-    axes[0, 1].set_title("Difficult Positive/Negative Tails")
+    axes[0, 1].set_title("Positive Distance P95")
     axes[0, 1].set_xlabel("Epoch")
     axes[0, 1].grid(True, alpha=0.3)
     axes[0, 1].legend()
@@ -843,29 +871,26 @@ def plot_training_curves(metrics_path: Path, output_path: Path) -> None:
     axes[1, 0].plot(
         epochs,
         values("val_fpr_at_tpr95"),
-        label="overall_fpr_at_tpr95",
-    )
-    axes[1, 0].plot(
-        epochs,
-        values("val_same_finger_fpr_at_tpr95", "val_fpr_at_tpr95"),
-        label="same_finger_fpr_at_tpr95",
+        label="fpr_at_tpr95",
     )
     axes[1, 0].set_title("FPR at TPR=95%")
     axes[1, 0].set_xlabel("Epoch")
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].legend()
 
+    distance_gap = [
+        negative - positive
+        for negative, positive in zip(
+            values("val_neg_mean"),
+            values("val_pos_mean"),
+        )
+    ]
     axes[1, 1].plot(
         epochs,
-        values("val_same_finger_tpr_at_fpr_1e_4"),
-        label="same_finger_tpr_at_fpr_1e_4",
+        distance_gap,
+        label="val_neg_mean - val_pos_mean",
     )
-    axes[1, 1].plot(
-        epochs,
-        values("val_same_finger_recall_at_1"),
-        label="same_finger_recall_at_1",
-    )
-    axes[1, 1].set_title("Same-finger Strict TPR and Recall@1")
+    axes[1, 1].set_title("Mean Distance Gap")
     axes[1, 1].set_xlabel("Epoch")
     axes[1, 1].grid(True, alpha=0.3)
     axes[1, 1].legend()
@@ -897,6 +922,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--optimizer", choices=["sgd", "adamw"], default=None)
     parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument(
+        "--drop-path-rate",
+        type=float,
+        default=None,
+        help="Maximum Strong V2 stochastic-depth rate; ignored by other architectures.",
+    )
     parser.add_argument("--margin", type=float, default=None)
     parser.add_argument("--hard-negative-strategy", choices=["same_finger_allowed", "different_finger"], default=None)
     parser.add_argument(
@@ -941,6 +972,8 @@ def main() -> None:
     model_cfg = config.setdefault("model", {})
     optim_cfg = config.setdefault("optimizer", {})
     validation_cfg = config.setdefault("validation", {})
+    data_cfg = config.setdefault("data", {})
+    data_cfg["train_augmentation"] = train_augmentation_contract(config)
     seed = int(config.get("seed", 42))
     set_seed(seed)
 
@@ -979,6 +1012,8 @@ def main() -> None:
         optim_cfg["name"] = args.optimizer
     if args.dropout is not None:
         model_cfg["dropout"] = float(args.dropout)
+    if args.drop_path_rate is not None:
+        model_cfg["drop_path_rate"] = float(args.drop_path_rate)
     if args.margin is not None:
         train_cfg["margin"] = float(args.margin)
     if args.hard_negative_strategy is not None:
@@ -1048,6 +1083,8 @@ def main() -> None:
         model_cfg["architecture"],
         model_cfg.get("descriptor_dim"),
     )
+    if model_cfg["architecture"] == "hardnet_strong_v2":
+        model_cfg["drop_path_rate"] = float(model_cfg.get("drop_path_rate", 0.08))
     train_cfg["hard_negative_strategy"] = normalize_hard_negative_strategy(train_cfg.get("hard_negative_strategy", "same_finger_allowed"))
     train_cfg["hard_negative_top_k"] = int(train_cfg.get("hard_negative_top_k", 3))
     configured_validation_fingers = validation_cfg["finger_count"]
@@ -1071,7 +1108,10 @@ def main() -> None:
         "",
         "auto",
     }:
-        config["output_dir"] = default_output_dir(model_cfg["architecture"])
+        config["output_dir"] = default_output_dir(
+            model_cfg["architecture"],
+            model_cfg["descriptor_dim"],
+        )
     output_dir = resolve_path(config, config["output_dir"])
     resume_arg = "auto" if args.resume_auto else args.resume
     resume_path = resolve_resume_checkpoint(
@@ -1171,14 +1211,24 @@ def main() -> None:
         if optimizer_name(optimizer) == "sgd"
         else f"betas={optim_cfg.get('betas', [0.9, 0.999])} eps={optim_cfg.get('eps', 1e-8)}"
     )
-    model_macs_per_patch = estimate_macs_per_patch(model)
+    model_profile, model_report_md, model_report_csv = write_model_structure_report(
+        model,
+        output_dir,
+    )
+    model_macs_per_patch = model_profile.macs_per_patch
+    print(
+        f"saved model structure report to {model_report_md} and {model_report_csv}",
+        flush=True,
+    )
     print(
         f"device={device} architecture={model_architecture(model)} "
         f"descriptor_dim={model_descriptor_dim(model)} "
         f"params={count_parameters(model)} macs_per_patch={model_macs_per_patch} "
         f"batch={batch_size} "
         f"fingers_per_batch={train_cfg.get('fingers_per_batch', 8)} "
-        f"dropout={model_cfg.get('dropout', 0.1)} optimizer={optimizer_name(optimizer)} "
+        f"dropout={model_cfg.get('dropout', 0.1)} "
+        f"drop_path_rate={model_cfg.get('drop_path_rate', 0.0)} "
+        f"optimizer={optimizer_name(optimizer)} "
         f"lr={optim_cfg.get('lr', 0.1)} {optimizer_detail} "
         f"margin={train_cfg.get('margin', 1.0)} steps_per_epoch={steps_per_epoch} epochs={epochs} "
         f"hard_negative_strategy={train_cfg.get('hard_negative_strategy', 'same_finger_allowed')} "
@@ -1317,53 +1367,13 @@ def main() -> None:
             "train_positive_p95": train_metrics["positive_p95"],
             "train_positive_p99": train_metrics["positive_p99"],
             "val_loss": val_metrics["loss"],
-            "val_same_finger_loss": val_metrics["same_finger_loss"],
             "val_pos_mean": val_metrics["pos_mean"],
             "val_pos_p95": val_metrics["pos_p95"],
             "val_neg_mean": val_metrics["neg_mean"],
-            "val_same_finger_pos_mean": val_metrics["same_finger_pos_mean"],
-            "val_same_finger_neg_mean": val_metrics["same_finger_neg_mean"],
-            "val_cross_finger_pos_mean": val_metrics["cross_finger_pos_mean"],
-            "val_cross_finger_neg_mean": val_metrics["cross_finger_neg_mean"],
-            "val_same_finger_neg_p01": val_metrics["same_finger_neg_p01"],
-            "val_same_finger_tail_gap": (
-                val_metrics["same_finger_neg_p01"] - val_metrics["pos_p95"]
-            ),
+            "val_neg_p01": val_metrics["neg_p01"],
             "val_fpr_at_tpr95": current_fpr_at_tpr95,
-            "val_same_finger_fpr_at_tpr95": val_metrics[
-                "same_finger_fpr_at_tpr95"
-            ],
-            "val_cross_finger_fpr_at_tpr95": val_metrics[
-                "cross_finger_fpr_at_tpr95"
-            ],
-            "val_same_finger_tpr_at_fpr_1e_4": val_metrics[
-                "same_finger_tpr_at_fpr_1e_4"
-            ],
-            "val_cross_finger_tpr_at_fpr_1e_4": val_metrics[
-                "cross_finger_tpr_at_fpr_1e_4"
-            ],
-            "val_same_finger_recall_at_1": val_metrics[
-                "same_finger_recall_at_1"
-            ],
-            "val_cross_finger_recall_at_1": val_metrics[
-                "cross_finger_recall_at_1"
-            ],
+            "val_tpr_at_fpr_1e_4": val_metrics["tpr_at_fpr_1e_4"],
             "val_checkpoint_selection_score": current_selection_score,
-            "val_checkpoint_selection_false_acceptance": val_metrics[
-                "checkpoint_selection_false_acceptance"
-            ],
-            "val_checkpoint_selection_low_fpr_recall": val_metrics[
-                "checkpoint_selection_low_fpr_recall"
-            ],
-            "val_checkpoint_selection_hard_negative_recall": val_metrics[
-                "checkpoint_selection_hard_negative_recall"
-            ],
-            "val_checkpoint_selection_mean_gap": val_metrics[
-                "checkpoint_selection_mean_gap"
-            ],
-            "val_checkpoint_selection_tail_gap": val_metrics[
-                "checkpoint_selection_tail_gap"
-            ],
             "val_valid_anchor_count": int(val_metrics["valid_anchor_count"]),
             "val_skipped_anchor_count": int(val_metrics["skipped_anchor_count"]),
             "lr": train_metrics["lr"],
@@ -1378,14 +1388,13 @@ def main() -> None:
             f"train_pos_tail={train_metrics['positive_tail_loss']:.4g} "
             f"train_pos_p95={train_metrics['positive_p95']:.4g} "
             f"train_pos_p99={train_metrics['positive_p99']:.4g} "
-            f"val_same_loss={val_metrics['same_finger_loss']:.4g} "
+            f"val_loss={val_metrics['loss']:.4g} "
+            f"val_pos_mean={val_metrics['pos_mean']:.4g} "
+            f"val_neg_mean={val_metrics['neg_mean']:.4g} "
             f"val_fpr95={current_fpr_at_tpr95:.4g} "
-            f"same_fpr95={val_metrics['same_finger_fpr_at_tpr95']:.4g} "
-            f"same_tpr1e4={val_metrics['same_finger_tpr_at_fpr_1e_4']:.4g} "
-            f"same_recall1={val_metrics['same_finger_recall_at_1']:.4g} "
+            f"val_pos_p95={val_metrics['pos_p95']:.4g} "
             f"valid_anchors={int(val_metrics['valid_anchor_count'])} "
             f"skipped_anchors={int(val_metrics['skipped_anchor_count'])} "
-            f"tail_gap={metric_row['val_same_finger_tail_gap']:.4g} "
             f"best_for_stop={early_best_selection_score:.4g} "
             f"{early_stop_message}",
             flush=True,

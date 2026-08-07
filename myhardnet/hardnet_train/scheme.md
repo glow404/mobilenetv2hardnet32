@@ -352,13 +352,13 @@ epoch 3 → seed 44
 
 # 5. 验证集如何构建
 
-验证集现在使用 `fixed_in_batch_v1`。它不再为每个 anchor 预先指定固定数量的同指/跨指负样本，而是让验证 batch 与训练 batch 使用同一套采样结构和候选规则。
+验证集现在使用 `fixed_candidate_pool_v3`。固定 batch 和合法候选身份每轮不变；完整候选池负责总体 ROC 和距离分布，动态 top-k 只负责 margin loss。
 
 示例配置：
 
 ```yaml
 validation:
-  protocol: fixed_in_batch_v1
+  protocol: fixed_candidate_pool_v3
   seed: 10042
   finger_count: auto
   batch_count: 256
@@ -462,11 +462,11 @@ Triplet margin loss
     ↓
 执行固定 in-batch 验证计划
     ↓
-计算 FPR@TPR95、Recall@1、TPR@FPR=1e-4 等指标
+计算 val_loss、平均正负距离、FPR@TPR95 和正样本 p95
     ↓
 保存 last.pt
     ↓
-如果 val_fpr_at_tpr95 更低，保存 best.pt
+按 matching_composite_v1 四项综合分保存 best.pt
     ↓
 写入 metrics.csv
     ↓
@@ -476,7 +476,7 @@ Triplet margin loss
 当前 `early_stop_patience: 0`，表示关闭早停，所以正常情况下会完成全部 100 个 epoch。最终训练产物中：
 
 - `last.pt`：最后一轮模型；
-- `best.pt`：验证集 `val_fpr_at_tpr95` 最低的模型；
+- `best.pt`：验证集 `val_checkpoint_selection_score` 最高的模型；
 - `metrics.csv`：每轮训练和验证指标；
 - `training_curves.png`：训练曲线。
 

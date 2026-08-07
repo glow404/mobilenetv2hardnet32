@@ -13,7 +13,7 @@ conda activate hardnet-cuda
 
 ## 1. `run_hardnet_matching.py`
 
-**作用**：HardNet 全量离线阈值标定实验。只检测 SIFT 关键点位置/方向，计算 HardNet 描述子并匹配；**不计算、不保存 SIFT/RootSIFT 描述子**。所有未注册 query 都会遍历本人和全部非本人 identity 的全部注册模板，不再拆分 validation/test；阈值曲线、阈值选择和最终 FAR/FRR 均基于同一份全量匹配结果。
+**作用**：HardNet 全量离线阈值标定实验。只检测 SIFT 关键点位置/方向，计算 HardNet 描述子并匹配；支持 float32/L2 与 packed binary/Hamming 两种 checkpoint 契约，后续候选生成、RANSAC、纹理融合和 identity 级评估共用。所有未注册 query 都会遍历本人和全部非本人 identity 的全部注册模板，不再拆分 validation/test；阈值曲线、阈值选择和最终 FAR/FRR 均基于同一份全量匹配结果。
 
 **运行参数**默认写在 `match_new/config_match_new.yaml`：
 
@@ -25,7 +25,10 @@ conda activate hardnet-cuda
 | `runtime.limit_identities` / `limit_images_per_identity` | 调试裁剪，正式实验保持 `0` |
 | `data.image_root` | 原始指纹图像根目录 |
 | `data.identity_depth` | 组成一个手指 identity 的目录层级数 |
-| `model.checkpoint` | HardNet 权重 |
+| `model.checkpoint` | 浮点或二值 HardNet 权重 |
+| `model.descriptor_kind` / `model.binary_storage` / `model.binary_bitorder` | 描述子类型与二值模板存储契约，默认 `auto`/`packed_uint8`/`auto` |
+| `matching.distance` | `auto` 跟随 checkpoint，也可显式写 `l2` 或 `hamming` |
+| `matching.hamming.*` | 二值 Hamming 的 ratio、绝对距离和自适应 margin，需按验证集重新标定 |
 | `enrollment.random_seed` | 注册/query 划分种子 |
 | `texture_verification.*` | 局部脊线纹理二次筛选及灰区提升参数 |
 | `template_management.*` | 在线模板学习、LRU排序和固定容量替换 |
@@ -44,27 +47,11 @@ python match_new\run_hardnet_matching.py
 
 ```powershell
 python match_new\run_hardnet_matching.py `
-  --image-root D:\datasets\tiny_v12 `
-  --identity-depth 2
+  --image-root datasets\new_data_V3 `
+  --output_dir outputs\newdataV3-8-float256+模板数30 `
 ```
 
-**临时覆盖示例**：
-
-```powershell
-python match_new\run_hardnet_matching.py `
-  --output_dir match_new\butieping `
-  --skip-template-build
-```
-
-**调试**（也可直接改配置里的 `runtime.limit_*`）：
-
-```powershell
-python match_new\run_hardnet_matching.py `
-  --limit_identities 2 `
-  --limit_images_per_identity 22
-```
-
-**输出模板目录**：`<output_dir>/image_templates/`，每个 `.npz` 包含关键点字段、`hardnet_descriptors` 和 `overlap_image`。灰度图保持原始尺寸和关键点坐标系，由 `np.savez_compressed` 无损压缩，`np.load` 时自动解压。
+**输出模板目录**：`<output_dir>/image_templates/`，每个 `.npz` 包含关键点字段、`hardnet_descriptors` 和 `overlap_image`。浮点模板使用 `float32` 列；二值模板使用 `packed_uint8` 列，`hardnet_descriptor_dim` 表示 bit 数，`hardnet_descriptor_bitorder` 保存位序。灰度图保持原始尺寸和关键点坐标系，由 `np.savez_compressed` 无损压缩，`np.load` 时自动解压。
 
 **常用命令行覆盖**（均可不传，改用配置）：
 
@@ -209,6 +196,14 @@ identification:
 
 FAR/FRR 阈值曲线写入 `match_score_threshold_curve.csv`。默认按 `0.01` 在 `[0,1]` 范围扫描，不再生成整数内点阈值曲线。
 
+固定的 `0.30`--`0.70`（步长 `0.01`）结果写入
+`far_frr_thresholds_0.30_0.70.csv`。此外，
+`per_finger_far_frr_at_global_zero_far.csv` 使用所有手指共同的
+“全局 FAR=0 且 FRR 最小”阈值：第一行是全体统计，后续各行按
+`owner_identity` 汇总单个注册手指的 FAR/FRR 及接受、拒绝计数。
+只有一个 identity、没有 impostor 尝试时，表中会将选择状态标记为
+`unavailable_no_impostor_attempts`，此时 FAR 不可估计。
+
 `metrics.json` 的 `texture_verification_config` 会记录实际融合参数，`score_component_summary` 会分别汇总 genuine/impostor 中纹理参与次数，以及相对纯几何分数改变了多少次阈值判定。`matching_backend` 名称带有 `texture_fusion` 时，表示本次结果确实启用了 C 方案。
 
 ### 动态模板学习、替换与LRU排序
@@ -281,8 +276,8 @@ LRU规则：
 | `template_library.json` | 当前活动模板、保护状态和持久化LRU顺序 |
 | `learned_templates/` | 已加入模板库的query NPZ副本 |
 | `retired_templates/` | 被LRU替换的学习模板，便于实验回滚 |
-| `eval_hardnet_l2/template_learning_events.csv` | 每次query的学习、替换和耗时摘要 |
-| `eval_hardnet_l2/template_learning_events.json` | 包含每张确认模板详细证据的完整事件 |
+| `eval_hardnet_<metric>/template_learning_events.csv` | 每次query的学习、替换和耗时摘要；`metric` 为 `l2` 或 `hamming` |
+| `eval_hardnet_<metric>/template_learning_events.json` | 包含每张确认模板详细证据的完整事件 |
 
 模板库管理器每次启动都从当前注册索引重建seed状态，不复用上次运行的 `template_library.json`。
 

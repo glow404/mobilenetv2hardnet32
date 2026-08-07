@@ -113,36 +113,13 @@ def _distance_metrics(positive_dist: torch.Tensor, negative_dist: torch.Tensor) 
     }
 
 
-def _ranking_metrics(
-    positive_dist: torch.Tensor,
-    negative_dist: torch.Tensor,
-    margin: float,
-    hard_negative_top_k: int,
-) -> dict[str, float]:
-    if negative_dist.ndim != 2 or positive_dist.ndim != 1:
-        raise ValueError("Ranking metrics expect positive_dist=[N] and negative_dist=[N, K].")
-    if negative_dist.shape[0] != positive_dist.shape[0]:
-        raise ValueError("Positive and negative distance rows must have the same anchor count.")
-    if hard_negative_top_k < 1:
-        raise ValueError("hard_negative_top_k must be >= 1.")
-
-    selected_k = min(int(hard_negative_top_k), int(negative_dist.shape[1]))
-    hardest = torch.topk(negative_dist, k=selected_k, dim=1, largest=False).values
-    violations = torch.clamp(float(margin) + positive_dist[:, None] - hardest, min=0.0)
-    return {
-        "recall_at_1": float((positive_dist < negative_dist.min(dim=1).values).float().mean().item()),
-        "active_triplet_ratio": float((violations > 0.0).any(dim=1).float().mean().item()),
-        "loss": float(violations.mean().item()),
-    }
-
-
-def _selected_ranking_metrics(
+def _selected_topk_metrics(
     positive_dist: torch.Tensor,
     negative_dist: torch.Tensor,
     negative_anchor_index: torch.Tensor,
     margin: float,
 ) -> dict[str, float]:
-    """按每个 anchor 实际选中的可变数量 top-k 候选计算 ranking 指标。"""
+    """按每个 anchor 实际选中的可变数量 top-k 候选计算 loss 诊断。"""
 
     positives = _finite_flatten(positive_dist, "positive_dist")
     negatives = _finite_flatten(negative_dist, "negative_dist")
@@ -157,7 +134,6 @@ def _selected_ranking_metrics(
     included = count > 0
     if not torch.any(included):
         return {
-            "recall_at_1": math.nan,
             "active_triplet_ratio": math.nan,
             "loss": math.nan,
         }
@@ -173,23 +149,7 @@ def _selected_ranking_metrics(
 
     active_count = torch.zeros(positives.numel(), dtype=torch.long)
     active_count.index_add_(0, anchor_index, violations.gt(0.0).long())
-
-    min_negative = torch.full(
-        (positives.numel(),),
-        float("inf"),
-        dtype=torch.float32,
-    )
-    min_negative.scatter_reduce_(
-        0,
-        anchor_index,
-        negatives,
-        reduce="amin",
-        include_self=True,
-    )
     return {
-        "recall_at_1": float(
-            (positives[included] < min_negative[included]).float().mean().item()
-        ),
         "active_triplet_ratio": float(
             active_count[included].gt(0).float().mean().item()
         ),
@@ -199,29 +159,42 @@ def _selected_ranking_metrics(
 
 def in_batch_descriptor_validation_metrics(
     positive_dist: torch.Tensor,
-    negative_dist: torch.Tensor,
-    negative_anchor_index: torch.Tensor,
-    negative_is_same_finger: torch.Tensor,
+    candidate_dist: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    selected_negative_dist: torch.Tensor,
+    selected_negative_mask: torch.Tensor,
+    selected_negative_anchor_index: torch.Tensor,
     margin: float,
     *,
     valid_anchor_count: int,
     skipped_anchor_count: int,
 ) -> dict[str, float]:
-    """汇总固定 batch 计划中实际被训练规则选中的难负样本。"""
+    """用完整合法候选池计算总体指标，用动态 top-k 子集计算 loss 诊断。"""
 
     positives = _finite_flatten(positive_dist, "positive_dist")
-    negatives = _finite_flatten(negative_dist, "negative_dist")
-    anchor_index = negative_anchor_index.detach().long().cpu().reshape(-1)
-    same_mask = negative_is_same_finger.detach().bool().cpu().reshape(-1)
+    if candidate_dist.shape != candidate_mask.shape:
+        raise ValueError("Candidate distances and masks must align.")
+    if selected_negative_dist.shape != selected_negative_mask.shape:
+        raise ValueError("Selected negative distances and masks must align.")
+    candidates = _finite_flatten(candidate_dist[candidate_mask], "candidate_dist")
+    selected = _finite_flatten(
+        selected_negative_dist[selected_negative_mask],
+        "selected_negative_dist",
+    )
+    selected_anchor_index = (
+        selected_negative_anchor_index[selected_negative_mask]
+        .detach()
+        .long()
+        .cpu()
+        .reshape(-1)
+    )
     if positives.numel() != int(valid_anchor_count):
         raise ValueError(
             "positive_dist length must equal valid_anchor_count: "
             f"{positives.numel()} vs {valid_anchor_count}."
         )
-    if anchor_index.numel() != negatives.numel():
-        raise ValueError("negative_anchor_index must match negative_dist length.")
-    if same_mask.numel() != negatives.numel():
-        raise ValueError("negative_is_same_finger must match negative_dist length.")
+    if selected_anchor_index.numel() != selected.numel():
+        raise ValueError("Selected negative anchor indices must match selected distances.")
 
     result = {
         "pos_mean": float(positives.mean().item()),
@@ -231,93 +204,16 @@ def in_batch_descriptor_validation_metrics(
         "skipped_anchor_count": float(skipped_anchor_count),
         "valid_anchor_ratio": float(valid_anchor_count)
         / float(valid_anchor_count + skipped_anchor_count),
-        "selected_negative_count": float(negatives.numel()),
-        "same_finger_selected_negative_count": float(same_mask.sum().item()),
-        "cross_finger_selected_negative_count": float((~same_mask).sum().item()),
     }
-    result.update(_distance_metrics(positives, negatives))
+    result.update(_distance_metrics(positives, candidates))
     result.update(
-        _selected_ranking_metrics(
+        _selected_topk_metrics(
             positives,
-            negatives,
-            anchor_index,
+            selected,
+            selected_anchor_index,
             margin,
         )
     )
-
-    for prefix, mask in (
-        ("same_finger", same_mask),
-        ("cross_finger", ~same_mask),
-    ):
-        if not torch.any(mask):
-            group_metrics = {
-                "pos_mean": math.nan,
-                "fpr_at_tpr95": math.nan,
-                "tpr_at_fpr_1e_4": math.nan,
-                "roc_auc": math.nan,
-                "eer": math.nan,
-                "neg_mean": math.nan,
-                "neg_p01": math.nan,
-                "neg_p05": math.nan,
-                "recall_at_1": math.nan,
-                "active_triplet_ratio": math.nan,
-                "loss": math.nan,
-            }
-        else:
-            group_negatives = negatives[mask]
-            group_metrics = _distance_metrics(positives, group_negatives)
-            group_metrics.update(
-                _selected_ranking_metrics(
-                    positives,
-                    group_negatives,
-                    anchor_index[mask],
-                    margin,
-                )
-            )
-        result.update(
-            {f"{prefix}_{name}": value for name, value in group_metrics.items()}
-        )
-    return result
-
-
-def descriptor_validation_metrics(
-    positive_dist: torch.Tensor,
-    same_finger_negative_dist: torch.Tensor,
-    cross_finger_negative_dist: torch.Tensor,
-    margin: float,
-    hard_negative_top_k: int = 3,
-) -> dict[str, float]:
-    """计算固定协议总指标，以及 same-finger / cross-finger 分项指标。"""
-    positives = _finite_flatten(positive_dist, "positive_dist")
-    if positive_dist.ndim != 1:
-        raise ValueError("positive_dist must be one-dimensional.")
-    if same_finger_negative_dist.ndim != 2 or cross_finger_negative_dist.ndim != 2:
-        raise ValueError("Negative distances must be shaped [anchor_count, negatives_per_anchor].")
-    if same_finger_negative_dist.shape[0] != positives.numel():
-        raise ValueError("same-finger negative rows must match positive count.")
-    if cross_finger_negative_dist.shape[0] != positives.numel():
-        raise ValueError("cross-finger negative rows must match positive count.")
-    if not torch.all(torch.isfinite(same_finger_negative_dist)):
-        raise ValueError("same_finger_negative_dist contains NaN or infinite values.")
-    if not torch.all(torch.isfinite(cross_finger_negative_dist)):
-        raise ValueError("cross_finger_negative_dist contains NaN or infinite values.")
-
-    combined = torch.cat([same_finger_negative_dist, cross_finger_negative_dist], dim=1).float().cpu()
-    same = same_finger_negative_dist.float().cpu()
-    cross = cross_finger_negative_dist.float().cpu()
-
-    result = {
-        "pos_mean": float(positives.mean().item()),
-        "pos_p95": float(torch.quantile(positives, 0.95).item()),
-        "pos_p99": float(torch.quantile(positives, 0.99).item()),
-    }
-    result.update(_distance_metrics(positives, combined.reshape(-1)))
-    result.update(_ranking_metrics(positives, combined, margin, hard_negative_top_k))
-
-    for prefix, negatives in (("same_finger", same), ("cross_finger", cross)):
-        group_metrics = _distance_metrics(positives, negatives.reshape(-1))
-        group_metrics.update(_ranking_metrics(positives, negatives, margin, hard_negative_top_k))
-        result.update({f"{prefix}_{name}": value for name, value in group_metrics.items()})
     return result
 
 

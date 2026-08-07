@@ -16,7 +16,10 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import torch
 
-from hardnet_train.binary_loss import BinaryDescriptorLoss
+from hardnet_train.binary_loss import (
+    BINARY_METRIC_LOSS_DEFAULTS,
+    BinaryDescriptorLoss,
+)
 from hardnet_train.binary_model import (
     BinaryDescriptorModel,
     binary_model_metadata,
@@ -45,6 +48,7 @@ from hardnet_train.model import (
     count_parameters,
     normalize_model_architecture,
 )
+from hardnet_train.model_report import write_model_structure_report
 from hardnet_train.optim import (
     build_optimizer,
     normalize_optimizer_name,
@@ -53,6 +57,7 @@ from hardnet_train.optim import (
 from hardnet_train.train import (
     append_metrics,
     configure_cuda,
+    descriptor_loss_contract,
     load_config,
     make_loader,
     move_optimizer_state_to_device,
@@ -65,6 +70,7 @@ from hardnet_train.train import (
     scheduled_lr,
     set_optimizer_lr,
     set_seed,
+    train_augmentation_contract,
     validate_resume_negative_sampling_contract,
 )
 from hardnet_train.validation import (
@@ -214,6 +220,7 @@ def train_binary_one_epoch(
         "mean_abs_continuous",
         "pos_dist",
         "neg_dist",
+        "positive_tail_loss",
     )
     meters = {name: RunningMean() for name in meter_names}
     started = time.time()
@@ -302,6 +309,7 @@ def train_binary_one_epoch(
                 f"epoch={epoch} step={step}/{len(loader)} lr={lr:.6g} "
                 f"temperature={temperature:.4f} loss={meters['loss'].value:.4f} "
                 f"metric={meters['loss_metric'].value:.4f} "
+                f"pos_tail={meters['positive_tail_loss'].value:.4f} "
                 f"quant={meters['loss_quantization'].value:.4f} "
                 f"pos_hamming={meters['positive_hamming'].value:.4f} "
                 f"samples/s={meters['loss'].count / elapsed:.1f}",
@@ -341,6 +349,8 @@ def save_binary_checkpoint(
         "epoch": int(epoch),
         "global_step": int(global_step),
         "negative_sampling_contract": negative_sampling_contract(resolved_config),
+        "descriptor_loss_contract": descriptor_loss_contract(resolved_config),
+        "train_augmentation_contract": train_augmentation_contract(resolved_config),
         **metadata,
         "quantization_method": "tanh_ste_sign",
         "quantization_temperature": model.quantization_temperature,
@@ -448,6 +458,10 @@ def main() -> None:
     optim_cfg = config.setdefault("optimizer", {})
     validation_cfg = config.setdefault("validation", {})
     backbone_cfg = config.setdefault("backbone", {})
+    data_cfg = config.setdefault("data", {})
+    data_cfg["train_augmentation"] = train_augmentation_contract(config)
+    for name, value in BINARY_METRIC_LOSS_DEFAULTS.items():
+        train_cfg.setdefault(name, value)
 
     if args.epochs is not None:
         train_cfg["epochs"] = int(args.epochs)
@@ -507,6 +521,7 @@ def main() -> None:
     config["checkpoint_selection"] = normalize_checkpoint_selection_config(
         config.get("checkpoint_selection")
     )
+    configured_validation_fingers = validation_cfg["finger_count"]
     if (
         train_cfg["hard_negative_strategy"] == "different_finger"
         and isinstance(configured_validation_fingers, int)
@@ -543,7 +558,7 @@ def main() -> None:
         config,
         config.get(
             "output_dir",
-            "../outputs/models/hardnet_binary_256_fixed_in_batch_v1",
+            "../outputs/models/hardnet_binary_256_fixed_candidate_pool_v3",
         ),
     )
     resume_arg = "auto" if args.resume_auto else args.resume
@@ -642,6 +657,15 @@ def main() -> None:
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    model_profile, model_report_md, model_report_csv = write_model_structure_report(
+        model,
+        output_dir,
+    )
+    print(
+        f"saved model structure report to {model_report_md} and {model_report_csv} "
+        f"macs_per_patch={model_profile.macs_per_patch}",
+        flush=True,
+    )
     (output_dir / "resolved_config.json").write_text(
         json.dumps(
             {key: value for key, value in config.items() if key != "_config_path"},
@@ -659,6 +683,12 @@ def main() -> None:
         f"trainable_params={count_parameters(model)} optimizer={optimizer_name(optimizer)} "
         f"lr={optim_cfg['lr']} batch={batch_size} epochs={epochs} "
         f"steps_per_epoch={steps_per_epoch} temperature={temperature_start}->{temperature_end} "
+        f"metric_margin={criterion.metric_loss.margin} "
+        f"hard_negative_top_k={criterion.metric_loss.hard_negative_top_k} "
+        f"hard_negative_top1_weight={criterion.metric_loss.hard_negative_top1_weight} "
+        f"positive_tail_loss_weight={criterion.metric_loss.positive_tail_loss_weight} "
+        f"positive_tail_targets={criterion.metric_loss.positive_tail_p95_target}/"
+        f"{criterion.metric_loss.positive_tail_p99_target} "
         f"validation_fingers={validation_plan.finger_count} "
         f"validation_batches={validation_plan.batch_count} "
         f"validation_batch_size={validation_plan.batch_size} "

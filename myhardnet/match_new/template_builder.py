@@ -24,11 +24,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from match_new.descriptor_contract import (
+    BINARY_DESCRIPTOR_KIND,
     DESCRIPTOR_SCHEMA_VERSION,
     FLOAT32_STORAGE,
     FLOAT_DESCRIPTOR_KIND,
     L2_DISTANCE_METRIC,
-    require_l2_float_contract,
+    descriptor_columns,
+    require_supported_contract,
     resolve_descriptor_contract,
 )
 from match_new.runtime import (
@@ -80,12 +82,14 @@ def hardnet_template_payload(
     keypoints: list[cv2.KeyPoint],
     hardnet_descriptors: np.ndarray,
     overlap_image: np.ndarray,
+    *,
+    descriptor_kind: str = FLOAT_DESCRIPTOR_KIND,
+    descriptor_metric: str = L2_DISTANCE_METRIC,
+    descriptor_dim: int | None = None,
+    descriptor_storage: str = FLOAT32_STORAGE,
+    descriptor_bitorder: str = "",
 ) -> dict[str, Any]:
-    """构造注册阶段和在线解锁共用的内存模板结构。
-
-    该结构同时保留关键点几何信息、HardNet 描述子和纹理验证所需的灰度图。
-    在线查询直接使用返回的字典，不需要先写入再读取 ``.npz`` 文件。
-    """
+    """构造注册阶段和在线解锁共用的内存模板结构。"""
 
     xy = np.asarray([kp.pt for kp in keypoints], dtype=np.float32).reshape(-1, 2)
     gray = np.asarray(overlap_image)
@@ -93,7 +97,11 @@ def hardnet_template_payload(
         raise ValueError(f"overlap_image must be a 2D grayscale image, got {gray.shape}")
     if gray.dtype != np.uint8:
         gray = np.clip(gray, 0, 255).astype(np.uint8)
-    descriptors = np.asarray(hardnet_descriptors, dtype=np.float32)
+    kind = str(descriptor_kind).strip().lower()
+    descriptors = np.asarray(
+        hardnet_descriptors,
+        dtype=np.uint8 if kind == BINARY_DESCRIPTOR_KIND else np.float32,
+    )
     if descriptors.ndim != 2:
         raise ValueError(
             f"hardnet_descriptors must be [N,D], got {descriptors.shape}"
@@ -103,11 +111,13 @@ def hardnet_template_payload(
             "HardNet descriptor/keypoint row mismatch: "
             f"descriptors={descriptors.shape[0]}, keypoints={len(keypoints)}"
         )
-    descriptor_dim = int(descriptors.shape[1])
-    if descriptor_dim <= 0:
-        raise ValueError(f"HardNet descriptor dimension must be positive, got {descriptor_dim}")
-    return {
-        "template_format_version": 4,
+    dimension = int(
+        descriptor_dim if descriptor_dim is not None else descriptors.shape[1]
+    )
+    if dimension <= 0:
+        raise ValueError(f"HardNet descriptor dimension must be positive, got {dimension}")
+    template = {
+        "template_format_version": 5,
         "descriptor_schema_version": DESCRIPTOR_SCHEMA_VERSION,
         "identity_id": str(row["identity_id"]),
         "image_id": str(row["image_id"]),
@@ -120,10 +130,11 @@ def hardnet_template_payload(
         ),
         "keypoints_response": np.asarray([kp.response for kp in keypoints], dtype=np.float32),
         "hardnet_descriptors": descriptors,
-        "hardnet_descriptor_dim": descriptor_dim,
-        "hardnet_descriptor_kind": FLOAT_DESCRIPTOR_KIND,
-        "hardnet_descriptor_metric": L2_DISTANCE_METRIC,
-        "hardnet_descriptor_storage": FLOAT32_STORAGE,
+        "hardnet_descriptor_dim": dimension,
+        "hardnet_descriptor_kind": kind,
+        "hardnet_descriptor_metric": str(descriptor_metric).strip().lower(),
+        "hardnet_descriptor_storage": str(descriptor_storage).strip().lower(),
+        "hardnet_descriptor_bitorder": str(descriptor_bitorder).strip().lower(),
         "sift_descriptors": np.zeros((0, 128), dtype=np.float32),
         "overlap_image": gray,
         "template_path": "",
@@ -131,6 +142,15 @@ def hardnet_template_payload(
         "has_sift": False,
         "has_overlap_image": True,
     }
+    contract = resolve_descriptor_contract(template, "hardnet")
+    require_supported_contract(contract, label=str(row.get("image_id", "<memory>")))
+    expected_shape = (len(keypoints), descriptor_columns(contract))
+    if descriptors.shape != expected_shape:
+        raise ValueError(
+            "HardNet descriptor shape does not match its contract: "
+            f"descriptors={descriptors.shape}, expected={expected_shape}."
+        )
+    return template
 
 
 def save_hardnet_template_payload(output_path: str | Path, template: dict[str, Any]) -> Path:
@@ -139,12 +159,17 @@ def save_hardnet_template_payload(output_path: str | Path, template: dict[str, A
     target = Path(output_path).expanduser()
     ensure_dir(target.parent)
     contract = resolve_descriptor_contract(template, "hardnet")
-    require_l2_float_contract(contract, label=str(target))
-    descriptors = np.asarray(template["hardnet_descriptors"], dtype=np.float32)
-    if descriptors.ndim != 2 or descriptors.shape[1] != contract.dimension:
+    require_supported_contract(contract, label=str(target))
+    descriptors = np.asarray(
+        template["hardnet_descriptors"],
+        dtype=np.uint8 if contract.kind == BINARY_DESCRIPTOR_KIND else np.float32,
+    )
+    expected_columns = descriptor_columns(contract)
+    if descriptors.ndim != 2 or descriptors.shape[1] != expected_columns:
         raise ValueError(
             "HardNet template descriptor contract mismatch before save: "
-            f"path={target}, descriptors={descriptors.shape}, dimension={contract.dimension}."
+            f"path={target}, descriptors={descriptors.shape}, "
+            f"dimension={contract.dimension}, storage={contract.storage}."
         )
     np.savez_compressed(
         target,
@@ -176,6 +201,9 @@ def save_hardnet_template_payload(output_path: str | Path, template: dict[str, A
         ),
         hardnet_descriptor_storage=np.asarray(
             str(template.get("hardnet_descriptor_storage", FLOAT32_STORAGE))
+        ),
+        hardnet_descriptor_bitorder=np.asarray(
+            str(template.get("hardnet_descriptor_bitorder", ""))
         ),
         overlap_image=np.asarray(template["overlap_image"], dtype=np.uint8),
     )
@@ -254,6 +282,11 @@ def build_hardnet_template_from_image(
         selected_keypoints,
         hardnet_descriptors,
         image,
+        descriptor_kind=hardnet.descriptor_kind,
+        descriptor_metric=hardnet.descriptor_metric,
+        descriptor_dim=hardnet.descriptor_dim,
+        descriptor_storage=hardnet.descriptor_storage,
+        descriptor_bitorder=hardnet.descriptor_bitorder,
     )
     template_assembly_ms = (time.perf_counter() - started) * 1000.0
     template_total_ms = (time.perf_counter() - total_started) * 1000.0
@@ -312,8 +345,20 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
             raise ValueError(f"模板缺少描述子字段: {target}")
 
         n_xy = int(np.asarray(data["keypoints_xy"]).reshape(-1, 2).shape[0]) if "keypoints_xy" in keys else 0
+        saved_kind = (
+            str(np.asarray(data["hardnet_descriptor_kind"]).item()).strip().lower()
+            if "hardnet_descriptor_kind" in keys
+            else FLOAT_DESCRIPTOR_KIND
+        )
         hardnet = (
-            np.asarray(data["hardnet_descriptors"], dtype=np.float32)
+            np.asarray(
+                data["hardnet_descriptors"],
+                dtype=(
+                    np.uint8
+                    if saved_kind == BINARY_DESCRIPTOR_KIND
+                    else np.float32
+                ),
+            )
             if has_hardnet
             else np.zeros((0, 0), dtype=np.float32)
         )
@@ -326,6 +371,7 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
             "hardnet_descriptor_kind",
             "hardnet_descriptor_metric",
             "hardnet_descriptor_storage",
+            "hardnet_descriptor_bitorder",
         ):
             if field in keys:
                 hardnet_contract_source[field] = np.asarray(data[field]).item()
@@ -334,25 +380,30 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
                 hardnet_contract_source,
                 "hardnet",
             )
-            require_l2_float_contract(hardnet_contract, label=str(target))
+            require_supported_contract(hardnet_contract, label=str(target))
             hardnet_descriptor_dim = hardnet_contract.dimension
             hardnet_descriptor_kind = hardnet_contract.kind
             hardnet_descriptor_metric = hardnet_contract.metric
             hardnet_descriptor_storage = hardnet_contract.storage
+            hardnet_descriptor_bitorder = hardnet_contract.bitorder
+            expected_descriptor_columns = descriptor_columns(hardnet_contract)
         else:
             hardnet_descriptor_dim = 0
             hardnet_descriptor_kind = FLOAT_DESCRIPTOR_KIND
             hardnet_descriptor_metric = L2_DISTANCE_METRIC
             hardnet_descriptor_storage = FLOAT32_STORAGE
+            hardnet_descriptor_bitorder = ""
+            expected_descriptor_columns = 0
         if has_hardnet and (
             hardnet.ndim != 2
             or hardnet.shape[0] != n_xy
-            or hardnet.shape[1] != hardnet_descriptor_dim
+            or hardnet.shape[1] != expected_descriptor_columns
         ):
             raise ValueError(
                 "HardNet 模板描述子/关键点/元数据不一致: "
                 f"{target}: descriptors={hardnet.shape}, keypoints={n_xy}, "
-                f"descriptor_dim={hardnet_descriptor_dim}"
+                f"descriptor_dim={hardnet_descriptor_dim}, "
+                f"storage={hardnet_descriptor_storage}"
             )
         sift = (
             np.asarray(data["sift_descriptors"], dtype=np.float32)
@@ -374,6 +425,7 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
             "hardnet_descriptor_kind": hardnet_descriptor_kind,
             "hardnet_descriptor_metric": hardnet_descriptor_metric,
             "hardnet_descriptor_storage": hardnet_descriptor_storage,
+            "hardnet_descriptor_bitorder": hardnet_descriptor_bitorder,
             "sift_descriptors": sift,
             "overlap_image": np.asarray(data["overlap_image"], dtype=np.uint8) if "overlap_image" in keys else np.zeros((0, 0), dtype=np.uint8),
             "template_path": str(target),
@@ -471,9 +523,11 @@ def build_hardnet_templates(
         "errors": errors,
         "template_timings": timings,
         "descriptor_type": "hardnet",
-        "descriptor_kind": FLOAT_DESCRIPTOR_KIND,
-        "descriptor_metric": L2_DISTANCE_METRIC,
+        "descriptor_kind": hardnet.descriptor_kind,
+        "descriptor_metric": hardnet.descriptor_metric,
         "descriptor_dim": hardnet.descriptor_dim,
+        "descriptor_storage": hardnet.descriptor_storage,
+        "descriptor_bitorder": hardnet.descriptor_bitorder,
     }
 
 

@@ -12,11 +12,10 @@ from typing import Any
 DEFAULT_CHECKPOINT_SELECTION = {
     "strategy": "matching_composite_v1",
     "weights": {
-        "false_acceptance": 0.45,
-        "low_fpr_recall": 0.20,
-        "hard_negative_recall": 0.15,
-        "mean_gap": 0.10,
-        "tail_gap": 0.10,
+        "loss": 0.30,
+        "distance_gap": 0.20,
+        "fpr_at_tpr95": 0.35,
+        "pos_p95": 0.15,
     },
 }
 
@@ -36,6 +35,14 @@ def normalize_checkpoint_selection_config(
     raw_weights = raw.get("weights", {})
     if not isinstance(raw_weights, Mapping):
         raise ValueError("checkpoint_selection.weights must be a mapping.")
+    expected_weight_names = set(DEFAULT_CHECKPOINT_SELECTION["weights"])
+    unknown_weight_names = sorted(set(raw_weights) - expected_weight_names)
+    if unknown_weight_names:
+        raise ValueError(
+            "Unsupported checkpoint_selection weight names: "
+            f"{unknown_weight_names}. Supported names are "
+            f"{sorted(expected_weight_names)}."
+        )
     weights = {
         name: float(raw_weights.get(name, default))
         for name, default in DEFAULT_CHECKPOINT_SELECTION["weights"].items()
@@ -57,24 +64,6 @@ def _finite_metric(metrics: Mapping[str, Any], name: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def _worst_case_metric(
-    metrics: Mapping[str, Any],
-    name: str,
-    *,
-    lower_is_better: bool,
-) -> float | None:
-    """优先采用同指/跨指两组的最差值；没有分组时回退到总体值。"""
-
-    candidates = [
-        _finite_metric(metrics, f"same_finger_{name}"),
-        _finite_metric(metrics, f"cross_finger_{name}"),
-    ]
-    candidates = [value for value in candidates if value is not None]
-    if not candidates:
-        return _finite_metric(metrics, name)
-    return min(candidates) if lower_is_better else max(candidates)
-
-
 def _unit_interval(value: float | None, *, lower_is_better: bool = False) -> float:
     if value is None:
         return 0.0
@@ -82,16 +71,29 @@ def _unit_interval(value: float | None, *, lower_is_better: bool = False) -> flo
     return 1.0 - bounded if lower_is_better else bounded
 
 
+def _validation_margin(
+    config: Mapping[str, Any] | None,
+    descriptor_metric: str,
+) -> float:
+    section_name = (
+        "validation"
+        if descriptor_metric in {"hamming", "binary_hamming"}
+        else "training"
+    )
+    default = 0.2 if section_name == "validation" else 1.0
+    section = config.get(section_name, {}) if isinstance(config, Mapping) else {}
+    raw_margin = section.get("margin", default) if isinstance(section, Mapping) else default
+    margin = float(raw_margin)
+    if not math.isfinite(margin) or margin < 0.0:
+        raise ValueError(f"{section_name}.margin must be finite and non-negative.")
+    return margin
+
+
 def checkpoint_selection_metrics(
     validation_metrics: Mapping[str, Any],
     config: Mapping[str, Any] | None = None,
 ) -> dict[str, float]:
-    """从一次验证结果生成可解释、越高越好的综合选择分数。
-
-    选择目标对应部署中的三层行为：误接受安全性、低误报区间的召回，
-    以及正负描述子距离的可分性。same/cross-finger 使用最差分项，避免
-    某一类负样本变差时被另一类样本的平均值掩盖。
-    """
+    """由四项总体验证指标生成唯一的、越高越好的 checkpoint 分数。"""
 
     selection_config = normalize_checkpoint_selection_config(
         config.get("checkpoint_selection") if isinstance(config, Mapping) else None
@@ -101,61 +103,33 @@ def checkpoint_selection_metrics(
         config.get("descriptor_metric", "l2") if isinstance(config, Mapping) else "l2"
     ).strip().lower()
     distance_cap = 1.0 if descriptor_metric in {"hamming", "binary_hamming"} else 2.0
+    loss_cap = distance_cap + _validation_margin(config, descriptor_metric)
 
-    fpr = _worst_case_metric(
-        validation_metrics,
-        "fpr_at_tpr95",
-        lower_is_better=True,
-    )
-    low_fpr_recall = _worst_case_metric(
-        validation_metrics,
-        "tpr_at_fpr_1e_4",
-        lower_is_better=False,
-    )
-    hard_negative_recall = _worst_case_metric(
-        validation_metrics,
-        "recall_at_1",
-        lower_is_better=False,
-    )
+    validation_loss = _finite_metric(validation_metrics, "loss")
     positive_mean = _finite_metric(validation_metrics, "pos_mean")
-    negative_mean = _worst_case_metric(
-        validation_metrics,
-        "neg_mean",
-        lower_is_better=False,
-    )
-    mean_gap = (
+    negative_mean = _finite_metric(validation_metrics, "neg_mean")
+    distance_gap = (
         None
         if positive_mean is None or negative_mean is None
         else (negative_mean - positive_mean) / distance_cap
     )
+    fpr = _finite_metric(validation_metrics, "fpr_at_tpr95")
     positive_p95 = _finite_metric(validation_metrics, "pos_p95")
-    negative_p01 = _worst_case_metric(
-        validation_metrics,
-        "neg_p01",
-        lower_is_better=False,
-    )
-    tail_gap = (
-        None
-        if positive_p95 is None or negative_p01 is None
-        else (negative_p01 - positive_p95) / distance_cap
-    )
 
     components = {
-        "false_acceptance": _unit_interval(fpr, lower_is_better=True),
-        "low_fpr_recall": _unit_interval(low_fpr_recall),
-        "hard_negative_recall": _unit_interval(hard_negative_recall),
-        "mean_gap": _unit_interval(mean_gap),
-        "tail_gap": _unit_interval(tail_gap),
+        "loss": _unit_interval(
+            None if validation_loss is None else validation_loss / loss_cap,
+            lower_is_better=True,
+        ),
+        "distance_gap": _unit_interval(distance_gap),
+        "fpr_at_tpr95": _unit_interval(fpr, lower_is_better=True),
+        "pos_p95": _unit_interval(
+            None if positive_p95 is None else positive_p95 / distance_cap,
+            lower_is_better=True,
+        ),
     }
     score = sum(weights[name] * components[name] for name in weights)
-    result = {
-        "checkpoint_selection_score": float(score),
-        **{
-            f"checkpoint_selection_{name}": float(value)
-            for name, value in components.items()
-        },
-    }
-    return result
+    return {"checkpoint_selection_score": float(score)}
 
 
 def checkpoint_selection_state_from_metrics(
@@ -178,7 +152,7 @@ def checkpoint_selection_state_from_metrics(
     if not scores:
         raise ValueError(
             "Existing metrics.csv has no val_checkpoint_selection_score. "
-            "Start a new output directory; old single-metric runs cannot be resumed "
+            "Start a new output directory; old selection runs cannot be resumed "
             "under matching_composite_v1."
         )
     last = rows[-1]

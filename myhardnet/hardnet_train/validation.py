@@ -269,12 +269,13 @@ def make_fixed_validation_loader(
 
 @dataclass(frozen=True)
 class InBatchValidationDistances:
-    """一个验证 batch 的正距离、实际 top-k 负距离及候选类型。"""
+    """一个验证 batch 的正距离、完整候选池及 top-k 排名距离。"""
 
     positive_dist: torch.Tensor
+    candidate_dist: torch.Tensor
+    candidate_mask: torch.Tensor
     selected_negative_dist: torch.Tensor
     selected_negative_mask: torch.Tensor
-    selected_negative_is_same_finger: torch.Tensor
     valid_anchor: torch.Tensor
 
 
@@ -285,11 +286,10 @@ def detach_validation_distances_to_cpu(
 
     return InBatchValidationDistances(
         positive_dist=batch.positive_dist.detach().cpu(),
+        candidate_dist=batch.candidate_dist.detach().cpu(),
+        candidate_mask=batch.candidate_mask.detach().cpu(),
         selected_negative_dist=batch.selected_negative_dist.detach().cpu(),
         selected_negative_mask=batch.selected_negative_mask.detach().cpu(),
-        selected_negative_is_same_finger=(
-            batch.selected_negative_is_same_finger.detach().cpu()
-        ),
         valid_anchor=batch.valid_anchor.detach().cpu(),
     )
 
@@ -300,34 +300,34 @@ def summarize_in_batch_validation(
     margin: float,
     plan: FixedValidationBatchPlan,
 ) -> dict[str, float]:
-    """合并可变候选数的 batch；无候选 anchor 只计数，不中止验证。"""
+    """固定候选池计算 ROC，动态 top-k 只计算 margin loss 诊断。"""
 
     if not batches:
         raise RuntimeError("Fixed validation loader produced no batches.")
 
     positive_parts: list[torch.Tensor] = []
-    negative_parts: list[torch.Tensor] = []
-    negative_anchor_parts: list[torch.Tensor] = []
-    negative_same_parts: list[torch.Tensor] = []
+    candidate_parts: list[torch.Tensor] = []
+    candidate_mask_parts: list[torch.Tensor] = []
+    selected_parts: list[torch.Tensor] = []
+    selected_mask_parts: list[torch.Tensor] = []
+    selected_anchor_parts: list[torch.Tensor] = []
     valid_anchor_count = 0
     skipped_anchor_count = 0
 
     for batch in batches:
         positive = batch.positive_dist.detach().float().cpu().reshape(-1)
-        selected_negative = (
-            batch.selected_negative_dist.detach().float().cpu()
-        )
+        candidate = batch.candidate_dist.detach().float().cpu()
+        candidate_mask = batch.candidate_mask.detach().bool().cpu()
+        selected = batch.selected_negative_dist.detach().float().cpu()
         selected_mask = batch.selected_negative_mask.detach().bool().cpu()
-        selected_same = (
-            batch.selected_negative_is_same_finger.detach().bool().cpu()
-        )
         valid_anchor = batch.valid_anchor.detach().bool().cpu().reshape(-1)
         batch_size = int(positive.numel())
-        if selected_negative.ndim != 2:
-            raise ValueError("selected_negative_dist must have shape [batch, top_k].")
-        expected_shape = selected_negative.shape
-        if selected_mask.shape != expected_shape or selected_same.shape != expected_shape:
-            raise ValueError("Selected negative distances, masks and types must align.")
+        if candidate.ndim != 2 or selected.ndim != 2:
+            raise ValueError("Candidate and selected distances must be two-dimensional.")
+        if candidate_mask.shape != candidate.shape:
+            raise ValueError("Candidate distances and masks must align.")
+        if selected_mask.shape != selected.shape:
+            raise ValueError("Selected negative distances and masks must align.")
         if valid_anchor.numel() != batch_size:
             raise ValueError("valid_anchor length must match positive_dist length.")
 
@@ -336,22 +336,20 @@ def summarize_in_batch_validation(
         if valid_rows.numel() == 0:
             continue
 
-        local_to_global = torch.full((batch_size,), -1, dtype=torch.long)
-        local_to_global[valid_rows] = torch.arange(
+        global_anchor_index = torch.arange(
             valid_anchor_count,
             valid_anchor_count + int(valid_rows.numel()),
             dtype=torch.long,
         )
         valid_anchor_count += int(valid_rows.numel())
         positive_parts.append(positive[valid_rows])
-
-        usable_mask = selected_mask & valid_anchor[:, None]
-        local_anchor_index = torch.arange(batch_size)[:, None].expand_as(
-            usable_mask
-        )[usable_mask]
-        negative_parts.append(selected_negative[usable_mask])
-        negative_same_parts.append(selected_same[usable_mask])
-        negative_anchor_parts.append(local_to_global[local_anchor_index])
+        candidate_parts.append(candidate[valid_rows])
+        candidate_mask_parts.append(candidate_mask[valid_rows])
+        selected_parts.append(selected[valid_rows])
+        selected_mask_parts.append(selected_mask[valid_rows])
+        selected_anchor_parts.append(
+            global_anchor_index[:, None].expand_as(selected[valid_rows])
+        )
 
     if valid_anchor_count == 0:
         raise RuntimeError(
@@ -361,14 +359,18 @@ def summarize_in_batch_validation(
         )
 
     positive_dist = torch.cat(positive_parts)
-    negative_dist = torch.cat(negative_parts)
-    negative_anchor_index = torch.cat(negative_anchor_parts)
-    negative_is_same_finger = torch.cat(negative_same_parts)
+    candidate_dist = torch.cat(candidate_parts)
+    candidate_mask = torch.cat(candidate_mask_parts)
+    selected_negative_dist = torch.cat(selected_parts)
+    selected_negative_mask = torch.cat(selected_mask_parts)
+    selected_negative_anchor_index = torch.cat(selected_anchor_parts)
     metrics = in_batch_descriptor_validation_metrics(
         positive_dist=positive_dist,
-        negative_dist=negative_dist,
-        negative_anchor_index=negative_anchor_index,
-        negative_is_same_finger=negative_is_same_finger,
+        candidate_dist=candidate_dist,
+        candidate_mask=candidate_mask,
+        selected_negative_dist=selected_negative_dist,
+        selected_negative_mask=selected_negative_mask,
+        selected_negative_anchor_index=selected_negative_anchor_index,
         margin=float(margin),
         valid_anchor_count=valid_anchor_count,
         skipped_anchor_count=skipped_anchor_count,
@@ -380,8 +382,6 @@ def summarize_in_batch_validation(
             "configured_batch_count": float(plan.batch_count),
             "configured_batch_size": float(plan.batch_size),
             "planned_positive_count": float(plan.positive_count),
-            "hard_negative_count_mean": float(negative_dist.numel())
-            / float(valid_anchor_count),
         }
     )
     return metrics
@@ -441,11 +441,10 @@ def evaluate_fixed_validation_batches(
             detach_validation_distances_to_cpu(
                 InBatchValidationDistances(
                     positive_dist=stats["pos_dist"],
+                    candidate_dist=stats["candidate_dist"],
+                    candidate_mask=stats["candidate_mask"],
                     selected_negative_dist=stats["selected_negative_dist"],
                     selected_negative_mask=stats["selected_negative_mask"],
-                    selected_negative_is_same_finger=stats[
-                        "selected_negative_is_same_finger"
-                    ],
                     valid_anchor=stats["valid_triplets"],
                 )
             )

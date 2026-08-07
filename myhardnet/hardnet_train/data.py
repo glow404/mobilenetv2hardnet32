@@ -18,13 +18,14 @@ import csv
 import math
 import random
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter
 from torch.utils.data import Dataset, Sampler
 
 
@@ -54,6 +55,146 @@ class PairRecord:
     pair_id: str
     source: str
     stability_score: float
+
+
+@dataclass(frozen=True)
+class PatchAugmentationConfig:
+    """方向对齐后的 32×32 patch 使用的轻量在线增强。"""
+
+    enabled: bool = False
+    probability: float = 0.8
+    max_rotation_degrees: float = 5.0
+    max_translation_pixels: float = 1.0
+    scale_jitter: float = 0.03
+    contrast_jitter: float = 0.10
+    gamma_jitter: float = 0.10
+    blur_probability: float = 0.15
+    max_blur_radius: float = 0.40
+    noise_probability: float = 0.25
+    max_noise_std: float = 2.0
+
+    @classmethod
+    def from_mapping(
+        cls,
+        config: Mapping[str, Any] | None,
+    ) -> PatchAugmentationConfig:
+        values = dict(config or {})
+        augmentation = cls(
+            enabled=bool(values.get("enabled", False)),
+            probability=float(values.get("probability", 0.8)),
+            max_rotation_degrees=float(values.get("max_rotation_degrees", 5.0)),
+            max_translation_pixels=float(values.get("max_translation_pixels", 1.0)),
+            scale_jitter=float(values.get("scale_jitter", 0.03)),
+            contrast_jitter=float(values.get("contrast_jitter", 0.10)),
+            gamma_jitter=float(values.get("gamma_jitter", 0.10)),
+            blur_probability=float(values.get("blur_probability", 0.15)),
+            max_blur_radius=float(values.get("max_blur_radius", 0.40)),
+            noise_probability=float(values.get("noise_probability", 0.25)),
+            max_noise_std=float(values.get("max_noise_std", 2.0)),
+        )
+        augmentation.validate()
+        return augmentation
+
+    def validate(self) -> None:
+        for name in ("probability", "blur_probability", "noise_probability"):
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"train_augmentation.{name} must be in [0, 1], got {value}.")
+        for name in (
+            "max_rotation_degrees",
+            "max_translation_pixels",
+            "scale_jitter",
+            "contrast_jitter",
+            "gamma_jitter",
+            "max_blur_radius",
+            "max_noise_std",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"train_augmentation.{name} must be finite and non-negative, got {value}."
+                )
+        for name in ("scale_jitter", "contrast_jitter", "gamma_jitter"):
+            value = float(getattr(self, name))
+            if value >= 1.0:
+                raise ValueError(f"train_augmentation.{name} must be < 1, got {value}.")
+
+    def as_dict(self) -> dict[str, bool | float]:
+        return {
+            "enabled": self.enabled,
+            "probability": self.probability,
+            "max_rotation_degrees": self.max_rotation_degrees,
+            "max_translation_pixels": self.max_translation_pixels,
+            "scale_jitter": self.scale_jitter,
+            "contrast_jitter": self.contrast_jitter,
+            "gamma_jitter": self.gamma_jitter,
+            "blur_probability": self.blur_probability,
+            "max_blur_radius": self.max_blur_radius,
+            "noise_probability": self.noise_probability,
+            "max_noise_std": self.max_noise_std,
+        }
+
+
+def _symmetric_jitter(maximum: float) -> float:
+    return random.uniform(-float(maximum), float(maximum)) if maximum > 0.0 else 0.0
+
+
+def augment_patch(
+    patch: np.ndarray,
+    config: PatchAugmentationConfig,
+) -> np.ndarray:
+    """在标准化前对单个灰度 patch 施加轻微、独立的随机扰动。"""
+
+    if not config.enabled or random.random() >= config.probability:
+        return np.asarray(patch, dtype=np.float32)
+    if patch.ndim != 2:
+        raise ValueError(f"Patch augmentation expects a 2D grayscale image, got {patch.shape}.")
+
+    values = np.clip(np.asarray(patch, dtype=np.float32), 0.0, 255.0)
+    height, width = values.shape
+    angle = math.radians(_symmetric_jitter(config.max_rotation_degrees))
+    translation_x = _symmetric_jitter(config.max_translation_pixels)
+    translation_y = _symmetric_jitter(config.max_translation_pixels)
+    scale = 1.0 + _symmetric_jitter(config.scale_jitter)
+    cosine = math.cos(angle) / scale
+    sine = math.sin(angle) / scale
+    center_x = (float(width) - 1.0) / 2.0
+    center_y = (float(height) - 1.0) / 2.0
+    affine = (
+        cosine,
+        sine,
+        center_x - cosine * (center_x + translation_x) - sine * (center_y + translation_y),
+        -sine,
+        cosine,
+        center_y + sine * (center_x + translation_x) - cosine * (center_y + translation_y),
+    )
+    image = Image.fromarray(values.astype(np.uint8), mode="L")
+    image = image.transform(
+        (width, height),
+        Image.Transform.AFFINE,
+        affine,
+        resample=Image.Resampling.BILINEAR,
+        fillcolor=int(round(float(np.median(values)))),
+    )
+    if config.max_blur_radius > 0.0 and random.random() < config.blur_probability:
+        image = image.filter(
+            ImageFilter.GaussianBlur(
+                radius=random.uniform(0.0, config.max_blur_radius)
+            )
+        )
+
+    values = np.asarray(image, dtype=np.float32)
+    if config.contrast_jitter > 0.0:
+        contrast = 1.0 + _symmetric_jitter(config.contrast_jitter)
+        mean = float(values.mean())
+        values = (values - mean) * contrast + mean
+    if config.gamma_jitter > 0.0:
+        gamma = 1.0 + _symmetric_jitter(config.gamma_jitter)
+        values = 255.0 * np.power(np.clip(values, 0.0, 255.0) / 255.0, gamma)
+    if config.max_noise_std > 0.0 and random.random() < config.noise_probability:
+        noise_std = random.uniform(0.0, config.max_noise_std)
+        values = values + np.random.normal(0.0, noise_std, size=values.shape)
+    return np.clip(values, 0.0, 255.0).astype(np.float32, copy=False)
 
 
 class UnionFind:
@@ -135,9 +276,15 @@ class FingerprintPairDataset(Dataset):
         max_rows: int | None = None,
         max_rows_per_finger: int | None = None,
         normalize: bool = True,
+        augmentation: Mapping[str, Any] | PatchAugmentationConfig | None = None,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.normalize = bool(normalize)
+        self.augmentation = (
+            augmentation
+            if isinstance(augmentation, PatchAugmentationConfig)
+            else PatchAugmentationConfig.from_mapping(augmentation)
+        )
 
         # rows 暂存被采纳的 CSV 行。先扫描并建立 union-find，再生成 PairRecord；
         # 因为 point_group 需要等所有正样本边都合并完才能确定。
@@ -264,7 +411,9 @@ class FingerprintPairDataset(Dataset):
             path = record.patch_p_path
         else:
             raise ValueError(f"Unsupported patch side: {side!r}")
-        patch = self._normalize_patch(self._read_patch(path))[None, :, :]
+        patch = self._read_patch(path)
+        patch = augment_patch(patch, self.augmentation)
+        patch = self._normalize_patch(patch)[None, :, :]
         return torch.from_numpy(np.ascontiguousarray(patch, dtype=np.float32))
 
     def __getitem__(self, index: int) -> dict[str, object]:

@@ -1,4 +1,4 @@
-"""HardNet L2 手机解锁式指纹验证主入口。
+"""HardNet 浮点/二值手机解锁式指纹验证主入口。
 
 作用：
     1. 扫描原始指纹图像目录，构建每张图像的 `.npz` 模板；
@@ -38,7 +38,14 @@ from hardnet_train.model import (
     checkpoint_model_architecture,
 )
 from match_new.descriptor_contract import (
-    require_l2_float_contract,
+    BINARY_DESCRIPTOR_KIND,
+    FLOAT32_STORAGE,
+    FLOAT_DESCRIPTOR_KIND,
+    HAMMING_DISTANCE_METRIC,
+    L2_DISTANCE_METRIC,
+    PACKED_UINT8_STORAGE,
+    descriptor_columns,
+    require_supported_contract,
     resolve_descriptor_contract,
 )
 from match_new.evaluation import run_hardnet_evaluation, summary_row
@@ -192,7 +199,7 @@ def parse_args() -> argparse.Namespace:
     """解析命令行参数。默认值都在配置文件中；这里只提供覆盖项。"""
 
     parser = argparse.ArgumentParser(
-        description="运行 HardNet L2 手机指纹解锁离线评估；默认参数来自 --config 指定的 YAML。",
+        description="运行 HardNet 浮点/L2 或二值/Hamming 手机指纹解锁离线评估；默认参数来自 --config 指定的 YAML。",
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="配置文件路径。")
     parser.add_argument("--image-root", "--image_root", dest="image_root", default=None, help="覆盖 data.image_root。")
@@ -307,54 +314,40 @@ def limit_rows_for_debug(rows: list[dict[str, str]], limit_identities: int, limi
     return selected
 
 
-def resolve_expected_descriptor_dim(
-    config: dict[str, Any],
-    checkpoint_path: str | Path,
-) -> int:
-    """从 checkpoint 解析 HardNet 维度，并校验可选的显式配置。"""
+def checkpoint_descriptor_metadata(
+    checkpoint: Mapping[str, Any],
+) -> dict[str, Any]:
+    """从浮点或二值 checkpoint 解析统一描述子元数据。"""
 
-    target = Path(checkpoint_path).expanduser()
-    configured = dict(config.get("model", {})).get("descriptor_dim", "auto")
-    configured_text = str(configured if configured is not None else "").strip().lower()
-    if not target.exists():
-        if configured_text in {"", "auto"}:
-            raise FileNotFoundError(
-                "Cannot infer descriptor dimension without checkpoint or explicit "
-                f"model.descriptor_dim: {target}"
-            )
-        return int(configured_text)
-
-    checkpoint = torch.load(target, map_location="cpu")
-    if not isinstance(checkpoint, Mapping):
-        raise ValueError(f"Unsupported checkpoint format: {target}")
-    descriptor_kind = str(checkpoint.get("descriptor_kind", "float")).strip().lower()
-    descriptor_metric = str(checkpoint.get("descriptor_metric", "l2")).strip().lower()
-    if descriptor_kind != "float" or descriptor_metric != "l2":
+    kind = str(checkpoint.get("descriptor_kind", FLOAT_DESCRIPTOR_KIND)).strip().lower()
+    metric = str(checkpoint.get("descriptor_metric", L2_DISTANCE_METRIC)).strip().lower()
+    if (kind, metric) not in {
+        (FLOAT_DESCRIPTOR_KIND, L2_DISTANCE_METRIC),
+        (BINARY_DESCRIPTOR_KIND, HAMMING_DISTANCE_METRIC),
+    }:
         raise ValueError(
-            "HardNet L2 matching requires a float/L2 checkpoint: "
-            f"kind={descriptor_kind}, metric={descriptor_metric}, path={target}."
+            f"Unsupported checkpoint descriptor contract: kind={kind}, metric={metric}."
         )
-    checkpoint_dim = checkpoint_descriptor_dim(checkpoint)
-    if configured_text not in {"", "auto"} and int(configured_text) != checkpoint_dim:
-        raise ValueError(
-            "Configured descriptor dimension does not match checkpoint: "
-            f"config={int(configured_text)}, checkpoint={checkpoint_dim}."
+    dimension = checkpoint_descriptor_dim(checkpoint)
+    if kind == BINARY_DESCRIPTOR_KIND:
+        architecture = str(
+            checkpoint.get("model_architecture", "residual_binary_hash_v1")
         )
-    return checkpoint_dim
-
-
-def resolve_checkpoint_metadata(checkpoint_path: str | Path) -> dict[str, Any]:
-    """读取 checkpoint 的架构与维度元数据，并兼容旧 HardNet checkpoint。"""
-
-    target = Path(checkpoint_path).expanduser()
-    checkpoint = torch.load(target, map_location="cpu")
-    if not isinstance(checkpoint, Mapping):
-        raise ValueError(f"Unsupported checkpoint format: {target}")
+        storage = str(
+            checkpoint.get("binary_storage", PACKED_UINT8_STORAGE)
+        ).strip().lower()
+        bitorder = str(checkpoint.get("binary_bitorder", "little")).strip().lower()
+    else:
+        architecture = checkpoint_model_architecture(checkpoint)
+        storage = FLOAT32_STORAGE
+        bitorder = ""
     return {
-        "model_architecture": checkpoint_model_architecture(checkpoint),
-        "descriptor_kind": str(checkpoint.get("descriptor_kind", "float")),
-        "descriptor_metric": str(checkpoint.get("descriptor_metric", "l2")),
-        "descriptor_dim": checkpoint_descriptor_dim(checkpoint),
+        "model_architecture": architecture,
+        "descriptor_kind": kind,
+        "descriptor_metric": metric,
+        "descriptor_dim": dimension,
+        "descriptor_storage": storage,
+        "descriptor_bitorder": bitorder,
         "epoch": checkpoint.get("epoch"),
         "global_step": checkpoint.get("global_step"),
         "model_parameter_count": checkpoint.get("model_parameter_count"),
@@ -362,14 +355,104 @@ def resolve_checkpoint_metadata(checkpoint_path: str | Path) -> dict[str, Any]:
     }
 
 
+def validate_configured_descriptor(
+    config: dict[str, Any],
+    metadata: Mapping[str, Any],
+) -> None:
+    """将配置中的显式描述子选项作为 checkpoint 契约断言。"""
+
+    model_cfg = dict(config.get("model", {}))
+    matching_cfg = dict(config.get("matching", {}))
+    checks = {
+        "model.descriptor_kind": (
+            model_cfg.get("descriptor_kind", "auto"),
+            metadata["descriptor_kind"],
+        ),
+        "matching.distance": (
+            matching_cfg.get("distance", "auto"),
+            metadata["descriptor_metric"],
+        ),
+    }
+    for field, (configured, actual) in checks.items():
+        value = str(configured if configured is not None else "").strip().lower()
+        if value == "euclidean":
+            value = L2_DISTANCE_METRIC
+        if value not in {"", "auto", str(actual).lower()}:
+            raise ValueError(
+                f"{field} does not match checkpoint: config={value}, checkpoint={actual}."
+            )
+    configured_dim = str(
+        model_cfg.get("descriptor_dim", "auto")
+    ).strip().lower()
+    if configured_dim not in {"", "auto"} and int(configured_dim) != int(
+        metadata["descriptor_dim"]
+    ):
+        raise ValueError(
+            "model.descriptor_dim does not match checkpoint: "
+            f"config={configured_dim}, checkpoint={metadata['descriptor_dim']}."
+        )
+    if metadata["descriptor_kind"] == BINARY_DESCRIPTOR_KIND:
+        configured_storage = str(
+            model_cfg.get("binary_storage", "auto")
+        ).strip().lower()
+        configured_bitorder = str(
+            model_cfg.get("binary_bitorder", "auto")
+        ).strip().lower()
+        if configured_storage not in {
+            "",
+            "auto",
+            str(metadata["descriptor_storage"]).lower(),
+        }:
+            raise ValueError(
+                "model.binary_storage does not match checkpoint: "
+                f"config={configured_storage}, checkpoint={metadata['descriptor_storage']}."
+            )
+        if configured_bitorder not in {
+            "",
+            "auto",
+            str(metadata["descriptor_bitorder"]).lower(),
+        }:
+            raise ValueError(
+                "model.binary_bitorder does not match checkpoint: "
+                f"config={configured_bitorder}, checkpoint={metadata['descriptor_bitorder']}."
+            )
+
+
+def resolve_expected_descriptor_dim(
+    config: dict[str, Any],
+    checkpoint_path: str | Path,
+) -> int:
+    """从 checkpoint 解析描述子维度并校验显式配置。"""
+
+    target = Path(checkpoint_path).expanduser()
+    if not target.exists():
+        raise FileNotFoundError(f"Descriptor checkpoint does not exist: {target}")
+    checkpoint = torch.load(target, map_location="cpu")
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"Unsupported checkpoint format: {target}")
+    metadata = checkpoint_descriptor_metadata(checkpoint)
+    validate_configured_descriptor(config, metadata)
+    return int(metadata["descriptor_dim"])
+
+
+def resolve_checkpoint_metadata(checkpoint_path: str | Path) -> dict[str, Any]:
+    """读取浮点或二值 checkpoint 的统一元数据。"""
+
+    target = Path(checkpoint_path).expanduser()
+    checkpoint = torch.load(target, map_location="cpu")
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"Unsupported checkpoint format: {target}")
+    return checkpoint_descriptor_metadata(checkpoint)
+
+
 def validate_templates(
     template_dir: str | Path,
     rows: list[dict[str, str]],
     config: dict[str, Any],
-    descriptor_dim: int,
+    descriptor_metadata: Mapping[str, Any],
     max_checks: int = 10,
 ) -> dict[str, Any]:
-    """抽样检查模板字段是否与 keypoints 和 checkpoint 维度一致。"""
+    """抽样检查模板字段是否与 checkpoint 描述子契约一致。"""
 
     require_overlap_image = bool(dict(config.get("texture_verification", {})).get("enabled", False))
     checked = 0
@@ -378,13 +461,27 @@ def validate_templates(
         n = int(template["keypoints_xy"].shape[0])
         hardnet = template["hardnet_descriptors"]
         contract = resolve_descriptor_contract(template, "hardnet")
-        require_l2_float_contract(contract, label=str(template.get("template_path", row["image_id"])))
-        if contract.dimension != int(descriptor_dim):
+        require_supported_contract(
+            contract,
+            label=str(template.get("template_path", row["image_id"])),
+        )
+        actual = {
+            "descriptor_kind": contract.kind,
+            "descriptor_metric": contract.metric,
+            "descriptor_dim": contract.dimension,
+            "descriptor_storage": contract.storage,
+            "descriptor_bitorder": contract.bitorder,
+        }
+        expected = {
+            field: descriptor_metadata[field]
+            for field in actual
+        }
+        if actual != expected:
             raise ValueError(
-                f"HardNet dimension metadata mismatch for {row['image_id']}: "
-                f"template={contract.dimension}, checkpoint={descriptor_dim}"
+                f"Template/checkpoint descriptor mismatch for {row['image_id']}: "
+                f"template={actual}, checkpoint={expected}. Rebuild templates."
             )
-        expected_shape = (n, contract.dimension)
+        expected_shape = (n, descriptor_columns(contract))
         if hardnet.shape != expected_shape:
             raise ValueError(
                 f"HardNet shape mismatch for {row['image_id']}: "
@@ -404,9 +501,16 @@ def validate_templates(
         "patch_crop_size": int(patch_cfg.get("crop_size", 32)),
         "patch_out_size": int(patch_cfg.get("out_size", 32)),
         "descriptor_type": "hardnet",
-        "descriptor_kind": "float",
-        "descriptor_metric": "l2",
-        "descriptor_dim": int(descriptor_dim),
+        **{
+            field: descriptor_metadata[field]
+            for field in (
+                "descriptor_kind",
+                "descriptor_metric",
+                "descriptor_dim",
+                "descriptor_storage",
+                "descriptor_bitorder",
+            )
+        },
         "evaluation_dataset": image_root.name,
         "image_root": str(image_root),
         "overlap_image_required": require_overlap_image,
@@ -421,23 +525,17 @@ def main() -> None:
     apply_overrides(config, args)
     settings = resolve_run_settings(config)
     checkpoint = resolve_path(config, dict(config.get("model", {}))["checkpoint"])
-    if not checkpoint.exists() and not settings["skip_template_build"]:
-        raise FileNotFoundError(f"HardNet checkpoint does not exist: {checkpoint}")
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"Descriptor checkpoint does not exist: {checkpoint}")
     descriptor_dim = resolve_expected_descriptor_dim(config, checkpoint)
-    checkpoint_metadata = (
-        resolve_checkpoint_metadata(checkpoint)
-        if checkpoint.exists()
-        else {
-            "model_architecture": dict(config.get("model", {})).get("architecture", "unavailable"),
-            "descriptor_kind": "float",
-            "descriptor_metric": "l2",
-            "descriptor_dim": int(descriptor_dim),
-            "epoch": None,
-            "global_step": None,
-            "model_parameter_count": None,
-            "model_macs_per_patch": None,
-        }
+    checkpoint_metadata = resolve_checkpoint_metadata(checkpoint)
+    descriptor_metric = str(checkpoint_metadata["descriptor_metric"])
+    config.setdefault("model", {})["descriptor_kind"] = str(
+        checkpoint_metadata["descriptor_kind"]
     )
+    config.setdefault("matching", {})["distance"] = descriptor_metric
+    eval_dir_name = f"eval_hardnet_{descriptor_metric}"
+    summary_stem = f"hardnet_{descriptor_metric}_summary"
 
     image_root = resolve_path(
         config,
@@ -482,7 +580,7 @@ def main() -> None:
         template_dir,
         success_rows,
         config,
-        descriptor_dim=descriptor_dim,
+        descriptor_metadata=checkpoint_metadata,
     )
 
     # 3. 固定随机种子，为每个 identity 选择注册模板，其余作为 query。
@@ -503,7 +601,7 @@ def main() -> None:
         identity_templates_path=identity_templates_path,
         template_dir=template_dir,
         config=config,
-        output_dir=output_dir / "eval_hardnet_l2",
+        output_dir=output_dir / eval_dir_name,
         max_impostor_identities_per_query=int(settings["max_impostor_identities_per_query"]),
         export_failures=bool(settings["export_failures"]),
     )
@@ -517,8 +615,8 @@ def main() -> None:
         **summary_row(result["metrics"], far_points),
     }
     summary = [summary_record]
-    summary_csv = output_dir / "hardnet_l2_summary.csv"
-    summary_json = output_dir / "hardnet_l2_summary.json"
+    summary_csv = output_dir / f"{summary_stem}.csv"
+    summary_json = output_dir / f"{summary_stem}.json"
     write_csv_rows(summary_csv, summary)
     write_json(
         summary_json,
@@ -526,7 +624,7 @@ def main() -> None:
             "summary": summary,
             "identity_templates": str(identity_templates_path),
             "image_templates": str(template_dir),
-            "eval_dir": str(output_dir / "eval_hardnet_l2"),
+            "eval_dir": str(output_dir / eval_dir_name),
             "checkpoint": str(checkpoint),
             "checkpoint_metadata": checkpoint_metadata,
             "descriptor_dim": int(descriptor_dim),
@@ -550,6 +648,8 @@ def main() -> None:
             {
                 "summary_csv": str(summary_csv),
                 "summary_json": str(summary_json),
+                "far_frr_table_csv": result["far_frr_table_path"],
+                "per_finger_far_frr_csv": result["per_finger_far_frr_path"],
                 "outputs": str(output_dir),
             },
             ensure_ascii=False,

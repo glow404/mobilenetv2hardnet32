@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from match_new.hardnet_matcher import match_templates_descriptor_l2
+from match_new.hardnet_matcher import match_templates_descriptor
 from match_new.template_builder import load_image_template
 
 
@@ -123,7 +123,7 @@ def score_query_against_identity(
             require=require,
         )
         template_load_ms += (time.perf_counter() - load_started) * 1000.0
-        result = match_templates_descriptor_l2(
+        result = match_templates_descriptor(
             query_template,
             gallery_template,
             config,
@@ -251,7 +251,13 @@ def score_query_against_identity(
         "unique_query_inliers": int(best.get("unique_query_inliers", 0)),
         "unique_gallery_inliers": int(best.get("unique_gallery_inliers", 0)),
         "inlier_ratio": float(best.get("inlier_ratio", 0.0)),
+        "mean_descriptor_distance": float(
+            best.get("mean_descriptor_distance", 0.0)
+        ),
         "mean_l2_distance": float(best.get("mean_l2_distance", 0.0)),
+        "mean_hamming_distance": float(
+            best.get("mean_hamming_distance", 0.0)
+        ),
         "mean_reproj_error": float(best.get("mean_reproj_error", 0.0)),
         "orientation_consistency": float(best.get("orientation_consistency", 0.0)),
         "dominant_angle_delta": float(best.get("dominant_angle_delta", 0.0)),

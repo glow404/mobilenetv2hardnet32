@@ -117,9 +117,10 @@ def evaluate_binary_fixed_validation_batches(
             detach_validation_distances_to_cpu(
                 InBatchValidationDistances(
                     positive_dist=pairwise_hamming.diag(),
+                    candidate_dist=bidirectional_hamming,
+                    candidate_mask=selection.valid_candidate,
                     selected_negative_dist=selected_hamming,
                     selected_negative_mask=selection.valid_topk,
-                    selected_negative_is_same_finger=selection.topk_same_finger,
                     valid_anchor=selection.valid_anchor,
                 )
             )

@@ -15,8 +15,8 @@ data:
   # patch 已按关键点方向对齐，因此几何扰动保持轻微，不使用翻转或大角度旋转。
   train_augmentation:
     enabled: true
-    # 20% patch 保持原样，80% 执行下列随机扰动。
-    probability: 0.80
+    # 30% patch 保持原样，70% 执行下列随机扰动。
+    probability: 0.70
     max_rotation_degrees: 5.0
     max_translation_pixels: 1.0
     scale_jitter: 0.03

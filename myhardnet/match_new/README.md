@@ -28,6 +28,7 @@ conda activate hardnet-cuda
 | `model.checkpoint` | 浮点或二值 HardNet 权重 |
 | `model.descriptor_kind` / `model.binary_storage` / `model.binary_bitorder` | 描述子类型与二值模板存储契约，默认 `auto`/`packed_uint8`/`auto` |
 | `matching.distance` | `auto` 跟随 checkpoint，也可显式写 `l2` 或 `hamming` |
+| `matching.hamming.backend` | packed-Hamming 候选后端；默认 `cpu` 使用 OpenCV SIMD/POPCNT，`cuda` 仅用于显式实验 |
 | `matching.hamming.*` | 二值 Hamming 的 ratio、绝对距离和自适应 margin，需按验证集重新标定 |
 | `enrollment.random_seed` | 注册/query 划分种子 |
 | `texture_verification.*` | 局部脊线纹理二次筛选及灰区提升参数 |

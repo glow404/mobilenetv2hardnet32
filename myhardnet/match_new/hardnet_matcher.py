@@ -189,28 +189,41 @@ def keypoint_angles(template: dict[str, Any], n: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# 候选生成 GPU 加速
+# 描述子候选后端
 # ---------------------------------------------------------------------------
 
-_candidate_device: torch.device | None = None
+_l2_candidate_device: torch.device | None = None
+_HAMMING_BACKENDS = {"auto", "cpu", "cuda"}
 
 
-def _resolve_candidate_device() -> torch.device:
-    """解析候选生成可用的最快设备，并缓存结果。
+def _resolve_l2_candidate_device() -> torch.device:
+    """解析浮点 L2 候选生成设备，并缓存结果。"""
 
-    CUDA 可用时优先返回 CUDA；否则返回 CPU。
-    与 HardNetDescriptor 的设备独立，候选生成自行判断。
+    global _l2_candidate_device
+    if _l2_candidate_device is None:
+        _l2_candidate_device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+    return _l2_candidate_device
+
+
+def _resolve_hamming_backend(raw_backend: str | None) -> str:
+    """解析 packed-Hamming 后端。
+
+    ``auto`` 与默认值都选择 OpenCV CPU。当前工程的典型矩阵只有数百行，
+    CPU SIMD/POPCNT 明显快于逐模板 CUDA 调度。``cuda`` 仅作为显式实验开关；
+    CUDA 不可用时安全回退到 CPU。
     """
 
-    global _candidate_device
-    if _candidate_device is not None:
-        return _candidate_device
-    _candidate_device = (
-        torch.device("cuda")
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
-    return _candidate_device
+    backend = str(raw_backend or "cpu").strip().lower()
+    if backend not in _HAMMING_BACKENDS:
+        supported = ", ".join(sorted(_HAMMING_BACKENDS))
+        raise ValueError(
+            f"unsupported Hamming backend: {backend!r}; expected one of {supported}."
+        )
+    if backend == "cuda" and torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 def _l2_distance_torch(
@@ -248,42 +261,64 @@ def _l2_reverse_neighbors_torch(
     )
 
 
-def _hamming_to_bits_torch(
-    packed: np.ndarray,
-    hash_bits: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """把打包 uint8 Hamming 向量展开为 {0,1} float32 位向量。
-
-    ``packed`` 形状 ``[N, hash_bits//8]``，返回形状 ``[N, hash_bits]``。
-    """
-
-    t = torch.from_numpy(packed.astype(np.uint8)).to(device)
-    shifts = torch.tensor(
-        [7, 6, 5, 4, 3, 2, 1, 0],
-        dtype=torch.uint8,
-        device=device,
-    )
-    # t: [N, B], shifts: [8] → broadcast: [N, B, 8]
-    bits = (t.unsqueeze(-1) >> shifts) & 1
-    return bits.reshape(t.shape[0], hash_bits).to(torch.float32)
-
-
-def _hamming_distance_torch(
+def _hamming_distance_counts_torch(
     query: np.ndarray,
     gallery: np.ndarray,
-    hash_bits: int,
     device: torch.device,
-) -> np.ndarray:
-    """在 GPU（或 CPU torch）上计算归一化 Hamming 全量距离矩阵。
+) -> torch.Tensor:
+    """直接在 packed uint8 上计算 Hamming bit count 距离矩阵。
 
-    将打包字节展开为位之后用 L1 距离，结果除以 hash_bits。
+    保留紧凑二值表示，不再展开为 float32 位向量。距离矩阵驻留 GPU，供正向
+    和反向 top-k 共用，避免完整矩阵在 CPU/GPU 之间往返。
     """
 
-    q_bits = _hamming_to_bits_torch(query, hash_bits, device)
-    g_bits = _hamming_to_bits_torch(gallery, hash_bits, device)
-    l1 = torch.cdist(q_bits, g_bits, p=1.0)
-    return (l1 / float(hash_bits)).cpu().numpy().astype(np.float32)
+    query_t = torch.from_numpy(
+        np.ascontiguousarray(query, dtype=np.uint8)
+    ).to(device)
+    gallery_t = torch.from_numpy(
+        np.ascontiguousarray(gallery, dtype=np.uint8)
+    ).to(device)
+    xor = torch.bitwise_xor(query_t[:, None, :], gallery_t[None, :, :])
+    counts = xor - ((xor >> 1) & 0x55)
+    counts = (counts & 0x33) + ((counts >> 2) & 0x33)
+    counts = (counts + (counts >> 4)) & 0x0F
+    return counts.sum(dim=2, dtype=torch.int32)
+
+
+def _hamming_topk_torch(
+    distance_counts: torch.Tensor,
+    hash_bits: int,
+    k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """对 GPU 上的 Hamming bit count 矩阵取行方向 top-k。"""
+
+    neighbors = min(max(int(k), 0), int(distance_counts.shape[1]))
+    shape = (int(distance_counts.shape[0]), 0)
+    if neighbors == 0:
+        return (
+            np.zeros(shape, dtype=np.float32),
+            np.zeros(shape, dtype=np.int32),
+        )
+    column_count = int(distance_counts.shape[1])
+    tie_break = torch.arange(
+        column_count,
+        dtype=distance_counts.dtype,
+        device=distance_counts.device,
+    )
+    ranking_keys = distance_counts * (column_count + 1) + tie_break
+    _, topk_indices = torch.topk(
+        ranking_keys,
+        k=neighbors,
+        largest=False,
+    )
+    topk_counts = torch.gather(distance_counts, 1, topk_indices)
+    return (
+        (topk_counts.to(torch.float32) / float(hash_bits))
+        .cpu()
+        .numpy()
+        .astype(np.float32),
+        topk_indices.cpu().numpy().astype(np.int32),
+    )
 
 
 def _hamming_knn_torch(
@@ -293,18 +328,40 @@ def _hamming_knn_torch(
     k: int,
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """在 GPU 上返回归一化 Hamming top-k 距离和下标。"""
+    """在 GPU packed uint8 距离矩阵上返回归一化 Hamming top-k。"""
 
-    dist = _hamming_distance_torch(query, gallery, hash_bits, device)
-    neighbors = min(k, dist.shape[1])
-    topk_vals, topk_indices = torch.topk(
-        torch.from_numpy(dist).to(device),
-        k=neighbors,
-        largest=False,
+    distance_counts = _hamming_distance_counts_torch(query, gallery, device)
+    return _hamming_topk_torch(distance_counts, hash_bits, k)
+
+
+def _hamming_bidirectional_knn_torch(
+    query: np.ndarray,
+    gallery: np.ndarray,
+    hash_bits: int,
+    forward_k: int,
+    reverse_k: int,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """计算一次 GPU 距离矩阵，同时取得正向和反向近邻。"""
+
+    distance_counts = _hamming_distance_counts_torch(query, gallery, device)
+    forward_distances, forward_indices = _hamming_topk_torch(
+        distance_counts,
+        hash_bits,
+        forward_k,
+    )
+    if reverse_k <= 0:
+        return forward_distances, forward_indices, None, None
+    reverse_distances, reverse_indices = _hamming_topk_torch(
+        distance_counts.T,
+        hash_bits,
+        reverse_k,
     )
     return (
-        topk_vals.cpu().numpy().astype(np.float32),
-        topk_indices.cpu().numpy().astype(np.int32),
+        forward_distances,
+        forward_indices,
+        reverse_distances,
+        reverse_indices,
     )
 
 
@@ -328,7 +385,7 @@ def pairwise_l2(query: np.ndarray, gallery: np.ndarray) -> np.ndarray:
             "pairwise_l2 descriptor dimension mismatch: "
             f"query={query.shape[1]}, gallery={gallery.shape[1]}."
         )
-    device = _resolve_candidate_device()
+    device = _resolve_l2_candidate_device()
     if device.type == "cuda":
         try:
             return _l2_distance_torch(query, gallery, device)
@@ -340,41 +397,73 @@ def pairwise_l2(query: np.ndarray, gallery: np.ndarray) -> np.ndarray:
     return np.sqrt(d2, dtype=np.float32)
 
 
-def pairwise_hamming(
+def _validate_hamming_inputs(
     query: np.ndarray,
     gallery: np.ndarray,
     hash_bits: int,
-) -> np.ndarray:
-    """使用 OpenCV SIMD 或 GPU 计算归一化 Hamming 全距离矩阵。
-
-    优先尝试 GPU；CUDA 不可用或失败时回退 OpenCV batchDistance。
-    """
+    *,
+    function_name: str,
+) -> int:
+    """校验 packed-Hamming 数组契约并返回规范化 bit 数。"""
 
     if query.ndim != 2 or gallery.ndim != 2:
         raise ValueError(
-            f"pairwise_hamming expects [N,B] arrays, got {query.shape} and {gallery.shape}."
+            f"{function_name} expects [N,B] arrays, "
+            f"got {query.shape} and {gallery.shape}."
         )
     if query.shape[1] != gallery.shape[1]:
         raise ValueError(
-            "pairwise_hamming packed width mismatch: "
+            f"{function_name} packed width mismatch: "
             f"query={query.shape[1]}, gallery={gallery.shape[1]}."
         )
     bits = int(hash_bits)
     if bits <= 0 or bits % 8 != 0 or query.shape[1] != bits // 8:
         raise ValueError(
-            "pairwise_hamming requires byte-aligned hash bits: "
+            f"{function_name} requires byte-aligned hash bits: "
             f"hash_bits={bits}, width={query.shape[1]}."
         )
+    return bits
+
+
+def pairwise_hamming(
+    query: np.ndarray,
+    gallery: np.ndarray,
+    hash_bits: int,
+    *,
+    backend: str = "cpu",
+) -> np.ndarray:
+    """计算归一化 Hamming 全距离矩阵。
+
+    默认使用 OpenCV CPU SIMD/POPCNT。只有显式配置 ``backend=cuda`` 时才走
+    packed uint8 CUDA 路径；CUDA 不可用或执行失败时安全回退 CPU。
+    """
+
+    bits = _validate_hamming_inputs(
+        query,
+        gallery,
+        hash_bits,
+        function_name="pairwise_hamming",
+    )
     if query.shape[0] == 0 or gallery.shape[0] == 0:
         return np.zeros(
             (int(query.shape[0]), int(gallery.shape[0])),
             dtype=np.float32,
         )
 
-    device = _resolve_candidate_device()
-    if device.type == "cuda":
+    if _resolve_hamming_backend(backend) == "cuda":
         try:
-            return _hamming_distance_torch(query, gallery, bits, device)
+            distance_counts = _hamming_distance_counts_torch(
+                query,
+                gallery,
+                torch.device("cuda"),
+            )
+            return (
+                distance_counts.to(torch.float32)
+                .div(float(bits))
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
         except RuntimeError:
             pass
 
@@ -400,27 +489,17 @@ def hamming_knn(
     gallery: np.ndarray,
     hash_bits: int,
     k: int,
+    *,
+    backend: str = "cpu",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """使用 OpenCV SIMD 或 GPU 返回归一化距离和近邻下标矩阵。
+    """返回归一化 Hamming top-k 距离和近邻下标矩阵。"""
 
-    优先尝试 GPU；CUDA 不可用或失败时回退 OpenCV batchDistance。
-    """
-
-    if query.ndim != 2 or gallery.ndim != 2:
-        raise ValueError(
-            f"hamming_knn expects [N,B] arrays, got {query.shape} and {gallery.shape}."
-        )
-    if query.shape[1] != gallery.shape[1]:
-        raise ValueError(
-            "hamming_knn packed width mismatch: "
-            f"query={query.shape[1]}, gallery={gallery.shape[1]}."
-        )
-    bits = int(hash_bits)
-    if bits <= 0 or bits % 8 != 0 or query.shape[1] != bits // 8:
-        raise ValueError(
-            "hamming_knn requires byte-aligned hash bits: "
-            f"hash_bits={bits}, width={query.shape[1]}."
-        )
+    bits = _validate_hamming_inputs(
+        query,
+        gallery,
+        hash_bits,
+        function_name="hamming_knn",
+    )
     neighbors = min(max(int(k), 0), int(gallery.shape[0]))
     if query.shape[0] == 0 or neighbors == 0:
         shape = (int(query.shape[0]), 0)
@@ -429,10 +508,15 @@ def hamming_knn(
             np.zeros(shape, dtype=np.int32),
         )
 
-    device = _resolve_candidate_device()
-    if device.type == "cuda":
+    if _resolve_hamming_backend(backend) == "cuda":
         try:
-            return _hamming_knn_torch(query, gallery, bits, k, device)
+            return _hamming_knn_torch(
+                query,
+                gallery,
+                bits,
+                neighbors,
+                torch.device("cuda"),
+            )
         except RuntimeError:
             pass
 
@@ -446,6 +530,80 @@ def hamming_knn(
     return (
         np.asarray(distances, dtype=np.float32) / float(bits),
         np.asarray(indices, dtype=np.int32),
+    )
+
+
+def hamming_bidirectional_knn(
+    query: np.ndarray,
+    gallery: np.ndarray,
+    hash_bits: int,
+    forward_k: int,
+    reverse_k: int,
+    *,
+    backend: str = "cpu",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """返回正反两个方向的 Hamming 近邻。
+
+    显式 CUDA 路径只计算一次距离矩阵，再分别对行和列取 top-k；CPU 路径继续
+    使用 OpenCV packed-Hamming，避免为小矩阵引入 GPU 调度和传输开销。
+    """
+
+    bits = _validate_hamming_inputs(
+        query,
+        gallery,
+        hash_bits,
+        function_name="hamming_bidirectional_knn",
+    )
+    forward_neighbors = min(max(int(forward_k), 0), int(gallery.shape[0]))
+    reverse_neighbors = min(max(int(reverse_k), 0), int(query.shape[0]))
+    if query.shape[0] == 0 or gallery.shape[0] == 0:
+        forward_shape = (int(query.shape[0]), 0)
+        forward_distances = np.zeros(forward_shape, dtype=np.float32)
+        forward_indices = np.zeros(forward_shape, dtype=np.int32)
+        if reverse_k <= 0:
+            return forward_distances, forward_indices, None, None
+        reverse_shape = (int(gallery.shape[0]), 0)
+        return (
+            forward_distances,
+            forward_indices,
+            np.zeros(reverse_shape, dtype=np.float32),
+            np.zeros(reverse_shape, dtype=np.int32),
+        )
+
+    if _resolve_hamming_backend(backend) == "cuda":
+        try:
+            return _hamming_bidirectional_knn_torch(
+                query,
+                gallery,
+                bits,
+                forward_neighbors,
+                reverse_neighbors,
+                torch.device("cuda"),
+            )
+        except RuntimeError:
+            pass
+
+    forward_distances, forward_indices = hamming_knn(
+        query,
+        gallery,
+        bits,
+        forward_neighbors,
+        backend="cpu",
+    )
+    if reverse_k <= 0:
+        return forward_distances, forward_indices, None, None
+    reverse_distances, reverse_indices = hamming_knn(
+        gallery,
+        query,
+        bits,
+        reverse_neighbors,
+        backend="cpu",
+    )
+    return (
+        forward_distances,
+        forward_indices,
+        reverse_distances,
+        reverse_indices,
     )
 
 
@@ -558,15 +716,29 @@ def build_descriptor_candidates(
     margin = float(cfg.get("distance_margin", 0.12))
     allow_many = bool(cfg.get("allow_many_to_one_before_ransac", True))
     forward_k = min(max(top_k, 2), int(desc_g.shape[0]))
+    needs_bidirectional_ratio = bool(
+        bidirectional_ratio
+        and policy in {"ratio_only", "topk_or_ratio"}
+    )
+    reverse_k = min(2, int(desc_q.shape[0])) if needs_bidirectional_ratio else 0
 
+    reverse_distances: np.ndarray | None = None
+    reverse_indices: np.ndarray | None = None
     if contract.metric == HAMMING_DISTANCE_METRIC:
-        # Hamming 只查询候选生成真正需要的近邻，避免创建 Nq×Ng×bytes 的 XOR
-        # 中间数组，也避免 Python 按 query descriptor 循环执行 popcount。
-        forward_distances, forward_indices = hamming_knn(
+        # CPU 默认直接使用 OpenCV packed-Hamming。显式 CUDA 时只计算一次距离
+        # 矩阵，并从同一矩阵取得正向和反向近邻。
+        (
+            forward_distances,
+            forward_indices,
+            reverse_distances,
+            reverse_indices,
+        ) = hamming_bidirectional_knn(
             desc_q,
             desc_g,
             contract.dimension,
             forward_k,
+            reverse_k,
+            backend=str(cfg.get("backend", "cpu")),
         )
         distances = None
     else:
@@ -575,35 +747,30 @@ def build_descriptor_candidates(
         forward_indices = None
 
     # 双向 Lowe 验证需要预先得到每个 gallery 描述子的 query 侧最近邻和次近邻。
-    # 只在开关启用且当前策略包含 ratio 分支时计算；topk_only 不受此开关影响。
     reverse_best_query = np.full((desc_g.shape[0],), -1, dtype=np.int64)
     reverse_ratio_ok = np.zeros((desc_g.shape[0],), dtype=bool)
-    if bidirectional_ratio and policy in {"ratio_only", "topk_or_ratio"}:
-        reverse_k = min(2, int(desc_q.shape[0]))
+    if needs_bidirectional_ratio:
         if contract.metric == HAMMING_DISTANCE_METRIC:
-            reverse_distances, reverse_indices = hamming_knn(
-                desc_g,
-                desc_q,
-                contract.dimension,
-                reverse_k,
+            assert reverse_distances is not None
+            assert reverse_indices is not None
+            reverse_best_query[:] = reverse_indices[:, 0].astype(np.int64)
+            best_vals = reverse_distances[:, 0]
+            second_vals = (
+                reverse_distances[:, 1]
+                if reverse_distances.shape[1] > 1
+                else np.full(
+                    reverse_distances.shape[0],
+                    np.inf,
+                    dtype=np.float32,
+                )
             )
-            for gallery_idx in range(desc_g.shape[0]):
-                reverse_best_idx = int(reverse_indices[gallery_idx, 0])
-                reverse_best_dist = float(reverse_distances[gallery_idx, 0])
-                reverse_second_dist = (
-                    float(reverse_distances[gallery_idx, 1])
-                    if reverse_k > 1
-                    else float("inf")
-                )
-                reverse_best_query[gallery_idx] = reverse_best_idx
-                reverse_ratio_ok[gallery_idx] = bool(
-                    reverse_second_dist > 1e-12
-                    and reverse_best_dist
-                    < ratio_threshold * reverse_second_dist
-                )
+            reverse_ratio_ok[:] = (
+                (second_vals > 1e-12)
+                & (best_vals < ratio_threshold * second_vals)
+            )
         else:
             assert distances is not None
-            device = _resolve_candidate_device()
+            device = _resolve_l2_candidate_device()
             if device.type == "cuda":
                 try:
                     # GPU 并行：对距离矩阵的每一列（gallery 维度）

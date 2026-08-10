@@ -11,7 +11,7 @@
 output:
   # 实验结果根目录。相对路径相对本配置文件所在目录解析。
   # A0 与后续 Strong-256 使用不同目录，禁止复用模板和阈值产物。
-  output_dir: ..\outputs\检查是否有异常手指\hardnet_256float_512bit_fixed_best.pt-模板数40-数据集normal_pic-31
+  output_dir: ..\outputs\检查是否有异常手指\hardnet_strongv2_256_fixed_best.pt-模板数40-数据集normal_pic-31
 
 runtime:
   skip_template_build: false
@@ -53,7 +53,7 @@ model:
   binary_bitorder: auto
 
   # checkpoint 相对路径按本配置文件所在目录解析。
-  checkpoint: ..\outputs\models\3\models0\hardnet_256float_512bit_fixed\best.pt
+  checkpoint: ..\outputs\models\3\models2\hardnet_strongv2_256_fixed\best.pt
 
   # 显式值会覆盖 checkpoint 中对应的模型参数，必须与训练结构兼容。
   # A0 保持旧 checkpoint 的训练配置；Strong-256 使用独立配置/命令行覆盖。
@@ -147,6 +147,9 @@ matching:
   # 下列字段只覆盖 Hamming 路径；未列出的候选/RANSAC参数继续使用 matching 顶层值。
   # 首次正式实验后应根据验证集重新标定这三个阈值。
   hamming:
+    # 当前约 300~500 个关键点、逐模板调用时，OpenCV packed-Hamming 明显更快。
+    # cpu/auto：使用 CPU SIMD/POPCNT；cuda：显式启用实验性 packed CUDA 路径。
+    backend: cpu
     ratio_threshold: 0.90
     abs_distance_threshold: 0.40
     distance_margin: 0.05

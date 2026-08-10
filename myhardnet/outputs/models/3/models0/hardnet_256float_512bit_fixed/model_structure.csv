@@ -1,0 +1,32 @@
+﻿序号,层路径,类型,输入形状,输出形状,作用,参数量,可训练参数量,MACs_per_patch,FLOPs_per_patch_approx
+1,backbone.features.0.0,Conv2d,"[1,1,32,32]","[1,32,32,32]",局部空间特征提取；Conv 1→32，kernel=3×3，stride=1×1，dilation=1×1，groups=1,288,0,294912,589824
+2,backbone.features.0.1,BatchNorm2d,"[1,32,32,32]","[1,32,32,32]",批归一化，稳定特征分布；affine=True,64,0,,
+3,backbone.features.0.2,ReLU,"[1,32,32,32]","[1,32,32,32]",ReLU 非线性激活,0,0,,
+4,backbone.features.1.0,Conv2d,"[1,32,32,32]","[1,32,32,32]",局部空间特征提取；Conv 32→32，kernel=3×3，stride=1×1，dilation=1×1，groups=1,9216,0,9437184,18874368
+5,backbone.features.1.1,BatchNorm2d,"[1,32,32,32]","[1,32,32,32]",批归一化，稳定特征分布；affine=True,64,0,,
+6,backbone.features.1.2,ReLU,"[1,32,32,32]","[1,32,32,32]",ReLU 非线性激活,0,0,,
+7,backbone.features.2.0,Conv2d,"[1,32,32,32]","[1,64,16,16]",局部空间特征提取；Conv 32→64，kernel=3×3，stride=2×2，dilation=1×1，groups=1,18432,0,4718592,9437184
+8,backbone.features.2.1,BatchNorm2d,"[1,64,16,16]","[1,64,16,16]",批归一化，稳定特征分布；affine=True,128,0,,
+9,backbone.features.2.2,ReLU,"[1,64,16,16]","[1,64,16,16]",ReLU 非线性激活,0,0,,
+10,backbone.features.3.0,Conv2d,"[1,64,16,16]","[1,64,16,16]",局部空间特征提取；Conv 64→64，kernel=3×3，stride=1×1，dilation=1×1，groups=1,36864,0,9437184,18874368
+11,backbone.features.3.1,BatchNorm2d,"[1,64,16,16]","[1,64,16,16]",批归一化，稳定特征分布；affine=True,128,0,,
+12,backbone.features.3.2,ReLU,"[1,64,16,16]","[1,64,16,16]",ReLU 非线性激活,0,0,,
+13,backbone.features.4.0,Conv2d,"[1,64,16,16]","[1,128,8,8]",局部空间特征提取；Conv 64→128，kernel=3×3，stride=2×2，dilation=1×1，groups=1,73728,0,4718592,9437184
+14,backbone.features.4.1,BatchNorm2d,"[1,128,8,8]","[1,128,8,8]",批归一化，稳定特征分布；affine=True,256,0,,
+15,backbone.features.4.2,ReLU,"[1,128,8,8]","[1,128,8,8]",ReLU 非线性激活,0,0,,
+16,backbone.features.5.0,Conv2d,"[1,128,8,8]","[1,128,8,8]",局部空间特征提取；Conv 128→128，kernel=3×3，stride=1×1，dilation=1×1，groups=1,147456,0,9437184,18874368
+17,backbone.features.5.1,BatchNorm2d,"[1,128,8,8]","[1,128,8,8]",批归一化，稳定特征分布；affine=True,256,0,,
+18,backbone.features.5.2,ReLU,"[1,128,8,8]","[1,128,8,8]",ReLU 非线性激活,0,0,,
+19,backbone.features.6,Dropout,"[1,128,8,8]","[1,128,8,8]",训练时随机失活，p=0.12,0,0,,
+20,backbone.features.7,Conv2d,"[1,128,8,8]","[1,256,1,1]",可学习的全局空间投影；Conv 128→256，kernel=8×8，stride=1×1，dilation=1×1，groups=1,2097152,0,2097152,4194304
+21,backbone.features.8,BatchNorm2d,"[1,256,1,1]","[1,256,1,1]",批归一化，稳定特征分布；affine=False,0,0,,
+22,hash_head,ResidualHashHead,"[1,256]","[1,512]",浮点描述子投影及残差哈希变换；计算量由子层统计,1024,1024,,
+23,hash_head.input_norm,LayerNorm,"[1,256]","[1,256]","对末端维度 (256,) 做层归一化",512,512,,
+24,hash_head.input_projection,Linear,"[1,256]","[1,512]",全连接特征投影 256→512,131072,131072,131072,262144
+25,hash_head.residual_norm,LayerNorm,"[1,512]","[1,512]","对末端维度 (512,) 做层归一化",1024,1024,,
+26,hash_head.expand,Linear,"[1,512]","[1,1024]",全连接特征投影 512→1024,525312,525312,524288,1048576
+27,hash_head.activation,GELU,"[1,1024]","[1,1024]",GELU 平滑非线性激活,0,0,,
+28,hash_head.dropout,Dropout,"[1,1024]","[1,1024]",训练时随机失活，p=0.1,0,0,,
+29,hash_head.contract,Linear,"[1,1024]","[1,512]",全连接特征投影 1024→512,524800,524800,524288,1048576
+30,hash_head.output_norm,LayerNorm,"[1,512]","[1,512]","对末端维度 (512,) 做层归一化",1024,1024,,
+31,hash_head.output_projection,Linear,"[1,512]","[1,512]",全连接特征投影 512→512,262656,262656,262144,524288

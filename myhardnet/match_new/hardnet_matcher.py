@@ -31,6 +31,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import torch
 
 from match_new.descriptor_contract import (
     BINARY_DESCRIPTOR_KIND,
@@ -187,11 +188,135 @@ def keypoint_angles(template: dict[str, Any], n: int) -> np.ndarray:
     return angles[:n]
 
 
+# ---------------------------------------------------------------------------
+# 候选生成 GPU 加速
+# ---------------------------------------------------------------------------
+
+_candidate_device: torch.device | None = None
+
+
+def _resolve_candidate_device() -> torch.device:
+    """解析候选生成可用的最快设备，并缓存结果。
+
+    CUDA 可用时优先返回 CUDA；否则返回 CPU。
+    与 HardNetDescriptor 的设备独立，候选生成自行判断。
+    """
+
+    global _candidate_device
+    if _candidate_device is not None:
+        return _candidate_device
+    _candidate_device = (
+        torch.device("cuda")
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    return _candidate_device
+
+
+def _l2_distance_torch(
+    query: np.ndarray,
+    gallery: np.ndarray,
+    device: torch.device,
+) -> np.ndarray:
+    """在 GPU（或 CPU torch）上计算全量 L2 距离矩阵。"""
+
+    q_t = torch.from_numpy(query.astype(np.float32)).to(device)
+    g_t = torch.from_numpy(gallery.astype(np.float32)).to(device)
+    dist = torch.cdist(q_t, g_t, p=2.0)
+    return dist.cpu().numpy().astype(np.float32)
+
+
+def _l2_reverse_neighbors_torch(
+    distances: np.ndarray,
+    k: int,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """在 GPU 上并行计算距离矩阵每一列的 top-k 最小值和下标。
+
+    返回 ``(best_indices, best_values)``，形状均为 ``(gallery_count, k)``。
+    """
+
+    d_t = torch.from_numpy(distances.astype(np.float32)).to(device)
+    topk_vals, topk_indices = torch.topk(
+        d_t.T,
+        k=min(k, d_t.shape[0]),
+        largest=False,
+    )
+    return (
+        topk_indices.cpu().numpy().astype(np.int64),
+        topk_vals.cpu().numpy().astype(np.float32),
+    )
+
+
+def _hamming_to_bits_torch(
+    packed: np.ndarray,
+    hash_bits: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """把打包 uint8 Hamming 向量展开为 {0,1} float32 位向量。
+
+    ``packed`` 形状 ``[N, hash_bits//8]``，返回形状 ``[N, hash_bits]``。
+    """
+
+    t = torch.from_numpy(packed.astype(np.uint8)).to(device)
+    shifts = torch.tensor(
+        [7, 6, 5, 4, 3, 2, 1, 0],
+        dtype=torch.uint8,
+        device=device,
+    )
+    # t: [N, B], shifts: [8] → broadcast: [N, B, 8]
+    bits = (t.unsqueeze(-1) >> shifts) & 1
+    return bits.reshape(t.shape[0], hash_bits).to(torch.float32)
+
+
+def _hamming_distance_torch(
+    query: np.ndarray,
+    gallery: np.ndarray,
+    hash_bits: int,
+    device: torch.device,
+) -> np.ndarray:
+    """在 GPU（或 CPU torch）上计算归一化 Hamming 全量距离矩阵。
+
+    将打包字节展开为位之后用 L1 距离，结果除以 hash_bits。
+    """
+
+    q_bits = _hamming_to_bits_torch(query, hash_bits, device)
+    g_bits = _hamming_to_bits_torch(gallery, hash_bits, device)
+    l1 = torch.cdist(q_bits, g_bits, p=1.0)
+    return (l1 / float(hash_bits)).cpu().numpy().astype(np.float32)
+
+
+def _hamming_knn_torch(
+    query: np.ndarray,
+    gallery: np.ndarray,
+    hash_bits: int,
+    k: int,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """在 GPU 上返回归一化 Hamming top-k 距离和下标。"""
+
+    dist = _hamming_distance_torch(query, gallery, hash_bits, device)
+    neighbors = min(k, dist.shape[1])
+    topk_vals, topk_indices = torch.topk(
+        torch.from_numpy(dist).to(device),
+        k=neighbors,
+        largest=False,
+    )
+    return (
+        topk_vals.cpu().numpy().astype(np.float32),
+        topk_indices.cpu().numpy().astype(np.int32),
+    )
+
+
+# ---------------------------------------------------------------------------
+
 def pairwise_l2(query: np.ndarray, gallery: np.ndarray) -> np.ndarray:
     """计算 query descriptors 到 gallery descriptors 的全量 L2 距离矩阵。
 
     对 L2-normalized descriptor 来说，L2 排序与 cosine 排序等价；
     但 L2 距离范围更直观，便于设置 abs_distance_threshold。
+
+    GPU 可用时自动使用 ``torch.cdist`` 加速；CUDA 不可用或失败时回退 NumPy。
     """
 
     if query.ndim != 2 or gallery.ndim != 2:
@@ -203,6 +328,12 @@ def pairwise_l2(query: np.ndarray, gallery: np.ndarray) -> np.ndarray:
             "pairwise_l2 descriptor dimension mismatch: "
             f"query={query.shape[1]}, gallery={gallery.shape[1]}."
         )
+    device = _resolve_candidate_device()
+    if device.type == "cuda":
+        try:
+            return _l2_distance_torch(query, gallery, device)
+        except RuntimeError:
+            pass
     q2 = np.sum(query * query, axis=1, keepdims=True)
     g2 = np.sum(gallery * gallery, axis=1, keepdims=True).T
     d2 = np.maximum(q2 + g2 - 2.0 * query @ gallery.T, 0.0)
@@ -214,7 +345,10 @@ def pairwise_hamming(
     gallery: np.ndarray,
     hash_bits: int,
 ) -> np.ndarray:
-    """使用 OpenCV SIMD 后端计算归一化 Hamming 全距离矩阵。"""
+    """使用 OpenCV SIMD 或 GPU 计算归一化 Hamming 全距离矩阵。
+
+    优先尝试 GPU；CUDA 不可用或失败时回退 OpenCV batchDistance。
+    """
 
     if query.ndim != 2 or gallery.ndim != 2:
         raise ValueError(
@@ -236,6 +370,13 @@ def pairwise_hamming(
             (int(query.shape[0]), int(gallery.shape[0])),
             dtype=np.float32,
         )
+
+    device = _resolve_candidate_device()
+    if device.type == "cuda":
+        try:
+            return _hamming_distance_torch(query, gallery, bits, device)
+        except RuntimeError:
+            pass
 
     sorted_distances, sorted_indices = cv2.batchDistance(
         np.ascontiguousarray(query, dtype=np.uint8),
@@ -260,7 +401,10 @@ def hamming_knn(
     hash_bits: int,
     k: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """使用 OpenCV SIMD 后端返回归一化距离和近邻下标矩阵。"""
+    """使用 OpenCV SIMD 或 GPU 返回归一化距离和近邻下标矩阵。
+
+    优先尝试 GPU；CUDA 不可用或失败时回退 OpenCV batchDistance。
+    """
 
     if query.ndim != 2 or gallery.ndim != 2:
         raise ValueError(
@@ -284,6 +428,13 @@ def hamming_knn(
             np.zeros(shape, dtype=np.float32),
             np.zeros(shape, dtype=np.int32),
         )
+
+    device = _resolve_candidate_device()
+    if device.type == "cuda":
+        try:
+            return _hamming_knn_torch(query, gallery, bits, k, device)
+        except RuntimeError:
+            pass
 
     distances, indices = cv2.batchDistance(
         np.ascontiguousarray(query, dtype=np.uint8),
@@ -452,22 +603,46 @@ def build_descriptor_candidates(
                 )
         else:
             assert distances is not None
-            for gallery_idx in range(distances.shape[1]):
-                column = distances[:, gallery_idx]
-                reverse_order = top_indices(column, reverse_k)
-                reverse_best_idx = int(reverse_order[0])
-                reverse_best_dist = float(column[reverse_best_idx])
-                reverse_second_dist = (
-                    float(column[int(reverse_order[1])])
-                    if reverse_order.size > 1
-                    else float("inf")
-                )
-                reverse_best_query[gallery_idx] = reverse_best_idx
-                reverse_ratio_ok[gallery_idx] = bool(
-                    reverse_second_dist > 1e-12
-                    and reverse_best_dist
-                    < ratio_threshold * reverse_second_dist
-                )
+            device = _resolve_candidate_device()
+            if device.type == "cuda":
+                try:
+                    # GPU 并行：对距离矩阵的每一列（gallery 维度）
+                    # 取 top-2 最小值和下标，替代逐列 argpartition。
+                    rev_indices, rev_vals = _l2_reverse_neighbors_torch(
+                        distances,
+                        reverse_k,
+                        device,
+                    )
+                    reverse_best_query[:] = rev_indices[:, 0].astype(np.int64)
+                    best_vals = rev_vals[:, 0]
+                    second_vals = (
+                        rev_vals[:, 1]
+                        if rev_indices.shape[1] > 1
+                        else np.full(rev_indices.shape[0], np.inf, dtype=np.float32)
+                    )
+                    reverse_ratio_ok[:] = (
+                        (second_vals > 1e-12)
+                        & (best_vals < ratio_threshold * second_vals)
+                    )
+                except RuntimeError:
+                    device = torch.device("cpu")
+            if device.type != "cuda":
+                for gallery_idx in range(distances.shape[1]):
+                    column = distances[:, gallery_idx]
+                    reverse_order = top_indices(column, reverse_k)
+                    reverse_best_idx = int(reverse_order[0])
+                    reverse_best_dist = float(column[reverse_best_idx])
+                    reverse_second_dist = (
+                        float(column[int(reverse_order[1])])
+                        if reverse_order.size > 1
+                        else float("inf")
+                    )
+                    reverse_best_query[gallery_idx] = reverse_best_idx
+                    reverse_ratio_ok[gallery_idx] = bool(
+                        reverse_second_dist > 1e-12
+                        and reverse_best_dist
+                        < ratio_threshold * reverse_second_dist
+                    )
 
     # candidates 保存所有进入后续几何验证的候选；
     # best_gallery 只在 allow_many=false 时使用，用于提前做 gallery 侧去重。

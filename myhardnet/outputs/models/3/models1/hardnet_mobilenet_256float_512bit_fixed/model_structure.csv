@@ -1,0 +1,96 @@
+﻿序号,层路径,类型,输入形状,输出形状,作用,参数量,可训练参数量,MACs_per_patch,FLOPs_per_patch_approx
+1,backbone.stem.0,Conv2d,"[1,1,32,32]","[1,16,32,32]",局部空间特征提取；Conv 1→16，kernel=3×3，stride=1×1，dilation=1×1，groups=1,144,0,147456,294912
+2,backbone.stem.1,BatchNorm2d,"[1,16,32,32]","[1,16,32,32]",批归一化，稳定特征分布；affine=True,32,0,,
+3,backbone.stem.2,ReLU6,"[1,16,32,32]","[1,16,32,32]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+4,backbone.features.0,InvertedResidual,"[1,16,32,32]","[1,16,32,32]",MobileNetV2 倒残差块：扩展、深度卷积、线性投影；带残差相加；计算量由子层统计,0,0,,
+5,backbone.features.0.block.0,Conv2d,"[1,16,32,32]","[1,16,32,32]",逐通道空间特征提取；Conv 16→16，kernel=3×3，stride=1×1，dilation=1×1，groups=16,144,0,147456,294912
+6,backbone.features.0.block.1,BatchNorm2d,"[1,16,32,32]","[1,16,32,32]",批归一化，稳定特征分布；affine=True,32,0,,
+7,backbone.features.0.block.2,ReLU6,"[1,16,32,32]","[1,16,32,32]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+8,backbone.features.0.block.3,Conv2d,"[1,16,32,32]","[1,16,32,32]",通道投影与融合；Conv 16→16，kernel=1×1，stride=1×1，dilation=1×1，groups=1,256,0,262144,524288
+9,backbone.features.0.block.4,BatchNorm2d,"[1,16,32,32]","[1,16,32,32]",批归一化，稳定特征分布；affine=True,32,0,,
+10,backbone.features.1,InvertedResidual,"[1,16,32,32]","[1,24,16,16]",MobileNetV2 倒残差块：扩展、深度卷积、线性投影；不使用残差；计算量由子层统计,0,0,,
+11,backbone.features.1.block.0,Conv2d,"[1,16,32,32]","[1,32,32,32]",通道投影与融合；Conv 16→32，kernel=1×1，stride=1×1，dilation=1×1，groups=1,512,0,524288,1048576
+12,backbone.features.1.block.1,BatchNorm2d,"[1,32,32,32]","[1,32,32,32]",批归一化，稳定特征分布；affine=True,64,0,,
+13,backbone.features.1.block.2,ReLU6,"[1,32,32,32]","[1,32,32,32]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+14,backbone.features.1.block.3,Conv2d,"[1,32,32,32]","[1,32,16,16]",逐通道空间特征提取；Conv 32→32，kernel=3×3，stride=2×2，dilation=1×1，groups=32,288,0,73728,147456
+15,backbone.features.1.block.4,BatchNorm2d,"[1,32,16,16]","[1,32,16,16]",批归一化，稳定特征分布；affine=True,64,0,,
+16,backbone.features.1.block.5,ReLU6,"[1,32,16,16]","[1,32,16,16]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+17,backbone.features.1.block.6,Conv2d,"[1,32,16,16]","[1,24,16,16]",通道投影与融合；Conv 32→24，kernel=1×1，stride=1×1，dilation=1×1，groups=1,768,0,196608,393216
+18,backbone.features.1.block.7,BatchNorm2d,"[1,24,16,16]","[1,24,16,16]",批归一化，稳定特征分布；affine=True,48,0,,
+19,backbone.features.2,InvertedResidual,"[1,24,16,16]","[1,24,16,16]",MobileNetV2 倒残差块：扩展、深度卷积、线性投影；带残差相加；计算量由子层统计,0,0,,
+20,backbone.features.2.block.0,Conv2d,"[1,24,16,16]","[1,48,16,16]",通道投影与融合；Conv 24→48，kernel=1×1，stride=1×1，dilation=1×1，groups=1,1152,0,294912,589824
+21,backbone.features.2.block.1,BatchNorm2d,"[1,48,16,16]","[1,48,16,16]",批归一化，稳定特征分布；affine=True,96,0,,
+22,backbone.features.2.block.2,ReLU6,"[1,48,16,16]","[1,48,16,16]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+23,backbone.features.2.block.3,Conv2d,"[1,48,16,16]","[1,48,16,16]",逐通道空间特征提取；Conv 48→48，kernel=3×3，stride=1×1，dilation=1×1，groups=48,432,0,110592,221184
+24,backbone.features.2.block.4,BatchNorm2d,"[1,48,16,16]","[1,48,16,16]",批归一化，稳定特征分布；affine=True,96,0,,
+25,backbone.features.2.block.5,ReLU6,"[1,48,16,16]","[1,48,16,16]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+26,backbone.features.2.block.6,Conv2d,"[1,48,16,16]","[1,24,16,16]",通道投影与融合；Conv 48→24，kernel=1×1，stride=1×1，dilation=1×1，groups=1,1152,0,294912,589824
+27,backbone.features.2.block.7,BatchNorm2d,"[1,24,16,16]","[1,24,16,16]",批归一化，稳定特征分布；affine=True,48,0,,
+28,backbone.features.3,InvertedResidual,"[1,24,16,16]","[1,32,8,8]",MobileNetV2 倒残差块：扩展、深度卷积、线性投影；不使用残差；计算量由子层统计,0,0,,
+29,backbone.features.3.block.0,Conv2d,"[1,24,16,16]","[1,48,16,16]",通道投影与融合；Conv 24→48，kernel=1×1，stride=1×1，dilation=1×1，groups=1,1152,0,294912,589824
+30,backbone.features.3.block.1,BatchNorm2d,"[1,48,16,16]","[1,48,16,16]",批归一化，稳定特征分布；affine=True,96,0,,
+31,backbone.features.3.block.2,ReLU6,"[1,48,16,16]","[1,48,16,16]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+32,backbone.features.3.block.3,Conv2d,"[1,48,16,16]","[1,48,8,8]",逐通道空间特征提取；Conv 48→48，kernel=3×3，stride=2×2，dilation=1×1，groups=48,432,0,27648,55296
+33,backbone.features.3.block.4,BatchNorm2d,"[1,48,8,8]","[1,48,8,8]",批归一化，稳定特征分布；affine=True,96,0,,
+34,backbone.features.3.block.5,ReLU6,"[1,48,8,8]","[1,48,8,8]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+35,backbone.features.3.block.6,Conv2d,"[1,48,8,8]","[1,32,8,8]",通道投影与融合；Conv 48→32，kernel=1×1，stride=1×1，dilation=1×1，groups=1,1536,0,98304,196608
+36,backbone.features.3.block.7,BatchNorm2d,"[1,32,8,8]","[1,32,8,8]",批归一化，稳定特征分布；affine=True,64,0,,
+37,backbone.features.4,InvertedResidual,"[1,32,8,8]","[1,32,8,8]",MobileNetV2 倒残差块：扩展、深度卷积、线性投影；带残差相加；计算量由子层统计,0,0,,
+38,backbone.features.4.block.0,Conv2d,"[1,32,8,8]","[1,64,8,8]",通道投影与融合；Conv 32→64，kernel=1×1，stride=1×1，dilation=1×1，groups=1,2048,0,131072,262144
+39,backbone.features.4.block.1,BatchNorm2d,"[1,64,8,8]","[1,64,8,8]",批归一化，稳定特征分布；affine=True,128,0,,
+40,backbone.features.4.block.2,ReLU6,"[1,64,8,8]","[1,64,8,8]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+41,backbone.features.4.block.3,Conv2d,"[1,64,8,8]","[1,64,8,8]",逐通道空间特征提取；Conv 64→64，kernel=3×3，stride=1×1，dilation=1×1，groups=64,576,0,36864,73728
+42,backbone.features.4.block.4,BatchNorm2d,"[1,64,8,8]","[1,64,8,8]",批归一化，稳定特征分布；affine=True,128,0,,
+43,backbone.features.4.block.5,ReLU6,"[1,64,8,8]","[1,64,8,8]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+44,backbone.features.4.block.6,Conv2d,"[1,64,8,8]","[1,32,8,8]",通道投影与融合；Conv 64→32，kernel=1×1，stride=1×1，dilation=1×1，groups=1,2048,0,131072,262144
+45,backbone.features.4.block.7,BatchNorm2d,"[1,32,8,8]","[1,32,8,8]",批归一化，稳定特征分布；affine=True,64,0,,
+46,backbone.features.5,InvertedResidual,"[1,32,8,8]","[1,48,8,8]",MobileNetV2 倒残差块：扩展、深度卷积、线性投影；不使用残差；计算量由子层统计,0,0,,
+47,backbone.features.5.block.0,Conv2d,"[1,32,8,8]","[1,64,8,8]",通道投影与融合；Conv 32→64，kernel=1×1，stride=1×1，dilation=1×1，groups=1,2048,0,131072,262144
+48,backbone.features.5.block.1,BatchNorm2d,"[1,64,8,8]","[1,64,8,8]",批归一化，稳定特征分布；affine=True,128,0,,
+49,backbone.features.5.block.2,ReLU6,"[1,64,8,8]","[1,64,8,8]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+50,backbone.features.5.block.3,Conv2d,"[1,64,8,8]","[1,64,8,8]",逐通道空间特征提取；Conv 64→64，kernel=3×3，stride=1×1，dilation=1×1，groups=64,576,0,36864,73728
+51,backbone.features.5.block.4,BatchNorm2d,"[1,64,8,8]","[1,64,8,8]",批归一化，稳定特征分布；affine=True,128,0,,
+52,backbone.features.5.block.5,ReLU6,"[1,64,8,8]","[1,64,8,8]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+53,backbone.features.5.block.6,Conv2d,"[1,64,8,8]","[1,48,8,8]",通道投影与融合；Conv 64→48，kernel=1×1，stride=1×1，dilation=1×1，groups=1,3072,0,196608,393216
+54,backbone.features.5.block.7,BatchNorm2d,"[1,48,8,8]","[1,48,8,8]",批归一化，稳定特征分布；affine=True,96,0,,
+55,backbone.features.6,InvertedResidual,"[1,48,8,8]","[1,48,8,8]",MobileNetV2 倒残差块：扩展、深度卷积、线性投影；带残差相加；计算量由子层统计,0,0,,
+56,backbone.features.6.block.0,Conv2d,"[1,48,8,8]","[1,96,8,8]",通道投影与融合；Conv 48→96，kernel=1×1，stride=1×1，dilation=1×1，groups=1,4608,0,294912,589824
+57,backbone.features.6.block.1,BatchNorm2d,"[1,96,8,8]","[1,96,8,8]",批归一化，稳定特征分布；affine=True,192,0,,
+58,backbone.features.6.block.2,ReLU6,"[1,96,8,8]","[1,96,8,8]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+59,backbone.features.6.block.3,Conv2d,"[1,96,8,8]","[1,96,8,8]",逐通道空间特征提取；Conv 96→96，kernel=3×3，stride=1×1，dilation=1×1，groups=96,864,0,55296,110592
+60,backbone.features.6.block.4,BatchNorm2d,"[1,96,8,8]","[1,96,8,8]",批归一化，稳定特征分布；affine=True,192,0,,
+61,backbone.features.6.block.5,ReLU6,"[1,96,8,8]","[1,96,8,8]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+62,backbone.features.6.block.6,Conv2d,"[1,96,8,8]","[1,48,8,8]",通道投影与融合；Conv 96→48，kernel=1×1，stride=1×1，dilation=1×1，groups=1,4608,0,294912,589824
+63,backbone.features.6.block.7,BatchNorm2d,"[1,48,8,8]","[1,48,8,8]",批归一化，稳定特征分布；affine=True,96,0,,
+64,backbone.features.7,InvertedResidual,"[1,48,8,8]","[1,64,8,8]",MobileNetV2 倒残差块：扩展、深度卷积、线性投影；不使用残差；计算量由子层统计,0,0,,
+65,backbone.features.7.block.0,Conv2d,"[1,48,8,8]","[1,96,8,8]",通道投影与融合；Conv 48→96，kernel=1×1，stride=1×1，dilation=1×1，groups=1,4608,0,294912,589824
+66,backbone.features.7.block.1,BatchNorm2d,"[1,96,8,8]","[1,96,8,8]",批归一化，稳定特征分布；affine=True,192,0,,
+67,backbone.features.7.block.2,ReLU6,"[1,96,8,8]","[1,96,8,8]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+68,backbone.features.7.block.3,Conv2d,"[1,96,8,8]","[1,96,8,8]",逐通道空间特征提取；Conv 96→96，kernel=3×3，stride=1×1，dilation=1×1，groups=96,864,0,55296,110592
+69,backbone.features.7.block.4,BatchNorm2d,"[1,96,8,8]","[1,96,8,8]",批归一化，稳定特征分布；affine=True,192,0,,
+70,backbone.features.7.block.5,ReLU6,"[1,96,8,8]","[1,96,8,8]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+71,backbone.features.7.block.6,Conv2d,"[1,96,8,8]","[1,64,8,8]",通道投影与融合；Conv 96→64，kernel=1×1，stride=1×1，dilation=1×1，groups=1,6144,0,393216,786432
+72,backbone.features.7.block.7,BatchNorm2d,"[1,64,8,8]","[1,64,8,8]",批归一化，稳定特征分布；affine=True,128,0,,
+73,backbone.adapter.0,Conv2d,"[1,64,8,8]","[1,96,8,8]",通道投影与融合；Conv 64→96，kernel=1×1，stride=1×1，dilation=1×1，groups=1,6144,0,393216,786432
+74,backbone.adapter.1,BatchNorm2d,"[1,96,8,8]","[1,96,8,8]",批归一化，稳定特征分布；affine=True,192,0,,
+75,backbone.adapter.2,ReLU6,"[1,96,8,8]","[1,96,8,8]",ReLU6 非线性激活，限制移动网络激活范围,0,0,,
+76,backbone.coordinate_attention,CoordinateAttention,"[1,96,8,8]","[1,96,8,8]",分别编码高度与宽度上下文并重标定特征；计算量由子层统计,0,0,,
+77,backbone.coordinate_attention.shared_projection.0,Conv2d,"[1,96,16,1]","[1,8,16,1]",通道投影与融合；Conv 96→8，kernel=1×1，stride=1×1，dilation=1×1，groups=1,768,0,12288,24576
+78,backbone.coordinate_attention.shared_projection.1,BatchNorm2d,"[1,8,16,1]","[1,8,16,1]",批归一化，稳定特征分布；affine=True,16,0,,
+79,backbone.coordinate_attention.shared_projection.2,Hardswish,"[1,8,16,1]","[1,8,16,1]",Hardswish 轻量平滑激活,0,0,,
+80,backbone.coordinate_attention.height_projection,Conv2d,"[1,8,8,1]","[1,96,8,1]",通道投影与融合；Conv 8→96，kernel=1×1，stride=1×1，dilation=1×1，groups=1,864,0,6144,12288
+81,backbone.coordinate_attention.width_projection,Conv2d,"[1,8,1,8]","[1,96,1,8]",通道投影与融合；Conv 8→96，kernel=1×1，stride=1×1，dilation=1×1，groups=1,864,0,6144,12288
+82,backbone.descriptor_head.0,Dropout,"[1,96,8,8]","[1,96,8,8]",训练时随机失活，p=0.12,0,0,,
+83,backbone.descriptor_head.1,Conv2d,"[1,96,8,8]","[1,192,1,1]",逐通道空间特征提取；Conv 96→192，kernel=8×8，stride=1×1，dilation=1×1，groups=96,12288,0,12288,24576
+84,backbone.descriptor_head.2,Conv2d,"[1,192,1,1]","[1,256,1,1]",通道投影与融合；Conv 192→256，kernel=1×1，stride=1×1，dilation=1×1，groups=1,49152,0,49152,98304
+85,backbone.descriptor_head.3,BatchNorm2d,"[1,256,1,1]","[1,256,1,1]",批归一化，稳定特征分布；affine=False,0,0,,
+86,hash_head,ResidualHashHead,"[1,256]","[1,512]",浮点描述子投影及残差哈希变换；计算量由子层统计,1024,1024,,
+87,hash_head.input_norm,LayerNorm,"[1,256]","[1,256]","对末端维度 (256,) 做层归一化",512,512,,
+88,hash_head.input_projection,Linear,"[1,256]","[1,512]",全连接特征投影 256→512,131072,131072,131072,262144
+89,hash_head.residual_norm,LayerNorm,"[1,512]","[1,512]","对末端维度 (512,) 做层归一化",1024,1024,,
+90,hash_head.expand,Linear,"[1,512]","[1,1024]",全连接特征投影 512→1024,525312,525312,524288,1048576
+91,hash_head.activation,GELU,"[1,1024]","[1,1024]",GELU 平滑非线性激活,0,0,,
+92,hash_head.dropout,Dropout,"[1,1024]","[1,1024]",训练时随机失活，p=0.1,0,0,,
+93,hash_head.contract,Linear,"[1,1024]","[1,512]",全连接特征投影 1024→512,524800,524800,524288,1048576
+94,hash_head.output_norm,LayerNorm,"[1,512]","[1,512]","对末端维度 (512,) 做层归一化",1024,1024,,
+95,hash_head.output_projection,Linear,"[1,512]","[1,512]",全连接特征投影 512→512,262656,262656,262144,524288

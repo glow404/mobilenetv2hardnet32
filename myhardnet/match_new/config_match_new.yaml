@@ -11,7 +11,7 @@
 output:
   # 实验结果根目录。相对路径相对本配置文件所在目录解析。
   # A0 与后续 Strong-256 使用不同目录，禁止复用模板和阈值产物。
-  output_dir: ..\outputs\检查是否有异常手指\hardnet_lr10_best.pt-模板数40-数据集normal_pic
+  output_dir: ..\outputs\检查是否有异常手指\hardnet_256float_512bit_fixed_best.pt-模板数40-数据集normal_pic-31
 
 runtime:
   skip_template_build: false
@@ -53,7 +53,7 @@ model:
   binary_bitorder: auto
 
   # checkpoint 相对路径按本配置文件所在目录解析。
-  checkpoint: ..\outputs\models\hardnet_lr10\best.pt
+  checkpoint: ..\outputs\models\3\models0\hardnet_256float_512bit_fixed\best.pt
 
   # 显式值会覆盖 checkpoint 中对应的模型参数，必须与训练结构兼容。
   # A0 保持旧 checkpoint 的训练配置；Strong-256 使用独立配置/命令行覆盖。
@@ -103,6 +103,10 @@ patch:
 
   # keypoint 靠近边界时，如果裁剪窗口与原图有效重叠过低，就丢弃该点。
   min_overlap_ratio: 0.75
+
+  # true：GPU 批量旋转裁切（grid_sample）；false：逐点整图 warpAffine。
+  # GPU 不可用时自动回退到逐点路径。
+  batch_rotate: true
 
 keypoint_filter:
   # 每张图最多保留的 SIFT keypoints 数，按 response 从高到低截断。

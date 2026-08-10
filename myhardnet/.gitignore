@@ -78,3 +78,4 @@ outputs/**
 !outputs/**/*.pth
 !outputs/**/*.ckpt
 !outputs/**/*.onnx
+!outputs/models/**

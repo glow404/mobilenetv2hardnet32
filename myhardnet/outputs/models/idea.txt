@@ -1,0 +1,132 @@
+倒残差块  标准残差块
+注意力模块 比如SE，
+
+
+
+
+
+
+
+
+
+GeM 是什么
+GeM 是 Generalized Mean Pooling，即“广义均值池化”。
+不同的 \(p\) 对应不同池化行为：
+\(p=1\)：等于全局平均池化。
+\(p\) 较大：更关注强响应区域。
+\(p\rightarrow\infty\)：逐渐接近最大池化。
+
+
+GroupNorm 将256个通道划分为若干组，在单个样本内部做归一化。与 BatchNorm 相比，它不依赖 batch 中其他样本的均值和方差，因此：
+小 batch 下更稳定
+不容易受 batch 内不同手指、不同质量图像分布影响
+训练和推理行为更一致
+SiLU 定义为：
+\[
+\operatorname{SiLU}(x)=x\cdot\sigma(x)
+\]它比 ReLU 更平滑，能够保留少量负响应信息。
+
+
+
+
+
+
+
+
+
+
+strong v2架构图
+```mermaid
+flowchart TD
+    X["输入指纹 Patch<br/>[B,1,32,32]"]
+
+    subgraph STEM["Contrast-Aware Stem"]
+        direction TB
+        S1["局部分支<br/>3×3 Conv → GN → SiLU<br/>[B,16,32,32]"]
+        S2["上下文分支<br/>5×5 Conv → GN → SiLU<br/>[B,16,32,32]"]
+        S3A["局部均值<br/>3×3 AvgPool"]
+        S3B["局部对比度<br/>X - 局部均值"]
+        S3C["对比分支<br/>3×3 Conv → GN → SiLU<br/>[B,16,32,32]"]
+        SCAT["Concat<br/>[B,48,32,32]"]
+        SFUSE["1×1 Conv → GN → SiLU<br/>[B,48,32,32]"]
+    end
+
+    X --> S1
+    X --> S2
+    X --> S3A
+    X --> S3B
+    S3A --> S3B
+    S3B --> S3C
+    S1 --> SCAT
+    S2 --> SCAT
+    S3C --> SCAT
+    SCAT --> SFUSE
+
+    SFUSE --> ST1["Stage 1<br/>2× StableResBlock<br/>[B,48,32,32]"]
+    ST1 --> D1["Down 1<br/>StableResBlock 48→96<br/>2×2 AvgPool, stride=2<br/>[B,96,16,16]"]
+    D1 --> ST2["Stage 2<br/>3× StableResBlock<br/>细粒度特征<br/>[B,96,16,16]"]
+
+    ST2 --> FP1["Fine Projection<br/>1×1 Conv 96→64<br/>GN → SiLU<br/>[B,64,16,16]"]
+    FP1 --> FP2["2×2 AvgPool, stride=2<br/>[B,64,8,8]"]
+
+    ST2 --> D2["Down 2<br/>StableResBlock 96→192<br/>2×2 AvgPool, stride=2<br/>[B,192,8,8]"]
+    D2 --> ST3["Stage 3<br/>4× StableResBlock<br/>粗粒度特征<br/>[B,192,8,8]"]
+
+    FP2 --> CAT["细粒度 + 粗粒度拼接<br/>64 + 192 = 256通道<br/>[B,256,8,8]"]
+    ST3 --> CAT
+
+    subgraph MSC["MultiScaleContext"]
+        direction TB
+        M1["点特征分支<br/>1×1 Conv<br/>[B,64,8,8]"]
+        M2["局部纹理分支<br/>3×3 Depthwise → 1×1 Conv<br/>[B,64,8,8]"]
+        M3["扩张上下文分支<br/>3×3 Depthwise, dilation=2<br/>→ 1×1 Conv<br/>[B,64,8,8]"]
+        M4["全局上下文分支<br/>Global AvgPool → 1×1 Conv<br/>上采样到8×8<br/>[B,64,8,8]"]
+        MCAT["四分支拼接<br/>[B,256,8,8]"]
+        MFUSE["1×1 Conv → GN<br/>LayerScale"]
+        MSCOUT["与1×1捷径相加<br/>[B,256,8,8]"]
+    end
+
+    CAT --> M1
+    CAT --> M2
+    CAT --> M3
+    CAT --> M4
+    M1 --> MCAT
+    M2 --> MCAT
+    M3 --> MCAT
+    M4 --> MCAT
+    MCAT --> MFUSE
+    CAT --> MSCOUT
+    MFUSE --> MSCOUT
+
+    MSCOUT --> HN["Head Norm<br/>GroupNorm → SiLU<br/>[B,256,8,8]"]
+
+    subgraph SPATIAL["空间描述子分支"]
+        direction TB
+        P1["3×3 Conv, stride=2<br/>GN → SiLU<br/>[B,256,4,4]"]
+        P2["3×3 Conv, stride=2<br/>GN → SiLU<br/>[B,256,2,2]"]
+        P3["Dropout2d"]
+        P4["2×2 Conv 256→D<br/>[B,D,1,1]"]
+        PS["Flatten<br/>空间描述子 [B,D]"]
+        P1 --> P2 --> P3 --> P4 --> PS
+    end
+
+    subgraph GLOBAL["全局描述子分支"]
+        direction TB
+        G1["GeM全局池化<br/>[B,256,1,1]"]
+        G2["Flatten<br/>[B,256]"]
+        G3["Linear 256→D<br/>全局描述子 [B,D]"]
+        G1 --> G2 --> G3
+    end
+
+    HN --> P1
+    HN --> G1
+
+    PS --> FCAT["拼接空间与全局描述子<br/>[B,2D]"]
+    G3 --> FCAT
+    FCAT --> FN["LayerNorm(2D)"]
+    FN --> FD["Dropout"]
+    FD --> FL["Linear 2D→D<br/>[B,D]"]
+    FL --> BN["BatchNorm1d(D)<br/>affine=False"]
+    BN --> L2["L2 Normalize"]
+    L2 --> OUT["最终单位长度描述子<br/>当前 D=256<br/>[B,256]"]
+```

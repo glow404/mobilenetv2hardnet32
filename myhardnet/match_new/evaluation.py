@@ -33,7 +33,17 @@ from tqdm import tqdm
 
 from match_new.identity_matcher import load_template_cached, score_query_against_identity
 from match_new.template_builder import load_identity_templates
-from match_new.utils import ensure_dir, read_csv_rows, resolve_path, safe_id, template_filename, write_csv_rows, write_json, write_yaml
+from match_new.utils import (
+    ensure_dir,
+    format_significant_digits,
+    read_csv_rows,
+    resolve_path,
+    safe_id,
+    template_filename,
+    write_csv_rows,
+    write_json,
+    write_yaml,
+)
 
 
 SCORE_FIELDNAMES = [
@@ -895,7 +905,12 @@ def export_failure_cases(
     max_cases = int(failure_cfg.get("max_cases_per_type", 200))
     copy_originals = bool(failure_cfg.get("copy_original_images", True))
     make_preview = bool(failure_cfg.get("make_pair_preview", True))
-    root = ensure_dir(Path(output_dir) / "failure_cases" / f"threshold_{safe_id(str(threshold))}")
+    threshold_text = format_significant_digits(threshold)
+    root = ensure_dir(
+        Path(output_dir)
+        / "failure_cases"
+        / f"threshold_{safe_id(threshold_text)}"
+    )
 
     # 先扫描 verification_scores，找出所有目标阈值下的失败行。
     failures: list[dict[str, Any]] = []
@@ -975,7 +990,13 @@ def export_failure_cases(
     for failure_type, items in ordered.items():
         type_dir = ensure_dir(root / f"{failure_type}s")
         for local_idx, item in enumerate(items[: max_cases if max_cases > 0 else None], start=1):
-            case_id = f"{failure_type}_{local_idx:05d}__score_{safe_id(str(item['score']))}__q_{safe_id(item['query_id'])}__owner_{safe_id(item['owner_identity'])}"
+            score_text = format_significant_digits(float(item["score"]))
+            case_id = (
+                f"{failure_type}_{local_idx:05d}"
+                f"__score_{safe_id(score_text)}"
+                f"__q_{safe_id(item['query_id'])}"
+                f"__owner_{safe_id(item['owner_identity'])}"
+            )
             case_dir = ensure_dir(type_dir / case_id)
             query_src = item["query_image_path"]
             template_src = item["best_template_image_path"]
@@ -990,7 +1011,10 @@ def export_failure_cases(
                     template_src,
                     case_dir / "pair_preview.jpg",
                     title=f"{failure_type} | query={item['query_identity']} owner={item['owner_identity']}",
-                    score_text=f"score={item['score']} threshold={threshold} unique={item['unique_inliers']} raw={item['raw_inliers']}",
+                    score_text=(
+                        f"score={score_text} threshold={threshold_text} "
+                        f"unique={item['unique_inliers']} raw={item['raw_inliers']}"
+                    ),
                 )
             enriched = {
                 **item,

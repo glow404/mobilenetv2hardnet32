@@ -1,0 +1,18 @@
+# Python >= 3.10
+
+# Core numerical and model runtime
+numpy>=1.24
+torch>=2.3
+
+# Image processing and data loading
+opencv-python>=4.4
+Pillow>=9.1
+PyYAML>=6.0
+
+# Matching evaluation and progress reporting
+matplotlib>=3.7
+scikit-learn>=1.2
+tqdm>=4.60
+
+# Tests
+pytest>=7.0

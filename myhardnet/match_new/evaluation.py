@@ -31,7 +31,11 @@ import numpy as np
 from sklearn.metrics import auc, roc_curve
 from tqdm import tqdm
 
-from match_new.identity_matcher import load_template_cached, score_query_against_identity
+from match_new.identity_matcher import (
+    load_template_cached,
+    resolve_early_stop_threshold,
+    score_query_against_identity,
+)
 from match_new.template_builder import load_identity_templates
 from match_new.utils import (
     ensure_dir,
@@ -1205,10 +1209,9 @@ def run_descriptor_l2_evaluation(
             f"identification.match_score_threshold must be in [0,1], got {configured_threshold}"
         )
     fusion_method = str(identification_cfg.get("fusion_method", "max"))
-    # 离线标定必须遍历全部注册模板并保留真实 identity 最大分数，否则阈值曲线、
-    # FAR 和 FRR 会受模板顺序影响。固定阈值早停仅由独立的在线解锁引擎处理。
     scoring_config = copy.deepcopy(config)
-    scoring_config.setdefault("identification", {})["early_stop_on_unlock_threshold"] = False
+    early_stop_threshold = resolve_early_stop_threshold(scoring_config)
+    early_stop_enabled = early_stop_threshold is not None
     far_points = [float(point) for point in evaluation_cfg.get("far_points", [0.001, 0.0001])]
     rng = np.random.default_rng(int(dict(config.get("enrollment", {})).get("random_seed", 42)))
     max_impostors = max(0, int(max_impostor_identities_per_query))
@@ -1244,7 +1247,7 @@ def run_descriptor_l2_evaluation(
                     scoring_config,
                     cache,
                     descriptor_source=source,
-                    early_stop_threshold=None,
+                    early_stop_threshold=early_stop_threshold,
                 )
                 attempt_ms = (time.perf_counter() - started) * 1000.0
                 score = float(result["score"])
@@ -1339,10 +1342,14 @@ def run_descriptor_l2_evaluation(
             "num_genuine_attempts": int(np.sum(labels == 1)),
             "num_impostor_attempts": int(np.sum(labels == 0)),
             "fusion_method": fusion_method,
-            "scoring_mode": "full_query_pool_threshold_selection_and_evaluation",
-            "offline_full_template_scoring": True,
-            "early_stop_on_unlock_threshold": False,
-            "early_stop_threshold": None,
+            "scoring_mode": (
+                "early_stop_query_pool_threshold_selection_and_evaluation"
+                if early_stop_enabled
+                else "full_query_pool_threshold_selection_and_evaluation"
+            ),
+            "offline_full_template_scoring": not early_stop_enabled,
+            "early_stop_on_unlock_threshold": early_stop_enabled,
+            "early_stop_threshold": early_stop_threshold,
             "max_impostor_identities_per_query": max_impostors,
             "matching_config": dict(scoring_config.get("matching", {})),
             "texture_verification_config": dict(scoring_config.get("texture_verification", {})),

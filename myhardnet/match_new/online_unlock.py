@@ -14,7 +14,11 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
-from match_new.identity_matcher import load_template_cached, score_query_against_identity
+from match_new.identity_matcher import (
+    load_template_cached,
+    resolve_early_stop_threshold,
+    score_query_against_identity,
+)
 from match_new.template_builder import (
     build_hardnet_template_from_image,
     load_identity_templates,
@@ -125,15 +129,6 @@ class OnlineUnlockEngine:
 
         # 在线参数完全来自当前配置，可以独立切换 GPU 精度、patch 和匹配参数。
         identification_cfg = dict(config.get("identification", {}))
-        configured_early_stop = identification_cfg.get("early_stop_threshold")
-        threshold_value = (
-            configured_early_stop
-            if configured_early_stop not in {"", None}
-            else identification_cfg.get("match_score_threshold", 0.55)
-        )
-        self.threshold = float(threshold_value)
-        if not 0.0 <= self.threshold <= 1.0:
-            raise ValueError(f"在线匹配阈值必须位于 [0,1]，当前值为 {self.threshold}")
         self.descriptor_source = "hardnet"
         self.fusion_method = str(
             identification_cfg.get("fusion_method", "max")
@@ -141,14 +136,17 @@ class OnlineUnlockEngine:
         self.early_stop_enabled = bool(
             identification_cfg.get("early_stop_on_unlock_threshold", True)
         )
-        if (
-            self.early_stop_enabled
-            and self.fusion_method not in {"max", "max_quality_tiebreak"}
-        ):
-            raise ValueError(
-                "在线早停只支持 max 或 max_quality_tiebreak 融合；"
-                f"当前融合方式为 {self.fusion_method}"
-            )
+        if self.early_stop_enabled:
+            self.threshold = float(resolve_early_stop_threshold(config))
+        else:
+            configured_unlock = identification_cfg.get("early_stop_threshold")
+            if configured_unlock in {"", None}:
+                configured_unlock = identification_cfg.get("match_score_threshold", 0.55)
+            self.threshold = float(configured_unlock)
+            if not 0.0 <= self.threshold <= 1.0:
+                raise ValueError(
+                    f"在线匹配阈值必须位于 [0,1]，当前值为 {self.threshold}"
+                )
 
         self.identities = load_identity_templates(self.identity_templates_path)
         self.identity_by_id = {

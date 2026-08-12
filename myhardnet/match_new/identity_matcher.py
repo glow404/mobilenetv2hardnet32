@@ -65,6 +65,30 @@ def fuse_image_results(results: list[dict[str, Any]], method: str) -> float:
     raise ValueError(f"unsupported fusion method: {method}")
 
 
+def resolve_early_stop_threshold(config: dict[str, Any]) -> float | None:
+    """根据 identification 配置解析早停阈值；关闭早停时返回 None。"""
+
+    identification_cfg = dict(config.get("identification", {}))
+    if not bool(identification_cfg.get("early_stop_on_unlock_threshold", True)):
+        return None
+    fusion_method = str(identification_cfg.get("fusion_method", "max")).lower()
+    if fusion_method not in {"max", "max_quality_tiebreak"}:
+        raise ValueError(
+            "早停只支持 max 或 max_quality_tiebreak 融合；"
+            f"当前融合方式为 {fusion_method}"
+        )
+    configured_early_stop = identification_cfg.get("early_stop_threshold")
+    threshold_value = (
+        configured_early_stop
+        if configured_early_stop not in {"", None}
+        else identification_cfg.get("match_score_threshold", 0.55)
+    )
+    threshold = float(threshold_value)
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(f"早停阈值必须位于 [0,1]，当前值为 {threshold}")
+    return threshold
+
+
 def score_query_against_identity(
     query_template: dict[str, Any],
     identity: dict[str, Any],

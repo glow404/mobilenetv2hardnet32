@@ -94,7 +94,9 @@ identification:
 | `early_stopped` | 是否因为达到阈值提前停止 |
 | `early_stop_threshold` | 本次使用的提前停止阈值 |
 
-该策略只由 `run_online_unlock.py` 使用。`run_hardnet_matching.py` 无条件完整匹配，不会读取在线早停开关来改变离线分数，因此生成的阈值曲线始终有效。
+该策略由 `identification.early_stop_on_unlock_threshold` 控制，离线评估与在线解锁共用同一配置。开启后，`run_hardnet_matching.py` 与 `run_online_unlock.py` 都会在模板分数达到阈值时提前停止；关闭后两者都会完整遍历全部注册模板。`metrics.json` 中的 `offline_full_template_scoring` 会标记本次离线评估是否使用了完整模板遍历。
+
+开启早停可显著降低本人匹配耗时；若需要完整的 identity 最大分数用于阈值曲线、AUC 或 EER，请将 `early_stop_on_unlock_threshold` 设为 `false`。
 
 ## 2. `run_online_unlock.py`
 

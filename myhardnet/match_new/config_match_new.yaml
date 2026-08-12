@@ -11,7 +11,7 @@
 output:
   # 实验结果根目录。相对路径相对本配置文件所在目录解析。
   # A0 与后续 Strong-256 使用不同目录，禁止复用模板和阈值产物。
-  output_dir: ..\outputs\检查是否有异常手指\hardnet_strongv2_256_fixed_best.pt-模板数40-数据集normal_pic-31
+  output_dir: ..\outputs\检查是否有异常手指\m0_256_v2_best.pt-模板数40-数据集normal_pic-31
 
 runtime:
   skip_template_build: false
@@ -53,7 +53,7 @@ model:
   binary_bitorder: auto
 
   # checkpoint 相对路径按本配置文件所在目录解析。
-  checkpoint: ..\outputs\models\3\models2\hardnet_strongv2_256_fixed\best.pt
+  checkpoint: ..\outputs\models\3\m0\m0_256_v2\best.pt
 
   # 显式值会覆盖 checkpoint 中对应的模型参数，必须与训练结构兼容。
   # A0 保持旧 checkpoint 的训练配置；Strong-256 使用独立配置/命令行覆盖。
@@ -139,7 +139,7 @@ matching:
   # 绝对距离上限。最近邻距离仍必须不超过该值
   abs_distance_threshold: 1.5
 
-  # 自适应距离上限：nearest_distance + distance_margin。topk只才有用。
+  # 自适应距离上限：nearest_distance + distance_margin。topk才有用。
   # 实际上限取 min(abs_distance_threshold, nearest + margin)。
   distance_margin: 0.15
 
@@ -258,10 +258,11 @@ identification:
 
   # [0,1] 连续匹配分数阈值，不再表示 unique inlier 数。
   # 当前 0.55 是首轮值，正式推荐看 target_operating_point 后重新标定。
-  match_score_threshold: 0.55
+  match_score_threshold: 0.70
 
   # 解锁式匹配加速：当某张注册模板的图像级 score 已经达到解锁阈值时，
   # 立即返回该 identity 的结果，不再继续匹配剩余注册模板。
+  # 离线评估与在线解锁共用该开关；关闭后会遍历全部注册模板以得到完整 identity 最大分数。
   # 只对 max / max_quality_tiebreak 融合方式启用；mean / top3_mean 会自动关闭。
   early_stop_on_unlock_threshold: true
 

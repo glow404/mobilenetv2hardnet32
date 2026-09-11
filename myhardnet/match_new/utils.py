@@ -189,7 +189,7 @@ def write_csv_rows(path: str | Path, rows: list[dict[str, Any]], fieldnames: lis
         }
         for row in rows
     ]
-    with target.open("w", encoding="utf-8", newline="") as handle:
+    with target.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(formatted_rows)

@@ -1,0 +1,49 @@
+# match_new 常调实验参数
+#
+# 运行时仍使用 config_match_new.yaml；主配置会自动继承本文件。
+# 模型、数据集、输出目录、注册数量及匹配阈值变化时，优先只修改这里。
+
+output:
+  output_dir: ..\outputs\检查是否有异常手指\m0_256_512_v2_best.pt-模板数40-数据集normal_pic-31_hamming_ratio_0.90_abs_distance_0.50_不做双向认证
+
+runtime:
+  skip_template_build: false
+
+data:
+  image_root: ../datasets/normal_pic
+
+model:
+  checkpoint: ..\outputs\models\3\m0\m0_256_512_v2\best.pt
+
+matching:
+  # 浮点 L2 候选阈值。
+  ratio_threshold: 0.85
+  bidirectional_ratio_test: false
+  abs_distance_threshold: 1.5
+  distance_margin: 0.15
+
+  # 二值 Hamming 候选阈值。
+  hamming:
+    backend: cpu
+    ratio_threshold: 0.90
+    abs_distance_threshold: 0.50
+    distance_margin: 0.05
+
+  allow_many_to_one_before_ransac: true
+
+texture_verification:
+  low_unique_inliers: 3
+  geometry_saturation_inliers: 12.0
+  geometry_weight: 0.70
+  texture_weight: 0.30
+  block_size: 16
+  blur_sigma: 0.8
+  min_block_std: 5.0
+  min_block_valid_fraction: 0.60
+  min_valid_blocks: 4
+  min_overlap_fraction: 0.20
+
+enrollment:
+  enrollment_images_per_identity: 40
+  selection_strategy: random
+  random_seed: 42

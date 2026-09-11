@@ -9,11 +9,14 @@ conda activate hardnet-cuda
 
 默认配置文件：`match_new/config_match_new.yaml`
 
+常调实验参数集中在 `match_new/config_match_tuning.yaml`；主配置通过
+`extends` 自动继承，运行命令和 `--config` 路径无需修改。
+
 ---
 
 ## 1. `run_hardnet_matching.py`
 
-**作用**：HardNet 全量离线阈值标定实验。只检测 SIFT 关键点位置/方向，计算 HardNet 描述子并匹配；支持 float32/L2 与 packed binary/Hamming 两种 checkpoint 契约，后续候选生成、RANSAC、纹理融合和 identity 级评估共用。所有未注册 query 都会遍历本人和全部非本人 identity 的全部注册模板，不再拆分 validation/test；阈值曲线、阈值选择和最终 FAR/FRR 均基于同一份全量匹配结果。
+**作用**：HardNet 全量离线阈值标定实验。只检测 SIFT 关键点位置/方向，计算 HardNet 描述子并匹配；支持 float32/L2 与 packed binary/Hamming 两种 checkpoint 契约，后续候选生成、RANSAC、纹理融合和 identity 级评估共用。所有未注册 query 都会遍历本人和全部非本人 identity 的全部注册模板，不再拆分 validation/test；阈值曲线和最终 FAR/FRR 均基于同一份全量匹配结果。
 
 **运行参数**默认写在 `match_new/config_match_new.yaml`：
 
@@ -33,8 +36,6 @@ conda activate hardnet-cuda
 | `enrollment.random_seed` | 注册/query 划分种子 |
 | `texture_verification.*` | 局部脊线纹理二次筛选及灰区提升参数 |
 | `template_management.*` | 在线模板学习、LRU排序和固定容量替换 |
-| `evaluation.target_far` / `target_frr` | 目标 FAR/FRR |
-| `evaluation.failure_export.*` | 失败样本导出 |
 
 优先级：`命令行覆盖 > 配置文件 > 程序默认值`。
 
@@ -66,7 +67,6 @@ python match_new\run_hardnet_matching.py `
 | `--skip-template-build` / `--no-skip-template-build` | 覆盖是否跳过模板构建 |
 | `--max_impostor_identities_per_query` | 覆盖 impostor 上限 |
 | `--random_seed` | 覆盖注册随机种子 |
-| `--target_far` / `--target_frr` | 覆盖目标 FAR/FRR |
 | `--failure-export` / `--no-failure-export` | 覆盖是否导出失败样本 |
 | `--max_failure_cases_per_type` | 覆盖每类失败样本导出上限 |
 | `--limit_identities` | 调试：限制 identity 数量 |
@@ -100,45 +100,198 @@ identification:
 
 ## 2. `run_online_unlock.py`
 
-**作用**：使用当前在线配置匹配指定的已注册手指，命中阈值后立即返回，不生成阈值曲线。批量基准只用成功解锁记录计算最快、平均值和百分位数，匹配失败记录保留在明细 CSV 中但不参与耗时统计。
+**作用**：模拟手机端固定阈值解锁。进程启动后常驻模型、SIFT 检测器和注册模板；每次请求从一张原始指纹图在内存中构建 query 模板，再与**指定的一个**已注册 identity 匹配并返回接受/拒绝结果。支持单次解锁和批量本人 query 延迟基准。
 
-单张解锁：
+**前置条件**：先运行 `run_hardnet_matching.py` 生成离线产物目录，其中至少包含：
+
+- `image_templates/`：注册模板 `.npz`
+- `metadata_all.csv`：原图索引（benchmark 用来推导 query 列表）
+- `identity_templates_<N>.json`：注册模板索引（`<N>` 为 `enrollment.enrollment_images_per_identity`）
+
+**配置优先级**：`命令行 > config_match_new.yaml > 程序缺省值`。在线入口**读取当前 YAML 中的模型、SIFT、patch、matching、纹理和 identification 参数**，不要求与生成 `artifacts` 那次离线实验完全一致；但 checkpoint 必须与注册模板描述子契约兼容。
+
+**在线不会读取**：`evaluation.*`（FAR/FRR 标定）、`runtime.max_impostor_identities_per_query`（impostor 全量扫描仅离线有）、`template_management.enabled`（当前解锁路径不执行模板学习）。
+
+### 运行模式
+
+| 模式 | 命令 | 匹配范围 | 主要输出 |
+|------|------|----------|----------|
+| 单次解锁 | `--image` + `--identity` | 1 张 query 图 → 1 个指定 identity | 终端 JSON |
+| 延迟基准 | `--benchmark` | 批量本人 query → 各自 identity | `online_unlock_attempts.csv`、`online_unlock_summary.json` |
+
+在线**不支持**“每个 query 对本人 + 全部非本人 identity”的全量扫描；该能力仅由 `run_hardnet_matching.py` 提供。
+
+### 命令行参数
+
+| 参数 | 缺省值 | 作用 |
+|------|--------|------|
+| `--config` | `match_new/config_match_new.yaml` | 本次在线测试使用的 YAML |
+| `--artifacts` | 读取 `output.output_dir` | 离线产物根目录（含模板与 metadata） |
+| `--image` | （与 `--benchmark` 二选一） | 单次解锁的 query 原图路径 |
+| `--identity` | 无 | 与 `--image` 配合，指定已注册手指 ID |
+| `--benchmark` | 无 | 对 metadata 中全部 query 跑本人延迟基准 |
+| `--limit` | `0` | benchmark 最多测几条 query；`0` 表示全量 |
+| `--output-dir` | `<artifacts>/<benchmark_output_dir>` | 覆盖 benchmark 结果输出目录 |
+
+**单次解锁示例**：
 
 ```powershell
 python match_new\run_online_unlock.py `
-  --artifacts match_new\ysjz_V4 `
+  --artifacts "..\outputs\你的实验目录" `
   --identity dy_L0 `
-  --image D:\query.bmp
+  --image "D:\query.bmp"
 ```
 
-批量 genuine query 延迟测试：
+**批量延迟基准示例**：
 
 ```powershell
 python match_new\run_online_unlock.py `
-  --artifacts match_new\ysjz_V4 `
-  --benchmark
+  --artifacts "..\outputs\你的实验目录" `
+  --benchmark `
+  --limit 100 `
+  --output-dir "..\outputs\你的实验目录\online_unlock_benchmark"
 ```
 
-在线入口通过 `--artifacts` 和 `online_unlock.identity_templates` 定位注册模板；批量 benchmark 使用 `metadata_all.csv` 与注册模板索引在内存中推导 query 划分，不再依赖单独的 split CSV。在线耗时测试以当前 YAML 配置为准，不要求模型、预处理、匹配参数和阈值与离线一致。
+### `online_unlock.*` 专用参数
 
-在线基准输出：
+| 配置项 | 缺省值 | 作用 |
+|--------|--------|------|
+| `identity_templates` | 空 → 自动使用 `identity_templates_<enrollment_images_per_identity>.json` | 注册模板索引 JSON；相对路径相对于 `--artifacts` |
+| `image_templates_dir` | `image_templates` | 注册模板 `.npz` 子目录 |
+| `preload_templates` | `true` | 启动时预加载全部注册模板到内存；预加载耗时**不计入**单次解锁 |
+| `model_warmup_runs` | `0` | 模型空 patch 预热次数；预热耗时单独统计 |
+| `persist_query_template` | `false` | 必须为 `false`；query 模板只在内存中使用 |
+| `template_learning_after_decision` | `false` | 必须为 `false`；当前路径不在解锁返回后写模板库 |
+| `benchmark_output_dir` | `online_unlock_benchmark` | benchmark 结果相对 `--artifacts` 的子目录 |
+| `timing.percentiles` | `[50, 90, 95, 99]` | 汇总 JSON 中输出的耗时百分位 |
 
-- `online_unlock_attempts.csv`：全部成功和失败尝试的逐次明细；`included_in_timing_statistics` 表示是否进入汇总。
-- `online_unlock_summary.json`：仅基于 `accepted=true` 的成功解锁生成耗时统计。
+示例：
 
-模板构建阶段包括 `image_read_ms`、`sift_keypoint_detection_ms`、
-`keypoint_filter_ms`、`patch_crop_rotate_ms`、`hardnet_inference_ms` 和
-`template_assembly_ms`。匹配阶段包括 `registered_template_load_ms`、
-`candidate_generation_ms`、`candidate_filter_ms`、`ransac_ms`、
-`inlier_refinement_ms`、`texture_similarity_ms`、`score_fusion_ms` 和
-`identity_fusion_ms` 等字段。每个阶段都输出最快、平均、最慢及配置指定的
-百分位数。
+```yaml
+online_unlock:
+  identity_templates:
+  image_templates_dir: image_templates
+  preload_templates: true
+  model_warmup_runs: 3
+  persist_query_template: false
+  template_learning_after_decision: false
+  benchmark_output_dir: online_unlock_benchmark
+  timing:
+    percentiles: [50, 90, 95, 99]
+```
 
-离线主实验还会把每张图像的注册分阶段耗时写入
-`template_build_timings.csv`，并在 `enrollment_timing.csv/json` 中按手指
-累计。注册统计额外包含 `template_persist_ms`（模板落盘）和
-`template_registration_overhead_ms`，因此各阶段之和可以与一个手指的
-`registration_total_ms` 对账。
+### `identification.*` 判定与早停
+
+| 配置项 | 缺省值 | 作用 |
+|--------|--------|------|
+| `fusion_method` | `max` | identity 分数融合：`max` / `mean` / `top3_mean` / `max_quality_tiebreak` |
+| `match_score_threshold` | `0.55` | 解锁分数阈值，范围 `[0,1]` |
+| `early_stop_on_unlock_threshold` | `true` | 是否在模板分数达到阈值后立即停止遍历 |
+| `early_stop_threshold` | 空 | 早停阈值；空/null 时使用 `match_score_threshold` |
+
+规则：
+
+- 早停仅对 `max`、`max_quality_tiebreak` 生效；`mean`、`top3_mean` 必须跑完所有模板。
+- 开启早停时，接受/拒绝结论与完整遍历一致，但耗时更低。
+- 关闭早停时，解锁阈值仍用 `match_score_threshold`（或 `early_stop_threshold` 若显式填写）。
+
+### 在线共用的模型与特征参数（`model.*` / `sift.*` / `patch.*`）
+
+在线构建 query 模板时使用与离线相同的 HardNet + SIFT 流水线。
+
+| 配置段 | 主要项 | 程序缺省值 | 说明 |
+|--------|--------|------------|------|
+| `model.checkpoint` | — | 无 | HardNet 权重路径；必须与注册模板描述子类型一致 |
+| `model.descriptor_kind` | `auto` | 跟随 checkpoint：`float` 或 `binary` |
+| `model.binary_storage` / `binary_bitorder` | `auto` | 二值 checkpoint 的 packed 存储契约 |
+| `model.device` | `auto` | 优先 CUDA，失败可回退 CPU（`fallback_to_cpu: true`） |
+| `model.batch_size` | `512` | HardNet patch 批量推理大小 |
+| `model.fixed_inference_batch_size` | `512` | 在线动态关键点补齐 batch |
+| `model.inference_precision` | `fp16` | CNN 前向精度；描述子仍返回 FP32 / packed uint8 |
+| `sift.nfeatures` | OpenCV 默认 | 当前配置常用 `500` |
+| `sift.nOctaveLayers` | `3` | 尺度层数 |
+| `sift.contrastThreshold` | `0.04`（OpenCV） | 当前配置常用 `0.03` |
+| `sift.edgeThreshold` | `10`（OpenCV） | 当前配置常用 `17.5` |
+| `sift.sigma` | `1.6`（OpenCV） | 当前配置常用 `1.70` |
+| `sift.enable_clahe` / `enable_blur` | `false` | 提特征前预处理 |
+| `keypoint_filter.max_keypoints` | 不截断 | 当前配置常用 `500` |
+| `patch.crop_size` / `out_size` | — | 必须与训练一致，当前为 `32` |
+| `patch.normalize` | — | 单 patch 减均值除标准差，当前为 `true` |
+| `patch.min_overlap_ratio` | — | 边界关键点丢弃阈值，当前常用 `0.75` |
+| `patch.batch_rotate` | `false` | 默认逐点局部反向采样；`true` 时启用批量旋转裁切 |
+
+### 在线共用的匹配参数（`matching.*`）
+
+| 配置项 | 程序缺省值 | `config_match_new.yaml` 常见值 | 作用 |
+|--------|------------|-------------------------------|------|
+| `distance` | `auto` | `auto` | `auto` 跟随 checkpoint：`l2` 或 `hamming` |
+| `candidate_policy` | `topk_or_ratio` | `ratio_only` | 候选生成策略 |
+| `top_k` | `5` | `1` | 每个 query 点保留的近邻数（`ratio_only` 下多为 1） |
+| `ratio_threshold` | `0.95` | L2 `0.85`；Hamming 见 `hamming.ratio_threshold` | Lowe ratio 阈值 |
+| `bidirectional_ratio_test` | `false` | 按实验配置 | 双向最近邻 + 双向 ratio |
+| `abs_distance_threshold` | `1.10` | L2 `1.5`；Hamming 见 `hamming.abs_distance_threshold` | 绝对距离上限 |
+| `distance_margin` | `0.12` | L2 `0.15` | top-k 自适应距离上限（ratio 策略下影响小） |
+| `allow_many_to_one_before_ransac` | `true` | 按实验配置 | RANSAC 前是否保留一对多 |
+| `max_candidates_for_ransac` | `250` | `300` | 进入 RANSAC 前的候选上限 |
+| `orientation_soft_gate` | `true` | `false` | true：方向软门控截断；false：仅按距离截断，候选阶段不算主方向 |
+| `orientation_weight` | `0.15` | `0.15` | 方向惩罚权重 |
+| `ransac_reproj_threshold` | `5.0` | `0.5` | RANSAC 重投影阈值（像素） |
+| `ransac_max_iters` | `3000` | `3000` | RANSAC 最大迭代 |
+| `ransac_confidence` | `0.995` | `0.995` | RANSAC 置信度 |
+| `min_scale` / `max_scale` | `0.0` / `∞` | `0.80` / `1.20` | partial affine 尺度范围 |
+| `reproj_error_weight` | `0.05` | `0.05` | one-to-one 去重时的重投影误差权重 |
+| `hamming.backend` | `cpu` | `cpu` | packed-Hamming 后端：`cpu` / `cuda` |
+| `hamming.ratio_threshold` | 继承顶层 | `0.85` | 二值 ratio 阈值 |
+| `hamming.abs_distance_threshold` | 继承顶层 | `0.50` | 二值绝对距离上限 |
+| `hamming.distance_margin` | 继承顶层 | `0.05` | 二值自适应 margin |
+
+Hamming 路径下，`matching.hamming.*` 会覆盖同名顶层 L2 参数。
+
+### 在线共用的纹理融合参数（`texture_verification.*`）
+
+| 配置项 | 程序缺省值 | 常见值 | 作用 |
+|--------|------------|--------|------|
+| `enabled` | `false` | `true` | 是否启用几何 + 脊线纹理融合 |
+| `low_unique_inliers` | `4` | `3` | 低于该 unique 内点数直接 score=0 |
+| `geometry_saturation_inliers` | `12.0` | `12.0` | 几何分数饱和内点数 |
+| `geometry_weight` / `texture_weight` | `0.70` / `0.30` | 同上 | 融合权重（自动归一化） |
+| `block_size` | `16` | `16` | ZNCC 分块大小 |
+| `blur_sigma` | `0.8` | `0.8` | 纹理计算前高斯模糊 |
+| `min_block_std` | `5.0` | `5.0` | 有效块最低对比度 |
+| `min_block_valid_fraction` | `0.60` | `0.60` | 块内有效重叠比例 |
+| `min_valid_blocks` | `4` | `4` | 至少多少有效块才出纹理分 |
+| `min_overlap_fraction` | `0.20` | `0.20` | warp 后有效重叠面积比例 |
+
+启用纹理融合时，注册模板必须含 `overlap_image` 字段。
+
+### 输出文件与耗时字段
+
+**单次解锁**：结果打印到终端 JSON，字段包括 `accepted`、`decision_score`、`threshold`、`match_ms`、`end_to_end_ms`、`end_to_end_core_ms` 以及各阶段 `*_ms`。
+
+**批量 benchmark**（默认写入 `<artifacts>/online_unlock_benchmark/`）：
+
+| 文件 | 内容 |
+|------|------|
+| `online_unlock_attempts.csv` | 每次尝试明细；`included_in_timing_statistics=true` 表示进入汇总 |
+| `online_unlock_summary.json` | 仅统计 `accepted=true` 的成功解锁 |
+
+`online_unlock_summary.json` 主要字段：
+
+- `timing_scope`：固定为 `accepted_unlocks_only`
+- `template_build` / `matching` / `end_to_end`：总耗时及各阶段 `fastest_ms`、`average_ms`、`p50_ms`、`p90_ms` 等
+- `end_to_end`：使用 `end_to_end_core_ms`（不含 `descriptor_prepare_ms`、`postprocess_ms`、`identity_match_overhead_ms`、`matching_wrapper_overhead_ms`）
+- `end_to_end_wall_clock`：完整墙钟 `end_to_end_ms`
+- `startup`：`model_initialization_ms`、`model_warmup_ms`、`template_preload_ms`（不计入单次解锁）
+- `early_stop_rate_on_successful_unlocks`：成功解锁中触发早停的比例
+
+分阶段耗时字段：
+
+- 模板构建：`image_read_ms`、`sift_keypoint_detection_ms`、`keypoint_filter_ms`、`patch_crop_rotate_ms`、`hardnet_inference_ms`、`template_assembly_ms`、`template_total_ms`
+- 匹配：`registered_template_load_ms`、`descriptor_prepare_ms`、`candidate_generation_ms`、`candidate_filter_ms`、`ransac_ms`、`inlier_refinement_ms`、`unique_inlier_dedup_ms`（一对一去重，含于 refinement 总时长内）、`texture_similarity_ms`、`score_fusion_ms`、`postprocess_ms`、`identity_fusion_ms`、`identity_match_total_ms`、`match_ms`、`end_to_end_ms`
+
+汇总中的百分位由 `online_unlock.timing.percentiles` 控制；明细 CSV 保留每次尝试的原始毫秒数。
+
+离线主实验的注册/template 构建耗时见 `template_build_timings.csv` 与 `enrollment_timing.csv/json`（第 1 节）。
 
 **换 checkpoint 示例**：
 
@@ -195,12 +348,12 @@ identification:
   match_score_threshold: 0.55
 ```
 
-`unique_inliers` 继续作为诊断字段输出，但不再直接充当 `score` 或解锁阈值。以上权重和 `0.55` 是初始配置值；离线评估会直接使用全部 query 的 identity 级分数扫描 FAR/FRR 并选择目标阈值。`verification_scores.csv` 会额外输出 `geometry_similarity`、`texture_similarity`、有效重叠比例、有效块数和实际融合权重。
+`unique_inliers` 继续作为诊断字段输出，但不再直接充当 `score` 或解锁阈值。离线评估会直接使用全部 query 的 identity 级分数扫描 FAR/FRR，并在 `identification.match_score_threshold` 下报告最终结果。`verification_scores.csv` 会额外输出 `geometry_similarity`、`texture_similarity`、有效重叠比例、有效块数和实际融合权重。
 
 FAR/FRR 阈值曲线写入 `match_score_threshold_curve.csv`。默认按 `0.01` 在 `[0,1]` 范围扫描，不再生成整数内点阈值曲线。
 
-固定的 `0.30`--`0.70`（步长 `0.01`）结果写入
-`far_frr_thresholds_0.30_0.70.csv`。此外，
+固定阈值区间的 FAR/FRR 对照表由 `evaluation.far_frr_table` 控制，默认
+`0.50--0.85`（步长 `0.01`），写入 `far_frr_thresholds_0.50_0.85.csv`。此外，
 `per_finger_far_frr_at_global_zero_far.csv` 使用所有手指共同的
 “全局 FAR=0 且 FRR 最小”阈值：第一行是全体统计，后续各行按
 `owner_identity` 汇总单个注册手指的 FAR/FRR 及接受、拒绝计数。

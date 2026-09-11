@@ -642,7 +642,7 @@ def metric_matching_config(
     config: dict[str, Any],
     metric: str,
 ) -> dict[str, Any]:
-    """合并通用候选参数与指定距离度量的专用阈值。"""
+    """校验距离契约，并在 Hamming 模式下应用二值专用阈值。"""
 
     configured = str(config.get("distance", "auto")).strip().lower()
     if configured == "euclidean":
@@ -652,11 +652,13 @@ def metric_matching_config(
             "matching.distance does not match template/checkpoint metric: "
             f"config={configured}, descriptor={metric}."
         )
-    overrides = config.get(metric, {})
-    if overrides is None:
-        overrides = {}
+    overrides = (
+        config.get(HAMMING_DISTANCE_METRIC, {})
+        if metric == HAMMING_DISTANCE_METRIC
+        else {}
+    )
     if not isinstance(overrides, dict):
-        raise ValueError(f"matching.{metric} must be a mapping.")
+        raise ValueError("matching.hamming must be a mapping.")
     return {**config, **overrides, "distance": metric}
 
 
@@ -952,11 +954,22 @@ def dominant_angle_delta(candidates: list[MatchCandidate], bin_deg: float = 10.0
     return wrap_angle_deg(-180.0 + (best + 0.5) * bin_deg)
 
 
-def soft_gate_candidates(candidates: list[MatchCandidate], cfg: dict[str, Any]) -> tuple[list[MatchCandidate], float]:
-    """候选过多时做轻量截断。
+def truncate_candidates_by_distance(
+    candidates: list[MatchCandidate],
+    max_candidates: int,
+) -> list[MatchCandidate]:
+    """候选过多时按描述子距离保留前 N 个；max_candidates<=0 表示不截断。"""
 
-    如果候选数未超过 max_candidates_for_ransac，原样返回。
-    如果超过，则按“归一化描述子距离 + 少量方向惩罚”排序，只保留前 N 个。
+    if max_candidates <= 0 or len(candidates) <= max_candidates:
+        return candidates
+    keep = np.argsort([item.distance for item in candidates])[:max_candidates]
+    return [candidates[int(i)] for i in keep]
+
+
+def soft_gate_candidates(candidates: list[MatchCandidate], cfg: dict[str, Any]) -> tuple[list[MatchCandidate], float]:
+    """方向软门控：统计主方向差，超限时按“距离 + 方向惩罚”截断。
+
+    仅在 orientation_soft_gate=true 时调用。
     方向惩罚权重很小，目的是让 RANSAC 少看一点明显方向离群的候选，
     而不是复刻 SIFT 方向峰硬过滤。
     """
@@ -966,20 +979,17 @@ def soft_gate_candidates(candidates: list[MatchCandidate], cfg: dict[str, Any]) 
     if max_candidates <= 0 or len(candidates) <= max_candidates:
         return candidates, dominant
 
-    if bool(cfg.get("orientation_soft_gate", True)):
-        distances = np.asarray([item.distance for item in candidates], dtype=np.float32)
-        lo = float(np.min(distances))
-        hi = float(np.max(distances))
-        denom = max(hi - lo, 1e-6)
-        weight = float(cfg.get("orientation_weight", 0.15))
-        scored = []
-        for idx, candidate in enumerate(candidates):
-            norm_dist = (candidate.distance - lo) / denom
-            angle_penalty = min(abs(wrap_angle_deg(candidate.angle_delta - dominant)), 45.0) / 45.0
-            scored.append((norm_dist + weight * angle_penalty, idx))
-        keep = [idx for _, idx in sorted(scored, key=lambda item: item[0])[:max_candidates]]
-    else:
-        keep = np.argsort([item.distance for item in candidates])[:max_candidates].tolist()
+    distances = np.asarray([item.distance for item in candidates], dtype=np.float32)
+    lo = float(np.min(distances))
+    hi = float(np.max(distances))
+    denom = max(hi - lo, 1e-6)
+    weight = float(cfg.get("orientation_weight", 0.15))
+    scored = []
+    for idx, candidate in enumerate(candidates):
+        norm_dist = (candidate.distance - lo) / denom
+        angle_penalty = min(abs(wrap_angle_deg(candidate.angle_delta - dominant)), 45.0) / 45.0
+        scored.append((norm_dist + weight * angle_penalty, idx))
+    keep = [idx for _, idx in sorted(scored, key=lambda item: item[0])[:max_candidates]]
     return [candidates[int(i)] for i in keep], dominant
 
 
@@ -1384,6 +1394,7 @@ def match_templates_descriptor(query: dict[str, Any], gallery: dict[str, Any], c
         "candidate_filter_ms": 0.0,
         "ransac_ms": 0.0,
         "inlier_refinement_ms": 0.0,
+        "unique_inlier_dedup_ms": 0.0,
         "texture_similarity_ms": 0.0,
         "score_fusion_ms": 0.0,
         "postprocess_ms": 0.0,
@@ -1446,9 +1457,19 @@ def match_templates_descriptor(query: dict[str, Any], gallery: dict[str, Any], c
     ) * 1000.0
     base["num_raw_matches"] = int(len(candidates))
 
-    # 阶段 2：候选过多时做软截断，并记录主方向差作为诊断指标。
+    # 阶段 2：进入 RANSAC 前截断。
+    # orientation_soft_gate=true：方向软门控（含主方向统计）。
+    # false：不算主方向，超限时仅按描述子距离截断。
     stage_started = time.perf_counter()
-    candidates_for_ransac, dominant = soft_gate_candidates(candidates, cfg)
+    use_orientation_soft_gate = bool(cfg.get("orientation_soft_gate", True))
+    if use_orientation_soft_gate:
+        candidates_for_ransac, dominant = soft_gate_candidates(candidates, cfg)
+    else:
+        candidates_for_ransac = truncate_candidates_by_distance(
+            candidates,
+            int(cfg.get("max_candidates_for_ransac", 250)),
+        )
+        dominant = 0.0
     timings["candidate_filter_ms"] = (
         time.perf_counter() - stage_started
     ) * 1000.0
@@ -1498,7 +1519,17 @@ def match_templates_descriptor(query: dict[str, Any], gallery: dict[str, Any], c
         return finish(base, {"candidates": candidate_debug_rows(candidates_for_ransac, query_xy, gallery_xy), "raw_inliers": [], "unique_inliers": []})
 
     # 阶段 4：把 RANSAC 原始 inliers 清理成真正的一对一 inliers。
-    kept, stage1_errors = unique_inliers(raw_inliers, query_xy, gallery_xy, np.asarray(matrix, dtype=np.float64), cfg)
+    dedup_started = time.perf_counter()
+    kept, stage1_errors = unique_inliers(
+        raw_inliers,
+        query_xy,
+        gallery_xy,
+        np.asarray(matrix, dtype=np.float64),
+        cfg,
+    )
+    timings["unique_inlier_dedup_ms"] = (
+        time.perf_counter() - dedup_started
+    ) * 1000.0
     if len(kept) >= 2:
         kept_src, kept_dst = points_from_candidates(kept, query_xy, gallery_xy)
         refined = estimate_partial_affine_ls(kept_src, kept_dst)
@@ -1524,6 +1555,13 @@ def match_templates_descriptor(query: dict[str, Any], gallery: dict[str, Any], c
     mean_distance = float(np.mean(distances)) if distances.size else 0.0
     mean_reproj = float(np.mean(final_errors)) if final_errors.size else 0.0
     inlier_ratio = float(unique_count / max(len(candidates_for_ransac), 1))
+    # 方向门控关闭时，主方向仅用于最终内点诊断，避免在候选阶段白算。
+    if not use_orientation_soft_gate:
+        dominant = dominant_angle_delta(
+            kept,
+            float(cfg.get("orientation_hist_bin_deg", 10.0)),
+        )
+        base["dominant_angle_delta"] = float(dominant)
     orient = orientation_consistency(
         kept,
         dominant,

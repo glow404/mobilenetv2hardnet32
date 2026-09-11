@@ -12,8 +12,9 @@
 
 from __future__ import annotations
 
-import warnings
 import math
+import warnings
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -180,38 +181,50 @@ def extract_aligned_patch(
     crop_size: int,
     out_size: int,
 ) -> np.ndarray:
-    """按关键点方向旋转原图，再裁剪与训练阶段一致的局部 patch。
+    """按关键点位置和方向直接从原图采样局部 patch。
 
-    当前保留已有模型使用的旧裁剪语义。后续若切换成直接局部仿射采样，必须让
-    训练数据生成和本函数同时切换，并重新训练模型、标定阈值。
+    只为输出 patch 构造反向坐标映射，不再为每个关键点旋转整张图。非整数
+    坐标使用双线性插值，越界位置补零。
     """
 
     x, y = keypoint.pt
     angle = float(keypoint.angle if keypoint.angle >= 0 else 0.0)
-    height, width = image.shape[:2]
-    matrix = cv2.getRotationMatrix2D(
-        (float(x), float(y)),
-        angle,
-        1.0,
-    )
-    rotated = cv2.warpAffine(
+    offset_x, offset_y = _centered_patch_grid(int(crop_size))
+    angle_rad = math.radians(angle)
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    map_x = (
+        float(x) + cos_a * offset_x - sin_a * offset_y
+    ).astype(np.float32)
+    map_y = (
+        float(y) + sin_a * offset_x + cos_a * offset_y
+    ).astype(np.float32)
+    patch = cv2.remap(
         image,
-        matrix,
-        dsize=(width, height),
-        flags=cv2.INTER_LINEAR,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
-    )
-    patch = cv2.getRectSubPix(
-        rotated,
-        patchSize=(int(crop_size), int(crop_size)),
-        center=(float(x), float(y)),
     )
     return cv2.resize(
         patch,
         (int(out_size), int(out_size)),
         interpolation=cv2.INTER_AREA,
     )
+
+
+@lru_cache(maxsize=8)
+def _centered_patch_grid(crop_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """缓存局部 patch 相对中心的坐标网格。"""
+
+    if crop_size <= 0:
+        raise ValueError(f"crop_size must be positive, got {crop_size}")
+    offsets = (
+        np.arange(crop_size, dtype=np.float32)
+        - (float(crop_size) - 1.0) / 2.0
+    )
+    return np.meshgrid(offsets, offsets)
 
 
 def normalize_patch(
@@ -234,7 +247,7 @@ def extract_aligned_patches_batch(
     out_size: int,
     device: torch.device | None = None,
 ) -> np.ndarray:
-    """GPU 批量旋转裁切：一次 ``grid_sample`` 完成全部 patch 的方向对齐。
+    """PyTorch 批量旋转裁切：一次 ``grid_sample`` 完成全部 patch 的方向对齐。
 
     策略：
         1. 从原图按关键点坐标直接裁取 padded patch（无旋转，比最终 patch 大一圈）；
@@ -242,8 +255,7 @@ def extract_aligned_patches_batch(
         3. 一次 ``affine_grid`` + ``grid_sample`` 批量完成旋转；
         4. 输出形状 ``[N, out_size, out_size]`` 的 float32 数组，像素值域 0–255。
 
-    GPU 不可用或 ``grid_sample`` 失败时，自动回退到逐点
-    ``extract_aligned_patch``（保留旧语义）。
+    ``grid_sample`` 失败时，自动回退到逐点局部反向采样。
 
     ``crop_size`` 仅用于确定 padded patch 尺寸以保证旋转后不越界，
     实际输出尺寸由 ``out_size`` 决定。
@@ -322,7 +334,7 @@ def extract_aligned_patches_batch(
         )
     theta_batch = torch.stack(thetas)  # [N, 2, 3]
 
-    # ── 阶段 3：GPU 批量旋转 ──
+    # ── 阶段 3：PyTorch 批量旋转 ──
     try:
         patches_t = (
             torch.from_numpy(np.stack(patches_host))
@@ -363,12 +375,12 @@ def patchable_keypoints(
 ) -> tuple[list[cv2.KeyPoint], np.ndarray, list[int]]:
     """过滤严重越界的关键点，并构建与关键点行号对齐的 patch 数组。
 
-    当 ``patch.batch_rotate=true``（默认）时，使用 GPU 批量旋转；
-    否则使用逐点 OpenCV 整图旋转。标准化始终批量完成。
+    默认使用逐点局部反向采样；当 ``patch.batch_rotate=true`` 时，使用
+    PyTorch 批量旋转。标准化始终批量完成。
     """
 
     crop_size = int(
-        get_nested(config, "patch", "crop_size", default=64)
+        get_nested(config, "patch", "crop_size", default=32)
     )
     out_size = int(
         get_nested(config, "patch", "out_size", default=32)
@@ -380,7 +392,7 @@ def patchable_keypoints(
         get_nested(config, "patch", "normalize", default=True)
     )
     batch_rotate = bool(
-        get_nested(config, "patch", "batch_rotate", default=True)
+        get_nested(config, "patch", "batch_rotate", default=False)
     )
 
     # ── 过滤越界关键点 ──
@@ -408,7 +420,7 @@ def patchable_keypoints(
             [],
         )
 
-    # ── 旋转裁切：批量 GPU 或逐点 OpenCV ──
+    # ── 旋转裁切：批量采样或逐点局部反向采样 ──
     if batch_rotate:
         try:
             patches_raw = extract_aligned_patches_batch(

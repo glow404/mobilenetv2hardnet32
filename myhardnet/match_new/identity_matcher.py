@@ -89,6 +89,29 @@ def resolve_early_stop_threshold(config: dict[str, Any]) -> float | None:
     return threshold
 
 
+END_TO_END_EXCLUDED_MATCH_OVERHEAD_MS_FIELDS: tuple[str, ...] = (
+    "descriptor_prepare_ms",
+    "postprocess_ms",
+    "identity_match_overhead_ms",
+    "matching_wrapper_overhead_ms",
+)
+
+
+def sum_end_to_end_excluded_match_overhead_ms(row: dict[str, Any]) -> float:
+    """端到端耗时统计中不计入的匹配阶段杂项耗时之和。"""
+
+    return sum(
+        float(row.get(field, 0.0))
+        for field in END_TO_END_EXCLUDED_MATCH_OVERHEAD_MS_FIELDS
+    )
+
+
+def compute_end_to_end_core_ms(end_to_end_ms: float, row: dict[str, Any]) -> float:
+    """从墙钟端到端耗时中扣除不计入统计的匹配杂项。"""
+
+    return max(0.0, float(end_to_end_ms) - sum_end_to_end_excluded_match_overhead_ms(row))
+
+
 def score_query_against_identity(
     query_template: dict[str, Any],
     identity: dict[str, Any],
@@ -133,6 +156,7 @@ def score_query_against_identity(
         "candidate_filter_ms",
         "ransac_ms",
         "inlier_refinement_ms",
+        "unique_inlier_dedup_ms",
         "texture_similarity_ms",
         "score_fusion_ms",
         "postprocess_ms",

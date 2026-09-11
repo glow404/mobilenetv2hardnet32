@@ -15,6 +15,7 @@ import numpy as np
 from tqdm import tqdm
 
 from match_new.identity_matcher import (
+    compute_end_to_end_core_ms,
     load_template_cached,
     resolve_early_stop_threshold,
     score_query_against_identity,
@@ -239,6 +240,9 @@ class OnlineUnlockEngine:
 
         ``end_to_end_ms`` 从读取查询图像开始，到 identity 级匹配完成为止；
         模型初始化、模型预热、注册模板预加载以及传感器采集图像的时间不包含在内。
+        ``end_to_end_core_ms`` 在 ``end_to_end_ms`` 基础上再扣除
+        ``descriptor_prepare_ms``、``postprocess_ms``、
+        ``identity_match_overhead_ms``、``matching_wrapper_overhead_ms``。
         ``match_ms`` 仅统计已有查询模板与注册模板集合之间的匹配阶段。
         """
 
@@ -278,6 +282,7 @@ class OnlineUnlockEngine:
             match_ms - float(match_result.get("identity_match_total_ms", 0.0)),
         )
         decision_score = float(match_result["score"])
+        end_to_end_ms = (time.perf_counter() - total_started) * 1000.0
         result = {
             "identity_id": str(identity_id),
             "image_id": row["image_id"],
@@ -294,9 +299,13 @@ class OnlineUnlockEngine:
             **template_timings,
             "match_ms": match_ms,
             "matching_wrapper_overhead_ms": matching_wrapper_overhead_ms,
-            "end_to_end_ms": (time.perf_counter() - total_started) * 1000.0,
+            "end_to_end_ms": end_to_end_ms,
             **match_result,
         }
+        result["end_to_end_core_ms"] = compute_end_to_end_core_ms(
+            end_to_end_ms,
+            result,
+        )
         return result
 
     def benchmark(self, query_rows: list[dict[str, str]]) -> dict[str, Any]:
@@ -339,6 +348,7 @@ class OnlineUnlockEngine:
             "candidate_filter_ms",
             "ransac_ms",
             "inlier_refinement_ms",
+            "unique_inlier_dedup_ms",
             "texture_similarity_ms",
             "score_fusion_ms",
             "postprocess_ms",
@@ -349,6 +359,12 @@ class OnlineUnlockEngine:
         summary = {
             "mode": "fixed_threshold_online_unlock",
             "timing_scope": "accepted_unlocks_only",
+            "end_to_end_definition": (
+                "end_to_end 汇总使用 end_to_end_core_ms：模板构建 + 匹配主路径，"
+                "不含 descriptor_prepare_ms、postprocess_ms、"
+                "identity_match_overhead_ms、matching_wrapper_overhead_ms；"
+                "end_to_end_wall_clock 保留完整墙钟 end_to_end_ms。"
+            ),
             "threshold": self.threshold,
             "fusion_method": self.fusion_method,
             "early_stop_enabled": self.early_stop_enabled,
@@ -397,6 +413,10 @@ class OnlineUnlockEngine:
                 points,
             ),
             "end_to_end": summarize_timings(
+                [float(row["end_to_end_core_ms"]) for row in successful_attempts],
+                points,
+            ),
+            "end_to_end_wall_clock": summarize_timings(
                 [float(row["end_to_end_ms"]) for row in successful_attempts],
                 points,
             ),

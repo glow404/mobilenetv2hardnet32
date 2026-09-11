@@ -4,8 +4,8 @@
     1. 扫描原始指纹图像目录，构建每张图像的 `.npz` 模板；
     2. 每个 identity 随机选择注册模板；
     3. 用其余图像作为 query，分别对本人和非本人 identity 模板库打分；
-    4. 输出 FAR/FRR/EER/AUC、满足目标 FAR/FRR 的推荐阈值；
-    5. 在目标阈值下导出 false reject / false accept 的原图和拼接预览。
+    4. 输出 FAR/FRR 阈值曲线、配置阈值下的结果、EER 和 AUC；
+    5. 在配置阈值下导出 false reject / false accept 的原图和拼接预览。
 
 运行参数默认写在 `config_match_new.yaml` 的 output/runtime/data/model/evaluation 等段；
 命令行仅作覆盖，优先级：命令行 > 配置文件 > 程序默认值。
@@ -223,8 +223,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max_impostor_identities_per_query", type=int, default=None, help="覆盖 runtime.max_impostor_identities_per_query。")
     parser.add_argument("--random_seed", type=int, default=None, help="覆盖 enrollment.random_seed。")
-    parser.add_argument("--target_far", type=float, default=None, help="覆盖 evaluation.target_far。")
-    parser.add_argument("--target_frr", type=float, default=None, help="覆盖 evaluation.target_frr。")
     parser.add_argument("--max_failure_cases_per_type", type=int, default=None, help="覆盖 evaluation.failure_export.max_cases_per_type。")
     parser.add_argument(
         "--failure-export",
@@ -258,10 +256,6 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("runtime", {})["max_impostor_identities_per_query"] = int(args.max_impostor_identities_per_query)
     if args.random_seed is not None:
         config.setdefault("enrollment", {})["random_seed"] = int(args.random_seed)
-    if args.target_far is not None:
-        config.setdefault("evaluation", {})["target_far"] = float(args.target_far)
-    if args.target_frr is not None:
-        config.setdefault("evaluation", {})["target_frr"] = float(args.target_frr)
     if args.max_failure_cases_per_type is not None:
         config.setdefault("evaluation", {}).setdefault("failure_export", {})["max_cases_per_type"] = int(args.max_failure_cases_per_type)
     if args.failure_export is not None:
@@ -595,7 +589,7 @@ def main() -> None:
     write_csv_rows(output_dir / "enrollment_timing.csv", enrollment_timing["per_identity"])
     write_json(output_dir / "enrollment_timing.json", enrollment_timing)
 
-    # 4. 执行身份验证评估，并在目标阈值下导出失败样本。
+    # 4. 执行身份验证评估，并在配置阈值下导出失败样本。
     result = run_hardnet_evaluation(
         metadata_rows=split_rows,
         identity_templates_path=identity_templates_path,
@@ -606,13 +600,12 @@ def main() -> None:
         export_failures=bool(settings["export_failures"]),
     )
     # 5. 汇总一行 CSV/JSON，方便和其他实验横向比较。
-    far_points = [float(point) for point in dict(config.get("evaluation", {})).get("far_points", [0.001, 0.0001])]
     summary_record = {
         "evaluation_dataset": image_root.name,
         "model_architecture": checkpoint_metadata.get("model_architecture", ""),
         "descriptor_dim": int(descriptor_dim),
         "checkpoint": str(checkpoint),
-        **summary_row(result["metrics"], far_points),
+        **summary_row(result["metrics"]),
     }
     summary = [summary_record]
     summary_csv = output_dir / f"{summary_stem}.csv"

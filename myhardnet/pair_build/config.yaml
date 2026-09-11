@@ -98,7 +98,7 @@ matching:
   # Lowe ratio test 阈值。越小越严格、seed matches 更少但更干净。
   ratio_thresh: 0.85
 
-  # 是否要求双向最近邻一致。false 更接近当前 finger 工程里追求匹配数量的设定。
+  # 是否要求双向最近邻一致。false 更接近当前 finger 工程里追求匹配数量的设定。todo：这里可以考虑修改为false，因为true情况下，匹配时用false反而效果更好。
   strict_two_way: true
 
   # RANSAC 几何模型。partial_affine 对小局部图更稳，包含旋转/平移/尺度/有限剪切。

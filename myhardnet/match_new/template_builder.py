@@ -60,6 +60,7 @@ def extract_keypoint_patches(
     out_size: int,
     min_overlap_ratio: float,
     normalize: bool,
+    batch_rotate: bool = False,
 ) -> tuple[list[cv2.KeyPoint], np.ndarray, list[int]]:
     """兼容旧模板构建代码的 patch 裁剪入口。"""
 
@@ -72,6 +73,7 @@ def extract_keypoint_patches(
                 "out_size": out_size,
                 "min_overlap_ratio": min_overlap_ratio,
                 "normalize": normalize,
+                "batch_rotate": batch_rotate,
             }
         },
     )
@@ -263,10 +265,11 @@ def build_hardnet_template_from_image(
     selected_keypoints, patches, _selected_indices = extract_keypoint_patches(
         image,
         keypoints,
-        crop_size=int(patch_cfg.get("crop_size", 64)),
+        crop_size=int(patch_cfg.get("crop_size", 32)),
         out_size=int(patch_cfg.get("out_size", 32)),
         min_overlap_ratio=float(patch_cfg.get("min_overlap_ratio", 0.55)),
         normalize=bool(patch_cfg.get("normalize", True)),
+        batch_rotate=bool(patch_cfg.get("batch_rotate", False)),
     )
     patch_extract_ms = (time.perf_counter() - started) * 1000.0
 

@@ -45,8 +45,6 @@ conda activate hardnet-cuda
 python match_new\run_hardnet_matching.py
 ```
 
-也可以直接覆盖原图目录及身份目录层级，无需预先运行 `pair_build`：
-
 ```powershell
 python match_new\run_hardnet_matching.py `
   --image-root datasets\new_data_V3 `

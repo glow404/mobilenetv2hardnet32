@@ -90,6 +90,8 @@ def hardnet_template_payload(
     descriptor_dim: int | None = None,
     descriptor_storage: str = FLOAT32_STORAGE,
     descriptor_bitorder: str = "",
+    descriptor_transform_name: str = "",
+    descriptor_transform_id: str = "",
 ) -> dict[str, Any]:
     """构造注册阶段和在线解锁共用的内存模板结构。"""
 
@@ -119,7 +121,7 @@ def hardnet_template_payload(
     if dimension <= 0:
         raise ValueError(f"HardNet descriptor dimension must be positive, got {dimension}")
     template = {
-        "template_format_version": 5,
+        "template_format_version": 6,
         "descriptor_schema_version": DESCRIPTOR_SCHEMA_VERSION,
         "identity_id": str(row["identity_id"]),
         "image_id": str(row["image_id"]),
@@ -137,6 +139,8 @@ def hardnet_template_payload(
         "hardnet_descriptor_metric": str(descriptor_metric).strip().lower(),
         "hardnet_descriptor_storage": str(descriptor_storage).strip().lower(),
         "hardnet_descriptor_bitorder": str(descriptor_bitorder).strip().lower(),
+        "hardnet_descriptor_transform_name": str(descriptor_transform_name).strip(),
+        "hardnet_descriptor_transform_id": str(descriptor_transform_id).strip(),
         "sift_descriptors": np.zeros((0, 128), dtype=np.float32),
         "overlap_image": gray,
         "template_path": "",
@@ -206,6 +210,12 @@ def save_hardnet_template_payload(output_path: str | Path, template: dict[str, A
         ),
         hardnet_descriptor_bitorder=np.asarray(
             str(template.get("hardnet_descriptor_bitorder", ""))
+        ),
+        hardnet_descriptor_transform_name=np.asarray(
+            str(template.get("hardnet_descriptor_transform_name", ""))
+        ),
+        hardnet_descriptor_transform_id=np.asarray(
+            str(template.get("hardnet_descriptor_transform_id", ""))
         ),
         overlap_image=np.asarray(template["overlap_image"], dtype=np.uint8),
     )
@@ -290,6 +300,8 @@ def build_hardnet_template_from_image(
         descriptor_dim=hardnet.descriptor_dim,
         descriptor_storage=hardnet.descriptor_storage,
         descriptor_bitorder=hardnet.descriptor_bitorder,
+        descriptor_transform_name=hardnet.descriptor_transform_name,
+        descriptor_transform_id=hardnet.descriptor_transform_id,
     )
     template_assembly_ms = (time.perf_counter() - started) * 1000.0
     template_total_ms = (time.perf_counter() - total_started) * 1000.0
@@ -375,6 +387,8 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
             "hardnet_descriptor_metric",
             "hardnet_descriptor_storage",
             "hardnet_descriptor_bitorder",
+            "hardnet_descriptor_transform_name",
+            "hardnet_descriptor_transform_id",
         ):
             if field in keys:
                 hardnet_contract_source[field] = np.asarray(data[field]).item()
@@ -389,6 +403,8 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
             hardnet_descriptor_metric = hardnet_contract.metric
             hardnet_descriptor_storage = hardnet_contract.storage
             hardnet_descriptor_bitorder = hardnet_contract.bitorder
+            hardnet_descriptor_transform_name = hardnet_contract.transform_name
+            hardnet_descriptor_transform_id = hardnet_contract.transform_id
             expected_descriptor_columns = descriptor_columns(hardnet_contract)
         else:
             hardnet_descriptor_dim = 0
@@ -396,6 +412,8 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
             hardnet_descriptor_metric = L2_DISTANCE_METRIC
             hardnet_descriptor_storage = FLOAT32_STORAGE
             hardnet_descriptor_bitorder = ""
+            hardnet_descriptor_transform_name = ""
+            hardnet_descriptor_transform_id = ""
             expected_descriptor_columns = 0
         if has_hardnet and (
             hardnet.ndim != 2
@@ -429,6 +447,8 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
             "hardnet_descriptor_metric": hardnet_descriptor_metric,
             "hardnet_descriptor_storage": hardnet_descriptor_storage,
             "hardnet_descriptor_bitorder": hardnet_descriptor_bitorder,
+            "hardnet_descriptor_transform_name": hardnet_descriptor_transform_name,
+            "hardnet_descriptor_transform_id": hardnet_descriptor_transform_id,
             "sift_descriptors": sift,
             "overlap_image": np.asarray(data["overlap_image"], dtype=np.uint8) if "overlap_image" in keys else np.zeros((0, 0), dtype=np.uint8),
             "template_path": str(target),
@@ -531,6 +551,8 @@ def build_hardnet_templates(
         "descriptor_dim": hardnet.descriptor_dim,
         "descriptor_storage": hardnet.descriptor_storage,
         "descriptor_bitorder": hardnet.descriptor_bitorder,
+        "descriptor_transform_name": hardnet.descriptor_transform_name,
+        "descriptor_transform_id": hardnet.descriptor_transform_id,
     }
 
 

@@ -4,16 +4,16 @@
 # 模型、数据集、输出目录、注册数量及匹配阈值变化时，优先只修改这里。
 
 output:
-  output_dir: ..\outputs\湿手指\m0_256_512_v2_best.pt-模板数40-数据集wet_new
+  output_dir: ..\outputs\哈达玛\m0_256_v2_hadamard_模板数40-数据集normal_pic
 
 runtime:
   skip_template_build: false
 
 data:
-  image_root: ../datasets/wet_new
+  image_root: ../datasets/normal_pic
 
 model:
-  checkpoint: ..\outputs\models\3\m0\m0_256_512_v2\best.pt
+  checkpoint: ..\outputs\models\3\m0\m0_256_v2\best.pt
 
 matching:
   # 浮点 L2 候选阈值。

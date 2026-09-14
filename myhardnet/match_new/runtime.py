@@ -41,6 +41,10 @@ from match_new.descriptor_contract import (
     FLOAT_DESCRIPTOR_KIND,
     L2_DISTANCE_METRIC,
 )
+from match_new.hadamard_binarization import (
+    HadamardBinarizer,
+    hadamard_binarization_enabled,
+)
 from match_new.utils import resolve_path
 
 
@@ -538,10 +542,15 @@ class HardNetDescriptor:
         requested_kind = str(
             get_nested(config, "model", "descriptor_kind", default="auto")
         ).strip().lower()
-        if requested_kind not in {"", "auto", descriptor_kind}:
+        output_descriptor_kind = (
+            BINARY_DESCRIPTOR_KIND
+            if hadamard_binarization_enabled(config)
+            else descriptor_kind
+        )
+        if requested_kind not in {"", "auto", output_descriptor_kind}:
             raise ValueError(
-                "Configured descriptor kind does not match checkpoint: "
-                f"config={requested_kind}, checkpoint={descriptor_kind}."
+                "Configured descriptor kind does not match runtime output: "
+                f"config={requested_kind}, output={output_descriptor_kind}."
             )
 
         saved_descriptor_dim = checkpoint_descriptor_dim(checkpoint)
@@ -689,9 +698,54 @@ class HardNetDescriptor:
                     f"config={requested_bitorder}, checkpoint={self.descriptor_bitorder}."
                 )
 
+        self.model_descriptor_kind = descriptor_kind
+        self.hadamard_binarizer: HadamardBinarizer | None = None
+        self.descriptor_transform_metadata: dict[str, Any] = {}
+        if hadamard_binarization_enabled(config):
+            if descriptor_kind != FLOAT_DESCRIPTOR_KIND:
+                raise ValueError(
+                    "Hadamard post-binarization requires a float/L2 checkpoint; "
+                    f"got kind={descriptor_kind}, metric={descriptor_metric}."
+                )
+            self.hadamard_binarizer = HadamardBinarizer.from_config(config)
+            if saved_descriptor_dim != self.hadamard_binarizer.order:
+                raise ValueError(
+                    "Hadamard order must equal the float checkpoint descriptor dimension: "
+                    f"order={self.hadamard_binarizer.order}, "
+                    f"descriptor_dim={saved_descriptor_dim}."
+                )
+            descriptor_kind = BINARY_DESCRIPTOR_KIND
+            descriptor_metric = HAMMING_DISTANCE_METRIC
+            saved_descriptor_dim = self.hadamard_binarizer.order
+            self.descriptor_storage = BINARY_STORAGE
+            self.descriptor_bitorder = self.hadamard_binarizer.bitorder
+            requested_storage = str(
+                get_nested(config, "model", "binary_storage", default="auto")
+            ).strip().lower()
+            requested_bitorder = str(
+                get_nested(config, "model", "binary_bitorder", default="auto")
+            ).strip().lower()
+            if requested_storage not in {"", "auto", self.descriptor_storage}:
+                raise ValueError(
+                    "Configured binary storage does not match Hadamard output: "
+                    f"config={requested_storage}, output={self.descriptor_storage}."
+                )
+            if requested_bitorder not in {"", "auto", self.descriptor_bitorder}:
+                raise ValueError(
+                    "Configured binary bitorder does not match Hadamard output: "
+                    f"config={requested_bitorder}, output={self.descriptor_bitorder}."
+                )
+            self.descriptor_transform_metadata = self.hadamard_binarizer.metadata()
+
         self.descriptor_kind = descriptor_kind
         self.descriptor_metric = descriptor_metric
         self.descriptor_dim = saved_descriptor_dim
+        self.descriptor_transform_name = str(
+            self.descriptor_transform_metadata.get("descriptor_transform_name", "")
+        )
+        self.descriptor_transform_id = str(
+            self.descriptor_transform_metadata.get("descriptor_transform_id", "")
+        )
         self.descriptor_columns = (
             (self.descriptor_dim + 7) // 8
             if self.descriptor_kind == BINARY_DESCRIPTOR_KIND
@@ -886,7 +940,7 @@ class HardNetDescriptor:
                 dtype=self.amp_dtype,
                 enabled=self.amp_enabled,
             ):
-                if self.descriptor_kind == BINARY_DESCRIPTOR_KIND:
+                if self.model_descriptor_kind == BINARY_DESCRIPTOR_KIND:
                     batch_output = self.model.encode_binary(batch, packed=True)
                 else:
                     batch_output = self.model(batch)
@@ -899,11 +953,18 @@ class HardNetDescriptor:
             )
             return np.zeros((0, self.descriptor_columns), dtype=dtype)
         output = torch.cat(outputs, dim=0).cpu()
-        descriptors = (
-            output.to(dtype=torch.uint8).numpy()
-            if self.descriptor_kind == BINARY_DESCRIPTOR_KIND
-            else output.float().numpy()
-        )
+        if self.hadamard_binarizer is not None:
+            float_descriptors = output.float().numpy()
+            descriptors = self.hadamard_binarizer.binarize(
+                float_descriptors,
+                packed=True,
+            )
+        else:
+            descriptors = (
+                output.to(dtype=torch.uint8).numpy()
+                if self.descriptor_kind == BINARY_DESCRIPTOR_KIND
+                else output.float().numpy()
+            )
         if descriptors.ndim != 2 or descriptors.shape[1] != self.descriptor_columns:
             raise ValueError(
                 "Descriptor model output shape mismatch: "

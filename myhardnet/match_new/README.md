@@ -30,6 +30,7 @@ conda activate hardnet-cuda
 | `data.identity_depth` | 组成一个手指 identity 的目录层级数 |
 | `model.checkpoint` | 浮点或二值 HardNet 权重 |
 | `model.descriptor_kind` / `model.binary_storage` / `model.binary_bitorder` | 描述子类型与二值模板存储契约，默认 `auto`/`packed_uint8`/`auto` |
+| `model.hadamard_binarization.*` | 启用时把浮点 checkpoint 的描述子按 `Hf -> sign -> packed_uint8` 二值化；不使用 P、D 或额外 state 文件 |
 | `matching.distance` | `auto` 跟随 checkpoint，也可显式写 `l2` 或 `hamming` |
 | `matching.hamming.backend` | packed-Hamming 候选后端；默认 `cpu` 使用 OpenCV SIMD/POPCNT，`cuda` 仅用于显式实验 |
 | `matching.hamming.*` | 二值 Hamming 的 ratio、绝对距离和自适应 margin，需按验证集重新标定 |
@@ -51,7 +52,7 @@ python match_new\run_hardnet_matching.py `
   --output_dir outputs\newdataV3-8-float256+模板数30 `
 ```
 
-**输出模板目录**：`<output_dir>/image_templates/`，每个 `.npz` 包含关键点字段、`hardnet_descriptors` 和 `overlap_image`。浮点模板使用 `float32` 列；二值模板使用 `packed_uint8` 列，`hardnet_descriptor_dim` 表示 bit 数，`hardnet_descriptor_bitorder` 保存位序。灰度图保持原始尺寸和关键点坐标系，由 `np.savez_compressed` 无损压缩，`np.load` 时自动解压。
+**输出模板目录**：`<output_dir>/image_templates/`，每个 `.npz` 包含关键点字段、`hardnet_descriptors` 和 `overlap_image`。浮点模板使用 `float32` 列；二值模板使用 `packed_uint8` 列，`hardnet_descriptor_dim` 表示 bit 数，`hardnet_descriptor_bitorder` 保存位序。Hadamard 后处理还会保存 `hardnet_descriptor_transform_name` 和 `hardnet_descriptor_transform_id`，防止旧的 P/D 模板与当前直接 `Hf` 模板混用。灰度图保持原始尺寸和关键点坐标系，由 `np.savez_compressed` 无损压缩，`np.load` 时自动解压。
 
 **常用命令行覆盖**（均可不传，改用配置）：
 

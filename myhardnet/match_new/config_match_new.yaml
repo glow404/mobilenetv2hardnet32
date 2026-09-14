@@ -38,6 +38,15 @@ model:
   binary_storage: auto
   binary_bitorder: auto
 
+  # 对浮点 checkpoint 输出直接执行 Hf -> sign -> packed uint8，随后使用
+  # 归一化 Hamming 距离匹配。不使用随机置换矩阵 P、对角符号矩阵 D，
+  # 也不再读写 P/D state 文件。order 必须等于浮点描述子维度。
+  hadamard_binarization:
+    enabled: true
+    order: 256
+    bitorder: little
+    zero_is_one: true
+
   # 建模版时，HardNet patch 一次批量推理 batch size个patch。
   batch_size: 512
 

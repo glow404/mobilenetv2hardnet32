@@ -49,6 +49,10 @@ from match_new.descriptor_contract import (
     resolve_descriptor_contract,
 )
 from match_new.evaluation import run_hardnet_evaluation, summary_row
+from match_new.hadamard_binarization import (
+    HadamardBinarizer,
+    hadamard_binarization_enabled,
+)
 from match_new.input_loader import load_raw_image_metadata, validate_identity_image_counts
 from match_new.template_builder import build_hardnet_templates, build_identity_templates, load_image_template
 from match_new.utils import ensure_dir, load_config, resolve_path, template_filename, write_csv_rows, write_json
@@ -310,8 +314,9 @@ def limit_rows_for_debug(rows: list[dict[str, str]], limit_identities: int, limi
 
 def checkpoint_descriptor_metadata(
     checkpoint: Mapping[str, Any],
+    config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """从浮点或二值 checkpoint 解析统一描述子元数据。"""
+    """解析 checkpoint 及可选 Hadamard 后处理的输出描述子元数据。"""
 
     kind = str(checkpoint.get("descriptor_kind", FLOAT_DESCRIPTOR_KIND)).strip().lower()
     metric = str(checkpoint.get("descriptor_metric", L2_DISTANCE_METRIC)).strip().lower()
@@ -335,18 +340,46 @@ def checkpoint_descriptor_metadata(
         architecture = checkpoint_model_architecture(checkpoint)
         storage = FLOAT32_STORAGE
         bitorder = ""
-    return {
+    metadata = {
         "model_architecture": architecture,
         "descriptor_kind": kind,
         "descriptor_metric": metric,
         "descriptor_dim": dimension,
         "descriptor_storage": storage,
         "descriptor_bitorder": bitorder,
+        "descriptor_transform_name": "",
+        "descriptor_transform_id": "",
         "epoch": checkpoint.get("epoch"),
         "global_step": checkpoint.get("global_step"),
         "model_parameter_count": checkpoint.get("model_parameter_count"),
         "model_macs_per_patch": checkpoint.get("model_macs_per_patch"),
     }
+    if hadamard_binarization_enabled(config):
+        if (kind, metric) != (FLOAT_DESCRIPTOR_KIND, L2_DISTANCE_METRIC):
+            raise ValueError(
+                "Hadamard post-binarization requires a float/L2 checkpoint; "
+                f"got kind={kind}, metric={metric}."
+            )
+        binarizer = HadamardBinarizer.from_config(config)
+        if dimension != binarizer.order:
+            raise ValueError(
+                "Hadamard order must equal the checkpoint descriptor dimension: "
+                f"order={binarizer.order}, descriptor_dim={dimension}."
+            )
+        metadata.update(
+            {
+                "source_descriptor_kind": kind,
+                "source_descriptor_metric": metric,
+                "source_descriptor_dim": dimension,
+                "descriptor_kind": BINARY_DESCRIPTOR_KIND,
+                "descriptor_metric": HAMMING_DISTANCE_METRIC,
+                "descriptor_dim": binarizer.order,
+                "descriptor_storage": PACKED_UINT8_STORAGE,
+                "descriptor_bitorder": binarizer.bitorder,
+                **binarizer.metadata(),
+            }
+        )
+    return metadata
 
 
 def validate_configured_descriptor(
@@ -424,19 +457,22 @@ def resolve_expected_descriptor_dim(
     checkpoint = torch.load(target, map_location="cpu")
     if not isinstance(checkpoint, Mapping):
         raise ValueError(f"Unsupported checkpoint format: {target}")
-    metadata = checkpoint_descriptor_metadata(checkpoint)
+    metadata = checkpoint_descriptor_metadata(checkpoint, config)
     validate_configured_descriptor(config, metadata)
     return int(metadata["descriptor_dim"])
 
 
-def resolve_checkpoint_metadata(checkpoint_path: str | Path) -> dict[str, Any]:
-    """读取浮点或二值 checkpoint 的统一元数据。"""
+def resolve_checkpoint_metadata(
+    checkpoint_path: str | Path,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """读取 checkpoint 和可选后处理对应的统一输出元数据。"""
 
     target = Path(checkpoint_path).expanduser()
     checkpoint = torch.load(target, map_location="cpu")
     if not isinstance(checkpoint, Mapping):
         raise ValueError(f"Unsupported checkpoint format: {target}")
-    return checkpoint_descriptor_metadata(checkpoint)
+    return checkpoint_descriptor_metadata(checkpoint, config)
 
 
 def validate_templates(
@@ -465,6 +501,8 @@ def validate_templates(
             "descriptor_dim": contract.dimension,
             "descriptor_storage": contract.storage,
             "descriptor_bitorder": contract.bitorder,
+            "descriptor_transform_name": contract.transform_name,
+            "descriptor_transform_id": contract.transform_id,
         }
         expected = {
             field: descriptor_metadata[field]
@@ -503,6 +541,8 @@ def validate_templates(
                 "descriptor_dim",
                 "descriptor_storage",
                 "descriptor_bitorder",
+                "descriptor_transform_name",
+                "descriptor_transform_id",
             )
         },
         "evaluation_dataset": image_root.name,
@@ -522,7 +562,7 @@ def main() -> None:
     if not checkpoint.exists():
         raise FileNotFoundError(f"Descriptor checkpoint does not exist: {checkpoint}")
     descriptor_dim = resolve_expected_descriptor_dim(config, checkpoint)
-    checkpoint_metadata = resolve_checkpoint_metadata(checkpoint)
+    checkpoint_metadata = resolve_checkpoint_metadata(checkpoint, config)
     descriptor_metric = str(checkpoint_metadata["descriptor_metric"])
     config.setdefault("model", {})["descriptor_kind"] = str(
         checkpoint_metadata["descriptor_kind"]

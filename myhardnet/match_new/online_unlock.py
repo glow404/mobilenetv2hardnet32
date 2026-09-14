@@ -204,20 +204,31 @@ class OnlineUnlockEngine:
             template_metric = str(template.get("hardnet_descriptor_metric", "l2"))
             template_storage = str(template.get("hardnet_descriptor_storage", "float32"))
             template_bitorder = str(template.get("hardnet_descriptor_bitorder", ""))
+            template_transform_name = str(
+                template.get("hardnet_descriptor_transform_name", "")
+            )
+            template_transform_id = str(
+                template.get("hardnet_descriptor_transform_id", "")
+            )
             if (
                 template_dim != self.hardnet.descriptor_dim
                 or template_kind != self.hardnet.descriptor_kind
                 or template_metric != self.hardnet.descriptor_metric
                 or template_storage != self.hardnet.descriptor_storage
                 or template_bitorder != self.hardnet.descriptor_bitorder
+                or template_transform_name != self.hardnet.descriptor_transform_name
+                or template_transform_id != self.hardnet.descriptor_transform_id
             ):
                 raise ValueError(
                     "Registered template/model descriptor contract mismatch: "
                     f"template=({template_kind}, {template_metric}, {template_dim}, "
-                    f"{template_storage}, {template_bitorder}), "
+                    f"{template_storage}, {template_bitorder}, "
+                    f"{template_transform_name}, {template_transform_id}), "
                     f"model=({self.hardnet.descriptor_kind}, {self.hardnet.descriptor_metric}, "
                     f"{self.hardnet.descriptor_dim}, {self.hardnet.descriptor_storage}, "
-                    f"{self.hardnet.descriptor_bitorder}), path={path}."
+                    f"{self.hardnet.descriptor_bitorder}, "
+                    f"{self.hardnet.descriptor_transform_name}, "
+                    f"{self.hardnet.descriptor_transform_id}), path={path}."
                 )
 
     def get_identity(self, identity_id: str) -> dict[str, Any]:

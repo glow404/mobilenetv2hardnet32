@@ -28,6 +28,8 @@ class DescriptorContract:
     dimension: int
     storage: str
     bitorder: str = ""
+    transform_name: str = ""
+    transform_id: str = ""
 
 
 def _template_label(template: Mapping[str, Any]) -> str:
@@ -128,6 +130,18 @@ def resolve_descriptor_contract(
             if kind == BINARY_DESCRIPTOR_KIND
             else ""
         )
+        transform_name = str(
+            template.get(
+                "hardnet_descriptor_transform_name",
+                template.get("descriptor_transform_name", ""),
+            )
+        ).strip()
+        transform_id = str(
+            template.get(
+                "hardnet_descriptor_transform_id",
+                template.get("descriptor_transform_id", ""),
+            )
+        ).strip()
     elif source in {"sift", "rootsift"}:
         source = "sift"
         dimension = 128
@@ -135,6 +149,8 @@ def resolve_descriptor_contract(
         metric = L2_DISTANCE_METRIC
         storage = FLOAT32_STORAGE
         bitorder = ""
+        transform_name = ""
+        transform_id = ""
     else:
         raise ValueError(f"unsupported descriptor_source: {descriptor_source}")
 
@@ -145,6 +161,8 @@ def resolve_descriptor_contract(
         dimension=dimension,
         storage=storage,
         bitorder=bitorder,
+        transform_name=transform_name,
+        transform_id=transform_id,
     )
 
 
@@ -231,6 +249,8 @@ def require_compatible_contracts(
         query.dimension,
         query.storage,
         query.bitorder,
+        query.transform_name,
+        query.transform_id,
     )
     right = (
         gallery.source,
@@ -239,6 +259,8 @@ def require_compatible_contracts(
         gallery.dimension,
         gallery.storage,
         gallery.bitorder,
+        gallery.transform_name,
+        gallery.transform_id,
     )
     if left != right:
         raise ValueError(

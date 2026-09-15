@@ -4,13 +4,13 @@
 # 模型、数据集、输出目录、注册数量及匹配阈值变化时，优先只修改这里。
 
 output:
-  output_dir: ..\outputs\湿手指\m0_256_v2_hadamard_模板数40-数据集wet
+  output_dir: ..\outputs\湿手指\m0_256_v2_hadamard_模板数40-数据集wet_select
 
 runtime:
   skip_template_build: false
 
 data:
-  image_root: ../datasets/wet
+  image_root: ../datasets/wet_select
 
 model:
   checkpoint: ..\outputs\models\3\m0\m0_256_v2\best.pt

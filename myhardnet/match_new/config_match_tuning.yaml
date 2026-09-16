@@ -5,6 +5,7 @@
 
 output:
   output_dir: ..\outputs\湿手指\m0_256_v2_hadamard_模板数40-数据集wet_select
+  
 
 runtime:
   skip_template_build: false
@@ -25,7 +26,7 @@ matching:
   # 二值 Hamming 候选阈值。
   hamming:
     backend: cpu
-    ratio_threshold: 0.85
+    ratio_threshold: 0.95
     abs_distance_threshold: 0.50
     distance_margin: 0.05
 

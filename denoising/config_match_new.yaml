@@ -125,12 +125,10 @@ matching:
   # RANSAC 后再做 one-to-one 去重。  开启双向验证时，这个参数不起作用。
   allow_many_to_one_before_ransac: true
 
-  # 候选过多会拖慢 RANSAC，也容易引入噪声，所以进入 RANSAC 前截断。
+  # 候选过多会拖慢 RANSAC，也容易引入噪声；超限时只按描述子距离从小到大截断。
   max_candidates_for_ransac: 300
 
-  # 方向只做软排序，不做 SIFT 式方向峰硬过滤。
-  orientation_soft_gate: false
-  orientation_weight: 0.15
+  # 以下参数只控制最终内点的方向一致性诊断，不参与候选筛选或最终打分。
   orientation_hist_bin_deg: 10.0
   orientation_consistency_thresh_deg: 20.0
 

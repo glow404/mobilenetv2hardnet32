@@ -102,13 +102,10 @@ matching:
   # 每个 query keypoint 最多向 gallery 取几个近邻候选。
   top_k: 1
 
-  # 候选过多会拖慢 RANSAC，也容易引入噪声，所以进入 RANSAC 前截断。
-  max_candidates_for_ransac: 200
+  # 候选过多会拖慢 RANSAC，也容易引入噪声；超限时只按描述子距离从小到大截断。
+  max_candidates_for_ransac: 250
 
-  # true：超限时用“距离 + 方向惩罚”截断，并在候选阶段统计主方向差。
-  # false：不调用方向软门控；超限时仅按描述子距离截断；主方向差只在最终内点上做诊断。
-  orientation_soft_gate: false
-  orientation_weight: 0.15
+  # 以下参数只控制最终内点的方向一致性诊断，完全不影响匹配结果。
   orientation_hist_bin_deg: 10.0
   orientation_consistency_thresh_deg: 20.0
 

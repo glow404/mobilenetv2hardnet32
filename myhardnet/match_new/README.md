@@ -231,9 +231,7 @@ online_unlock:
 | `abs_distance_threshold` | `1.10` | L2 `1.5`；Hamming 见 `hamming.abs_distance_threshold` | 绝对距离上限 |
 | `distance_margin` | `0.12` | L2 `0.15` | top-k 自适应距离上限（ratio 策略下影响小） |
 | `allow_many_to_one_before_ransac` | `true` | 按实验配置 | RANSAC 前是否保留一对多 |
-| `max_candidates_for_ransac` | `250` | `300` | 进入 RANSAC 前的候选上限 |
-| `orientation_soft_gate` | `true` | `false` | true：方向软门控截断；false：仅按距离截断，候选阶段不算主方向 |
-| `orientation_weight` | `0.15` | `0.15` | 方向惩罚权重 |
+| `max_candidates_for_ransac` | `250` | `200` | 进入 RANSAC 前的候选上限；超限时仅按描述子距离保留最近候选 |
 | `ransac_reproj_threshold` | `5.0` | `0.5` | RANSAC 重投影阈值（像素） |
 | `ransac_max_iters` | `3000` | `3000` | RANSAC 最大迭代 |
 | `ransac_confidence` | `0.995` | `0.995` | RANSAC 置信度 |

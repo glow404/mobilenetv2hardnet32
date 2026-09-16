@@ -6,7 +6,7 @@
 
     1. float32 描述子使用 L2；packed_uint8 二值描述子使用归一化 Hamming；
     2. 用 top-k / ratio 生成较宽松候选；
-    3. 候选过多时做方向软排序截断，而不是方向峰硬裁剪；
+    3. 候选过多时按描述子距离截断；
     4. 用 RANSAC 估计局部仿射变换；
     5. 对 RANSAC inliers 做 one-to-one 去重；
     6. 融合归一化 unique inlier 分数与脊线纹理分数，得到图像级 match score。
@@ -966,33 +966,6 @@ def truncate_candidates_by_distance(
     return [candidates[int(i)] for i in keep]
 
 
-def soft_gate_candidates(candidates: list[MatchCandidate], cfg: dict[str, Any]) -> tuple[list[MatchCandidate], float]:
-    """方向软门控：统计主方向差，超限时按“距离 + 方向惩罚”截断。
-
-    仅在 orientation_soft_gate=true 时调用。
-    方向惩罚权重很小，目的是让 RANSAC 少看一点明显方向离群的候选，
-    而不是复刻 SIFT 方向峰硬过滤。
-    """
-
-    max_candidates = int(cfg.get("max_candidates_for_ransac", 250))
-    dominant = dominant_angle_delta(candidates, float(cfg.get("orientation_hist_bin_deg", 10.0)))
-    if max_candidates <= 0 or len(candidates) <= max_candidates:
-        return candidates, dominant
-
-    distances = np.asarray([item.distance for item in candidates], dtype=np.float32)
-    lo = float(np.min(distances))
-    hi = float(np.max(distances))
-    denom = max(hi - lo, 1e-6)
-    weight = float(cfg.get("orientation_weight", 0.15))
-    scored = []
-    for idx, candidate in enumerate(candidates):
-        norm_dist = (candidate.distance - lo) / denom
-        angle_penalty = min(abs(wrap_angle_deg(candidate.angle_delta - dominant)), 45.0) / 45.0
-        scored.append((norm_dist + weight * angle_penalty, idx))
-    keep = [idx for _, idx in sorted(scored, key=lambda item: item[0])[:max_candidates]]
-    return [candidates[int(i)] for i in keep], dominant
-
-
 def points_from_candidates(
     candidates: list[MatchCandidate],
     query_xy: np.ndarray,
@@ -1457,24 +1430,16 @@ def match_templates_descriptor(query: dict[str, Any], gallery: dict[str, Any], c
     ) * 1000.0
     base["num_raw_matches"] = int(len(candidates))
 
-    # 阶段 2：进入 RANSAC 前截断。
-    # orientation_soft_gate=true：方向软门控（含主方向统计）。
-    # false：不算主方向，超限时仅按描述子距离截断。
+    # 阶段 2：进入 RANSAC 前仅按描述子距离截断。
     stage_started = time.perf_counter()
-    use_orientation_soft_gate = bool(cfg.get("orientation_soft_gate", True))
-    if use_orientation_soft_gate:
-        candidates_for_ransac, dominant = soft_gate_candidates(candidates, cfg)
-    else:
-        candidates_for_ransac = truncate_candidates_by_distance(
-            candidates,
-            int(cfg.get("max_candidates_for_ransac", 250)),
-        )
-        dominant = 0.0
+    candidates_for_ransac = truncate_candidates_by_distance(
+        candidates,
+        int(cfg.get("max_candidates_for_ransac", 250)),
+    )
     timings["candidate_filter_ms"] = (
         time.perf_counter() - stage_started
     ) * 1000.0
     base["num_candidates"] = int(len(candidates_for_ransac))
-    base["dominant_angle_delta"] = float(dominant)
     # partial affine 至少需要两对坐标；这是算法的固定数学条件，不是打分阈值。
     if len(candidates_for_ransac) < 2:
         return finish(base, {"candidates": candidate_debug_rows(candidates_for_ransac, query_xy, gallery_xy), "raw_inliers": [], "unique_inliers": []})
@@ -1555,13 +1520,12 @@ def match_templates_descriptor(query: dict[str, Any], gallery: dict[str, Any], c
     mean_distance = float(np.mean(distances)) if distances.size else 0.0
     mean_reproj = float(np.mean(final_errors)) if final_errors.size else 0.0
     inlier_ratio = float(unique_count / max(len(candidates_for_ransac), 1))
-    # 方向门控关闭时，主方向仅用于最终内点诊断，避免在候选阶段白算。
-    if not use_orientation_soft_gate:
-        dominant = dominant_angle_delta(
-            kept,
-            float(cfg.get("orientation_hist_bin_deg", 10.0)),
-        )
-        base["dominant_angle_delta"] = float(dominant)
+    # 方向只在最终内点上统计，用于诊断，不参与候选截断或打分。
+    dominant = dominant_angle_delta(
+        kept,
+        float(cfg.get("orientation_hist_bin_deg", 10.0)),
+    )
+    base["dominant_angle_delta"] = float(dominant)
     orient = orientation_consistency(
         kept,
         dominant,

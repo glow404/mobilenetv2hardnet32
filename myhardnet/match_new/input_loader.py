@@ -133,18 +133,39 @@ def validate_identity_image_counts(
     minimum: int,
     *,
     context: str,
-) -> None:
-    """Require enough images per identity for enrollment and at least one query."""
+) -> list[dict[str, str]]:
+    """保留图像数足够的身份；不足的跳过并打印提示，而不是直接终止。
+
+    每个身份至少需要 ``minimum`` 张图（通常为注册数 + 1 张查询）。
+    若全部身份都被跳过，则仍报错。
+    """
 
     groups: dict[str, int] = defaultdict(int)
     for row in rows:
         groups[str(row["identity_id"])] += 1
-    insufficient = [(identity_id, count) for identity_id, count in sorted(groups.items()) if count < int(minimum)]
-    if not insufficient:
-        return
-    examples = ", ".join(f"{identity_id}={count}" for identity_id, count in insufficient[:10])
-    raise ValueError(
-        f"{len(insufficient)} identity/identities have fewer than {minimum} images in {context}. "
-        f"At least {minimum - 1} enrollment image(s) and one query image are required. "
-        f"Examples: {examples}"
-    )
+    min_count = int(minimum)
+    insufficient = {
+        identity_id
+        for identity_id, count in groups.items()
+        if count < min_count
+    }
+    for identity_id in sorted(insufficient):
+        count = groups[identity_id]
+        print(
+            f"[跳过] 身份目录 `{identity_id}` 仅有 {count} 张图"
+            f"（{context}），少于所需的 {min_count} 张"
+            f"（注册 {min_count - 1} + 查询 1），已跳过该目录。"
+        )
+    kept = [row for row in rows if str(row["identity_id"]) not in insufficient]
+    if not kept:
+        raise ValueError(
+            f"全部 {len(insufficient)} 个身份在 {context} 中图像数都少于 "
+            f"{min_count}，无法继续。每个身份至少需要 "
+            f"{min_count - 1} 张注册图和 1 张查询图。"
+        )
+    if insufficient:
+        print(
+            f"[提示] 已跳过 {len(insufficient)} 个图像数不足的身份目录，"
+            f"剩余 {len(groups) - len(insufficient)} 个身份继续处理。"
+        )
+    return kept

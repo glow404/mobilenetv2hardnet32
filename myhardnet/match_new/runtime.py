@@ -244,143 +244,14 @@ def normalize_patch(
     return (values - float(values.mean())) / std
 
 
-def extract_aligned_patches_batch(
-    image: np.ndarray,
-    keypoints: list[cv2.KeyPoint],
-    crop_size: int,
-    out_size: int,
-    device: torch.device | None = None,
-) -> np.ndarray:
-    """PyTorch 批量旋转裁切：一次 ``grid_sample`` 完成全部 patch 的方向对齐。
-
-    策略：
-        1. 从原图按关键点坐标直接裁取 padded patch（无旋转，比最终 patch 大一圈）；
-        2. 为每个关键点构造 2×3 仿射矩阵（旋转 + 缩放）；
-        3. 一次 ``affine_grid`` + ``grid_sample`` 批量完成旋转；
-        4. 输出形状 ``[N, out_size, out_size]`` 的 float32 数组，像素值域 0–255。
-
-    ``grid_sample`` 失败时，自动回退到逐点局部反向采样。
-
-    ``crop_size`` 仅用于确定 padded patch 尺寸以保证旋转后不越界，
-    实际输出尺寸由 ``out_size`` 决定。
-    """
-
-    if not keypoints:
-        return np.zeros((0, out_size, out_size), dtype=np.float32)
-
-    if device is None:
-        device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-
-    # padded patch 需要容纳旋转后的 out_size×out_size 区域。
-    # 极端情况下旋转 45° 后的轴对齐边界框宽度为 out_size·√2，
-    # 因此 pad ≥ out_size·√2 ≈ out_size×1.414；ceil(×1.5) 留有安全余量。
-    pad_size = int(math.ceil(out_size * 1.5))
-
-    # ── 阶段 1：从原图裁取 N 个 padded patch（无旋转，纯像素索引）──
-    # 用 numpy 零填充处理越界区域，与 OpenCV warpAffine 的
-    # BORDER_CONSTANT + borderValue=0 语义一致。
-    half_pad = pad_size / 2.0
-    height, width = image.shape[:2]
-    patches_host: list[np.ndarray] = []
-    for kp in keypoints:
-        x, y = kp.pt
-        x0 = int(math.floor(x - half_pad))
-        y0 = int(math.floor(y - half_pad))
-        x1 = x0 + pad_size
-        y1 = y0 + pad_size
-        patch = np.zeros((pad_size, pad_size), dtype=np.float32)
-        # 原图与 padded patch 的交集区域
-        ix0 = max(0, x0)
-        iy0 = max(0, y0)
-        ix1 = min(width, x1)
-        iy1 = min(height, y1)
-        if ix0 < ix1 and iy0 < iy1:
-            px0 = ix0 - x0
-            py0 = iy0 - y0
-            patch[py0 : py0 + (iy1 - iy0), px0 : px0 + (ix1 - ix0)] = (
-                image[iy0:iy1, ix0:ix1].astype(np.float32)
-            )
-        patches_host.append(patch)
-
-    # ── 阶段 2：构造仿射矩阵 batch ──
-    # 每个关键点的 2×3 矩阵：把输出像素的相对位移旋转 -θ 后定位到 padded
-    # patch 中的对应采样坐标。数学上与 OpenCV 整图 warpAffine +
-    # getRectSubPix + resize 等价（双线性插值，align_corners=False）。
-    #
-    # warpAffine 默认无 WARP_INVERSE_MAP，使用正向矩阵（src→dest），
-    # 内部求逆后等效 dest→src 映射为 R(θ)·dst_displacement（CCW 旋转）。
-    # 代入 grid_sample 归一化公式得到：
-    #     A = [[s·cosθ,  -s·sinθ,  1/pad_size],
-    #          [s·sinθ,   s·cosθ,  1/pad_size]]
-    # 其中 s = crop_size / pad_size。剩余微小差异（< ~0.02
-    # 在 0-255 尺度下 < 5 像素值）源于 grid_sample bilinear 与
-    # OpenCV bilinear + INTER_AREA resize 的插值细节不同。
-    scale = crop_size / pad_size
-    translation = 1.0 / pad_size
-    thetas: list[torch.Tensor] = []
-    for kp in keypoints:
-        angle_rad = math.radians(
-            float(kp.angle) if kp.angle >= 0 else 0.0
-        )
-        cos_a = math.cos(angle_rad)
-        sin_a = math.sin(angle_rad)
-        thetas.append(
-            torch.tensor(
-                [
-                    [scale * cos_a, -scale * sin_a, translation],
-                    [scale * sin_a,  scale * cos_a, translation],
-                ],
-                dtype=torch.float32,
-                device=device,
-            )
-        )
-    theta_batch = torch.stack(thetas)  # [N, 2, 3]
-
-    # ── 阶段 3：PyTorch 批量旋转 ──
-    try:
-        patches_t = (
-            torch.from_numpy(np.stack(patches_host))
-            .unsqueeze(1)
-            .to(device, non_blocking=False)
-        )
-        grid = torch.nn.functional.affine_grid(
-            theta_batch,
-            torch.Size((len(keypoints), 1, out_size, out_size)),
-            align_corners=False,
-        )
-        rotated = torch.nn.functional.grid_sample(
-            patches_t,
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=False,
-        )
-        return rotated.squeeze(1).cpu().numpy().astype(np.float32)
-    except RuntimeError:
-        pass
-
-    # ── 阶段 4：回退到逐点 OpenCV 路径 ──
-    result = np.empty(
-        (len(keypoints), out_size, out_size), dtype=np.float32
-    )
-    for idx, kp in enumerate(keypoints):
-        result[idx] = extract_aligned_patch(
-            image, kp, crop_size=crop_size, out_size=out_size,
-        ).astype(np.float32)
-    return result
-
-
 def patchable_keypoints(
     image: np.ndarray,
     keypoints: list[cv2.KeyPoint],
     config: Mapping[str, Any],
 ) -> tuple[list[cv2.KeyPoint], np.ndarray, list[int]]:
-    """过滤严重越界的关键点，并构建与关键点行号对齐的 patch 数组。
+    """过滤严重越界的关键点，并用局部反向坐标采样构建对齐的 patch 数组。
 
-    默认使用逐点局部反向采样；当 ``patch.batch_rotate=true`` 时，使用
-    PyTorch 批量旋转。标准化始终批量完成。
+    标准化在全部 patch 上批量完成。
     """
 
     crop_size = int(
@@ -394,9 +265,6 @@ def patchable_keypoints(
     )
     normalize_flag = bool(
         get_nested(config, "patch", "normalize", default=True)
-    )
-    batch_rotate = bool(
-        get_nested(config, "patch", "batch_rotate", default=False)
     )
 
     # ── 过滤越界关键点 ──
@@ -424,26 +292,14 @@ def patchable_keypoints(
             [],
         )
 
-    # ── 旋转裁切：批量采样或逐点局部反向采样 ──
-    if batch_rotate:
-        try:
-            patches_raw = extract_aligned_patches_batch(
-                image,
-                selected_keypoints,
-                crop_size=crop_size,
-                out_size=out_size,
-            )
-        except RuntimeError:
-            batch_rotate = False  # 回退到逐点路径
-
-    if not batch_rotate:
-        patches_list = [
+    patches_raw = np.stack(
+        [
             extract_aligned_patch(
                 image, kp, crop_size=crop_size, out_size=out_size,
             ).astype(np.float32)
             for kp in selected_keypoints
         ]
-        patches_raw = np.stack(patches_list)
+    )
 
     # ── 批量标准化 ──
     if normalize_flag:

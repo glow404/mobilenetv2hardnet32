@@ -41,8 +41,8 @@ model:
   # 对浮点 checkpoint 输出直接执行 Hf -> sign -> packed uint8，随后使用
   # 归一化 Hamming 距离匹配。不使用随机置换矩阵 P、对角符号矩阵 D，
   # 也不再读写 P/D state 文件。order 必须等于浮点描述子维度。
+  # 开关 enabled 在 config_match_tuning.yaml 中常调。
   hadamard_binarization:
-    enabled: true
     order: 256
     bitorder: little
     zero_is_one: true
@@ -79,10 +79,7 @@ sift:
 patch:
   # keypoint 靠近边界时，如果裁剪窗口与原图有效重叠过低，就丢弃该点。
   min_overlap_ratio: 0.75
-
-  # false：逐点局部反向坐标采样（默认）；true：PyTorch 批量旋转裁切。
-  # 批量路径失败时自动回退到逐点局部采样。
-  batch_rotate: false
+  # 局部块按关键点方向做反向坐标采样（双线性插值），适配单次解锁场景。
 
 keypoint_filter:
   # 每张图最多保留的 SIFT keypoints 数，按 response 从高到低截断。

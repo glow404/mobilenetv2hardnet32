@@ -980,8 +980,15 @@ def export_failure_cases(
     return summary
 
 
-def write_plots(labels: np.ndarray, scores: np.ndarray, curve: list[dict[str, Any]], selected_threshold: float, output_dir: Path) -> None:
-    """写出分数分布图和 FAR/FRR 阈值曲线图。"""
+def write_plots(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    curve: list[dict[str, Any]],
+    selected_threshold: float,
+    metrics: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """写出分数分布图，以及标注 EER 和配置阈值的 FAR/FRR 曲线图。"""
 
     plots = ensure_dir(output_dir / "plots")
     genuine = scores[labels == 1]
@@ -1001,28 +1008,98 @@ def write_plots(labels: np.ndarray, scores: np.ndarray, curve: list[dict[str, An
     thresholds = [float(item["threshold"]) for item in curve]
     far = [float(item["far"] or 0.0) for item in curve]
     frr = [float(item["frr"] or 0.0) for item in curve]
+    far_color = "tab:blue"
+    frr_color = "tab:orange"
     plt.figure(figsize=(8, 5))
-    plt.plot(thresholds, far, label="FAR")
-    plt.plot(thresholds, frr, label="FRR")
-    plt.axvline(selected_threshold, color="gray", linestyle="--", linewidth=1)
+    plt.plot(thresholds, far, color=far_color, label="FAR")
+    plt.plot(thresholds, frr, color=frr_color, label="FRR")
+
+    fixed = dict(metrics.get("fixed_threshold") or {})
+    selected_far = float(fixed.get("far") or 0.0)
+    selected_frr = float(fixed.get("frr") or 0.0)
+    plt.axvline(
+        selected_threshold,
+        color="gray",
+        linestyle="--",
+        linewidth=1,
+        label="configured threshold",
+    )
+    plt.scatter(
+        [selected_threshold, selected_threshold],
+        [selected_far, selected_frr],
+        color=[far_color, frr_color],
+        s=36,
+        zorder=5,
+    )
+    plt.annotate(
+        (
+            f"Configured threshold={selected_threshold:.4f}\n"
+            f"FAR={selected_far:.4%}\n"
+            f"FRR={selected_frr:.4%}"
+        ),
+        xy=(selected_threshold, max(selected_far, selected_frr)),
+        xytext=(-8, 28),
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        arrowprops={"arrowstyle": "->", "color": "gray", "linewidth": 0.8},
+    )
+
+    eer = metrics.get("eer")
+    eer_threshold = metrics.get("eer_threshold")
+    if eer is not None and eer_threshold is not None:
+        eer_value = float(eer)
+        eer_x = float(eer_threshold)
+        plt.axvline(
+            eer_x,
+            color="tab:green",
+            linestyle=":",
+            linewidth=1,
+            label="EER threshold",
+        )
+        plt.scatter(
+            [eer_x],
+            [eer_value],
+            color="tab:green",
+            marker="o",
+            s=42,
+            zorder=5,
+        )
+        plt.annotate(
+            f"EER threshold={eer_x:.4f}\nEER={eer_value:.4%}",
+            xy=(eer_x, eer_value),
+            xytext=(8, -38),
+            textcoords="offset points",
+            ha="left",
+            va="top",
+            fontsize=8,
+            arrowprops={
+                "arrowstyle": "->",
+                "color": "tab:green",
+                "linewidth": 0.8,
+            },
+        )
+
     plt.legend()
     plt.xlabel("match score threshold")
+    plt.ylabel("error rate")
+    plt.grid(alpha=0.2)
     plt.tight_layout()
     plt.savefig(plots / "far_frr_vs_threshold.png", dpi=150)
     plt.close()
 
 
 def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str | Path) -> dict[str, Any]:
-    """从本人验证记录中生成手机解锁耗时明细和汇总报告。
+    """从本人验证记录中生成手机解锁总体耗时汇总。
 
-    离线评估中的本人尝试可用于估算查询模板构建和完整模板匹配耗时，但该流程
-    不启用在线早停，因此它不是最终在线延迟数据；准确的早停延迟应由
+    不再输出逐次解锁 CSV；准确的线上延迟仍应由
     ``run_online_unlock.py --benchmark`` 测量。
     """
 
-    rows: list[dict[str, Any]] = []
     total_genuine_attempts = 0
     failed_genuine_attempts = 0
+    successful_unlocks_timed = 0
     match_values: list[float] = []
     end_to_end_values: list[float] = []
     end_to_end_core_values: list[float] = []
@@ -1033,10 +1110,10 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
         if int(row.get("accepted_at_selected_threshold", 0)) != 1:
             failed_genuine_attempts += 1
             continue
+        successful_unlocks_timed += 1
         match_ms = parse_float(row.get("unlock_match_ms"))
         end_to_end_ms = parse_float(row.get("unlock_end_to_end_ms"))
         end_to_end_core_ms = parse_float(row.get("unlock_end_to_end_core_ms"))
-        query_build_ms = parse_float(row.get("query_template_build_ms"))
         if match_ms is not None:
             match_values.append(match_ms)
         if end_to_end_core_ms is not None:
@@ -1047,57 +1124,8 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
             )
         if end_to_end_ms is not None:
             end_to_end_values.append(end_to_end_ms)
-        rows.append(
-            {
-                "query_id": row.get("query_id", ""),
-                "query_identity": row.get("query_identity", ""),
-                "owner_identity": row.get("owner_identity", ""),
-                "score": row.get("score", ""),
-                "accepted_at_selected_threshold": row.get("accepted_at_selected_threshold", ""),
-                "query_template_build_ms": "" if query_build_ms is None else query_build_ms,
-                "unlock_match_ms": "" if match_ms is None else match_ms,
-                "unlock_end_to_end_ms": "" if end_to_end_ms is None else end_to_end_ms,
-                "unlock_end_to_end_core_ms": (
-                    ""
-                    if end_to_end_core_ms is None and end_to_end_ms is None
-                    else (
-                        end_to_end_core_ms
-                        if end_to_end_core_ms is not None
-                        else compute_end_to_end_core_ms(end_to_end_ms, row)
-                    )
-                ),
-                "best_template_image_id": row.get("best_template_image_id", ""),
-                "num_templates": row.get("num_templates", ""),
-                "num_templates_evaluated": row.get("num_templates_evaluated", ""),
-                "early_stopped": row.get("early_stopped", ""),
-                "early_stop_threshold": row.get("early_stop_threshold", ""),
-                "unique_inliers": row.get("unique_inliers", ""),
-                "num_candidates": row.get("num_candidates", ""),
-                "texture_similarity": row.get("texture_similarity", ""),
-                "texture_overlap_fraction": row.get("texture_overlap_fraction", ""),
-                "texture_valid_blocks": row.get("texture_valid_blocks", ""),
-                "geometry_similarity": row.get("geometry_similarity", ""),
-                "geometry_weight": row.get("geometry_weight", ""),
-                "texture_weight": row.get("texture_weight", ""),
-                "texture_decision": row.get("texture_decision", ""),
-                "registered_template_load_ms": row.get("registered_template_load_ms", ""),
-                "descriptor_prepare_ms": row.get("descriptor_prepare_ms", ""),
-                "candidate_generation_ms": row.get("candidate_generation_ms", ""),
-                "candidate_filter_ms": row.get("candidate_filter_ms", ""),
-                "ransac_ms": row.get("ransac_ms", ""),
-                "inlier_refinement_ms": row.get("inlier_refinement_ms", ""),
-                "unique_inlier_dedup_ms": row.get("unique_inlier_dedup_ms", ""),
-                "texture_similarity_ms": row.get("texture_similarity_ms", ""),
-                "score_fusion_ms": row.get("score_fusion_ms", ""),
-                "postprocess_ms": row.get("postprocess_ms", ""),
-                "image_match_total_ms": row.get("image_match_total_ms", ""),
-                "identity_fusion_ms": row.get("identity_fusion_ms", ""),
-                "identity_match_overhead_ms": row.get("identity_match_overhead_ms", ""),
-                "identity_match_total_ms": row.get("identity_match_total_ms", ""),
-            }
-        )
     out = ensure_dir(output_dir)
-    write_csv_rows(Path(out) / "unlock_timing.csv", rows)
+    (Path(out) / "unlock_timing.csv").unlink(missing_ok=True)
     summary = {
         "definition": {
             "timing_scope": "只统计在 selected threshold 下成功接受的本人解锁记录。",
@@ -1113,7 +1141,7 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
             ),
         },
         "total_genuine_attempts": total_genuine_attempts,
-        "successful_unlocks_timed": len(rows),
+        "successful_unlocks_timed": successful_unlocks_timed,
         "failed_unlocks_excluded": failed_genuine_attempts,
         "match_only": summarize_timing(match_values),
         "end_to_end": summarize_timing(end_to_end_core_values),
@@ -1355,7 +1383,7 @@ def run_descriptor_l2_evaluation(
     )
     write_json(out / "metrics.json", metrics)
     write_yaml(out / "effective_config.yaml", effective_config)
-    write_plots(labels, scores, curve, selected_threshold, out)
+    write_plots(labels, scores, curve, selected_threshold, metrics, out)
     return {
         "metrics": metrics,
         "scores_path": str(scores_path),
@@ -1385,52 +1413,3 @@ def run_hardnet_evaluation(
         max_impostor_identities_per_query=max_impostor_identities_per_query,
         export_failures=export_failures,
     )
-
-
-def summary_row(metrics: dict[str, Any]) -> dict[str, Any]:
-    """把 metrics.json 压平成一行 summary CSV。"""
-
-    fixed = metrics.get("fixed_threshold") or {}
-    failure_export = metrics.get("failure_export") or {}
-    texture_config = metrics.get("texture_verification_config") or {}
-    stage_summary = metrics.get("matching_stage_summary") or {}
-    genuine_stages = stage_summary.get("genuine") or {}
-    row: dict[str, Any] = {
-        "descriptor_source": metrics.get("descriptor_source", "hardnet"),
-        "matching_backend": metrics.get("matching_backend", "hardnet_unknown_unknown_ransac"),
-        "num_queries": metrics.get("num_queries", ""),
-        "configured_threshold": metrics.get("configured_threshold", ""),
-        "num_identities": metrics.get("num_identities", ""),
-        "num_match_attempts": metrics.get("num_match_attempts", ""),
-        "num_genuine_attempts": metrics.get("num_genuine_attempts", ""),
-        "num_impostor_attempts": metrics.get("num_impostor_attempts", ""),
-        "scoring_mode": metrics.get("scoring_mode", ""),
-        "offline_full_template_scoring": metrics.get("offline_full_template_scoring", ""),
-        "early_stop_on_unlock_threshold": metrics.get("early_stop_on_unlock_threshold", ""),
-        "early_stop_threshold": metrics.get("early_stop_threshold", ""),
-        "texture_verification_enabled": texture_config.get("enabled", ""),
-        "geometry_weight": texture_config.get("geometry_weight", ""),
-        "texture_weight": texture_config.get("texture_weight", ""),
-        "geometry_saturation_inliers": texture_config.get("geometry_saturation_inliers", ""),
-        "genuine_candidate_ready_rate": genuine_stages.get("candidate_ready_rate", ""),
-        "genuine_ratio_ready_rate": genuine_stages.get("ratio_ready_rate", ""),
-        "genuine_ransac_success_rate": genuine_stages.get("ransac_success_rate", ""),
-        "genuine_unique_inlier_ready_rate": genuine_stages.get("unique_inlier_ready_rate", ""),
-        "genuine_texture_available_rate": genuine_stages.get("texture_available_rate", ""),
-        "genuine_fused_score_ready_rate": genuine_stages.get("fused_score_ready_rate", ""),
-        "genuine_mean_best_candidates": genuine_stages.get("mean_best_candidates", ""),
-        "genuine_mean_best_unique_inliers": genuine_stages.get("mean_best_unique_inliers", ""),
-        "genuine_mean_max_unique_inliers": genuine_stages.get("mean_max_unique_inliers", ""),
-        "genuine_mean_max_candidate_query_coverage": genuine_stages.get("mean_max_candidate_query_coverage", ""),
-        "selected_threshold": metrics.get("selected_threshold", ""),
-        "eer": metrics.get("eer", ""),
-        "eer_threshold": metrics.get("eer_threshold", ""),
-        "auc": metrics.get("auc", ""),
-        "far_at_selected_threshold": fixed.get("far", ""),
-        "frr_at_selected_threshold": fixed.get("frr", ""),
-        "tar_at_selected_threshold": fixed.get("tar", ""),
-        "num_false_rejects_at_selected_threshold": failure_export.get("num_false_rejects", ""),
-        "num_false_accepts_at_selected_threshold": failure_export.get("num_false_accepts", ""),
-        "failure_dir": failure_export.get("failure_dir", ""),
-    }
-    return row

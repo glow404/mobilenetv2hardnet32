@@ -48,23 +48,32 @@ from match_new.descriptor_contract import (
     require_supported_contract,
     resolve_descriptor_contract,
 )
-from match_new.evaluation import run_hardnet_evaluation, summary_row
+from match_new.evaluation import run_hardnet_evaluation
 from match_new.hadamard_binarization import (
     HadamardBinarizer,
     hadamard_binarization_enabled,
 )
 from match_new.input_loader import load_raw_image_metadata, validate_identity_image_counts
 from match_new.template_builder import build_hardnet_templates, build_identity_templates, load_image_template
-from match_new.utils import ensure_dir, load_config, resolve_path, template_filename, write_csv_rows, write_json
+from match_new.utils import ensure_dir, load_config, resolve_path, template_filename, write_csv_rows
 
 
 MATCH_NEW_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = MATCH_NEW_DIR / "config_match_new.yaml"
 DEFAULT_OUTPUT_DIR = "outputs"
+OBSOLETE_ROOT_OUTPUT_FILENAMES = (
+    "build_report.json",
+    "enrollment_timing.csv",
+    "enrollment_timing.json",
+    "hardnet_l2_summary.csv",
+    "hardnet_l2_summary.json",
+    "hardnet_hamming_summary.csv",
+    "hardnet_hamming_summary.json",
+)
 
-# 单张注册模板总时长的完整组成。这里不包含 template_total_ms、sift_ms 等
-# 聚合/兼容字段，避免在按手指求和时重复计算同一阶段。
-ENROLLMENT_STAGE_FIELDS = (
+# 单张模板构建总时长的完整组成。这里不包含 template_total_ms、sift_ms 等
+# 聚合/兼容字段，避免重复计算同一阶段。
+TEMPLATE_BUILD_STAGE_FIELDS = (
     "image_read_ms",
     "sift_keypoint_detection_ms",
     "keypoint_filter_ms",
@@ -88,115 +97,52 @@ def numeric(value: Any) -> float | None:
         return None
 
 
-def percentile(values: list[float], q: float) -> float | None:
-    """用最近秩方式计算小规模耗时样本的百分位数。"""
+def build_template_timing_average(
+    template_timings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """汇总全部成功模板的构建阶段平均耗时，避免输出逐图明细。"""
 
-    if not values:
-        return None
-    ordered = sorted(values)
-    index = int(round((len(ordered) - 1) * float(q)))
-    index = max(0, min(len(ordered) - 1, index))
-    return float(ordered[index])
-
-
-def summarize_values(values: list[float]) -> dict[str, Any]:
-    """汇总一组毫秒耗时，输出总计、均值、范围及 P50/P95。"""
-
-    if not values:
-        return {"count": 0}
-    total = float(sum(values))
-    return {
-        "count": len(values),
-        "total_ms": total,
-        "avg_ms": total / len(values),
-        "min_ms": float(min(values)),
-        "max_ms": float(max(values)),
-        "p50_ms": percentile(values, 0.50),
-        "p95_ms": percentile(values, 0.95),
+    success_rows = [
+        row
+        for row in template_timings
+        if str(row.get("status", "")).lower() == "success"
+    ]
+    summary: dict[str, Any] = {
+        "num_input_images": len(template_timings),
+        "num_successful_templates": len(success_rows),
+        "num_failed_templates": len(template_timings) - len(success_rows),
     }
-
-
-def build_enrollment_timing_report(success_rows: list[dict[str, str]], identity_payload: dict[str, Any]) -> dict[str, Any]:
-    """按手指汇总被选中注册图像的模板构建时间。
-
-    单个手指的注册总时长等于其全部注册图像模板构建耗时之和；缺失的耗时会单独
-    计数，避免把不完整数据误当作真实注册时长。除总时长外，还会累计图像读取、
-    SIFT 检测、关键点筛选、局部块裁剪旋转、HardNet 推理和模板持久化等阶段。
-    """
-
-    row_by_key = {(row["identity_id"], row["image_id"]): row for row in success_rows}
-    per_identity: list[dict[str, Any]] = []
-    for identity in identity_payload.get("identities", []):
-        identity_id = str(identity.get("identity_id", ""))
-        image_ids = [str(image_id) for image_id in identity.get("template_image_ids", [])]
-        values: list[float] = []
-        missing = 0
-        stage_values = {
-            field: []
-            for field in ENROLLMENT_STAGE_FIELDS
-        }
-        missing_stage_timing_values = 0
-        for image_id in image_ids:
-            row = row_by_key.get((identity_id, image_id))
-            elapsed = numeric(row.get("template_build_ms") if row else None)
-            if elapsed is None:
-                missing += 1
-            else:
-                values.append(elapsed)
-            for field in ENROLLMENT_STAGE_FIELDS:
-                stage_elapsed = numeric(row.get(field) if row else None)
-                if stage_elapsed is None:
-                    missing_stage_timing_values += 1
-                else:
-                    stage_values[field].append(stage_elapsed)
-        summary = summarize_values(values)
-        stage_complete = bool(image_ids) and all(
-            len(stage_values[field]) == len(image_ids)
-            for field in ENROLLMENT_STAGE_FIELDS
+    average_fields = (
+        "template_build_ms",
+        *TEMPLATE_BUILD_STAGE_FIELDS,
+        "num_keypoints",
+    )
+    for field in average_fields:
+        values = [
+            value
+            for row in success_rows
+            if (value := numeric(row.get(field))) is not None
+        ]
+        output_field = (
+            "avg_num_keypoints"
+            if field == "num_keypoints"
+            else f"avg_{field}"
         )
-        stage_totals = {
-            field: (
-                float(sum(stage_values[field]))
-                if len(stage_values[field]) == len(image_ids) and image_ids
-                else ""
-            )
-            for field in ENROLLMENT_STAGE_FIELDS
-        }
-        accounted_stage_ms = (
-            float(sum(float(value) for value in stage_totals.values()))
-            if stage_complete
+        summary[output_field] = (
+            float(sum(values) / len(values))
+            if values
             else ""
         )
-        registration_total_ms = summary.get("total_ms", "")
-        per_identity.append(
-            {
-                "identity_id": identity_id,
-                "num_enrollment_templates": len(image_ids),
-                "num_timed_templates": len(values),
-                "missing_timing_count": missing,
-                "stage_timing_complete": int(stage_complete),
-                "missing_stage_timing_values": missing_stage_timing_values,
-                "registration_total_ms": registration_total_ms,
-                "registration_avg_template_ms": summary.get("avg_ms", ""),
-                "registration_min_template_ms": summary.get("min_ms", ""),
-                "registration_max_template_ms": summary.get("max_ms", ""),
-                "registration_p50_template_ms": summary.get("p50_ms", ""),
-                "registration_p95_template_ms": summary.get("p95_ms", ""),
-                **{
-                    f"registration_{field}": value
-                    for field, value in stage_totals.items()
-                },
-                "registration_accounted_stage_ms": accounted_stage_ms,
-                "registration_accounting_error_ms": (
-                    float(registration_total_ms) - float(accounted_stage_ms)
-                    if registration_total_ms not in {"", None}
-                    and accounted_stage_ms not in {"", None}
-                    else ""
-                ),
-            }
-        )
-    totals = [float(row["registration_total_ms"]) for row in per_identity if row.get("registration_total_ms") not in {"", None}]
-    return {"per_identity": per_identity, "summary": summarize_values(totals)}
+    return summary
+
+
+def remove_obsolete_root_outputs(output_dir: Path) -> None:
+    """删除旧版本生成但当前已取消的重复输出文件。"""
+
+    for filename in OBSOLETE_ROOT_OUTPUT_FILENAMES:
+        (output_dir / filename).unlink(missing_ok=True)
+    # 跳过模板构建时没有本次耗时，不能保留旧版逐图明细冒充当前结果。
+    (output_dir / "template_build_timings.csv").unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -215,8 +161,47 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="覆盖 data.identity_depth。",
     )
-    parser.add_argument("--model_path", default=None, help="覆盖 model.checkpoint。")
-    parser.add_argument("--output_dir", default=None, help="覆盖 output.output_dir。")
+    parser.add_argument(
+        "--model-path",
+        "--model_path",
+        dest="model_path",
+        default=None,
+        help="覆盖 model.checkpoint。",
+    )
+    parser.add_argument(
+        "--output-dir",
+        "--output_dir",
+        dest="output_dir",
+        default=None,
+        help="覆盖 output.output_dir。",
+    )
+    parser.add_argument(
+        "--hadamard-binarization",
+        "--hadamard_binarization",
+        dest="hadamard_binarization",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "覆盖 model.hadamard_binarization.enabled。可用 "
+            "--hadamard-binarization / --no-hadamard-binarization。"
+        ),
+    )
+    parser.add_argument(
+        "--ratio-threshold",
+        "--ratio_threshold",
+        dest="ratio_threshold",
+        type=float,
+        default=None,
+        help="覆盖 matching.ratio_threshold（浮点/L2）。",
+    )
+    parser.add_argument(
+        "--hamming-ratio-threshold",
+        "--hamming_ratio_threshold",
+        dest="hamming_ratio_threshold",
+        type=float,
+        default=None,
+        help="覆盖 matching.hamming.ratio_threshold（二值/Hamming）。",
+    )
     parser.add_argument(
         "--skip-template-build",
         "--skip_template_build",
@@ -254,6 +239,18 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
         # 命令行路径按当前工作目录理解，写成绝对路径避免歧义。
         config.setdefault("output", {})["output_dir"] = str(Path(args.output_dir).expanduser().resolve())
         config.setdefault("output", {})["_output_dir_from_cli"] = True
+    if args.hadamard_binarization is not None:
+        config.setdefault("model", {}).setdefault("hadamard_binarization", {})[
+            "enabled"
+        ] = bool(args.hadamard_binarization)
+    if args.ratio_threshold is not None:
+        config.setdefault("matching", {})["ratio_threshold"] = float(
+            args.ratio_threshold
+        )
+    if args.hamming_ratio_threshold is not None:
+        config.setdefault("matching", {}).setdefault("hamming", {})[
+            "ratio_threshold"
+        ] = float(args.hamming_ratio_threshold)
     if args.skip_template_build is not None:
         config.setdefault("runtime", {})["skip_template_build"] = bool(args.skip_template_build)
     if args.max_impostor_identities_per_query is not None:
@@ -561,7 +558,7 @@ def main() -> None:
     checkpoint = resolve_path(config, dict(config.get("model", {}))["checkpoint"])
     if not checkpoint.exists():
         raise FileNotFoundError(f"Descriptor checkpoint does not exist: {checkpoint}")
-    descriptor_dim = resolve_expected_descriptor_dim(config, checkpoint)
+    resolve_expected_descriptor_dim(config, checkpoint)
     checkpoint_metadata = resolve_checkpoint_metadata(checkpoint, config)
     descriptor_metric = str(checkpoint_metadata["descriptor_metric"])
     config.setdefault("model", {})["descriptor_kind"] = str(
@@ -569,22 +566,19 @@ def main() -> None:
     )
     config.setdefault("matching", {})["distance"] = descriptor_metric
     eval_dir_name = f"eval_hardnet_{descriptor_metric}"
-    summary_stem = f"hardnet_{descriptor_metric}_summary"
-
-    image_root = resolve_path(
-        config,
-        dict(config.get("data", {})).get("image_root", ""),
-    )
 
     # 1. 直接扫描原始图像；调试时可按 identity 数和每个 identity 的图像数裁剪数据。
     output_dir = ensure_dir(settings["output_dir"])
+    remove_obsolete_root_outputs(output_dir)
     rows = load_raw_image_metadata(config)
     rows = limit_rows_for_debug(rows, int(settings["limit_identities"]), int(settings["limit_images_per_identity"]))
     if not rows:
         raise RuntimeError("No raw fingerprint images found.")
     enrollment = dict(config.get("enrollment", {}))
     enrollment_count = int(enrollment.get("enrollment_images_per_identity", 20))
-    validate_identity_image_counts(rows, enrollment_count + 1, context="raw image input")
+    rows = validate_identity_image_counts(
+        rows, enrollment_count + 1, context="原始图像扫描"
+    )
     write_csv_rows(output_dir / "metadata_all.csv", rows)
 
     # 2. 构建图像级模板；如果 skip_template_build，则按原始 metadata 复用已有模板。
@@ -604,12 +598,16 @@ def main() -> None:
             raise RuntimeError("skip_template_build was set but no image templates were found.")
     else:
         report = build_hardnet_templates(rows, template_dir, config)
-        write_json(output_dir / "build_report.json", {k: v for k, v in report.items() if k != "success_rows"})
-        write_csv_rows(output_dir / "template_build_timings.csv", report.get("template_timings", []))
+        timing_average = build_template_timing_average(
+            report.get("template_timings", [])
+        )
+        write_csv_rows(
+            output_dir / "template_build_timings.csv",
+            [timing_average],
+        )
         success_rows = report["success_rows"]
         if not success_rows:
             raise RuntimeError("No templates were built successfully.")
-    validate_identity_image_counts(success_rows, enrollment_count + 1, context="successfully built templates")
     validate_templates(
         template_dir,
         success_rows,
@@ -619,68 +617,32 @@ def main() -> None:
 
     # 3. 固定随机种子，为每个 identity 选择注册模板，其余作为 query。
     identity_templates_path = output_dir / f"identity_templates_{enrollment_count}.json"
-    identity_payload, split_rows = build_identity_templates(
+    _identity_payload, split_rows = build_identity_templates(
         success_rows,
         identity_templates_path,
         enrollment_count=enrollment_count,
         seed=int(enrollment.get("random_seed", 42)),
     )
-    enrollment_timing = build_enrollment_timing_report(success_rows, identity_payload)
-    write_csv_rows(output_dir / "enrollment_timing.csv", enrollment_timing["per_identity"])
-    write_json(output_dir / "enrollment_timing.json", enrollment_timing)
 
     # 4. 执行身份验证评估，并在配置阈值下导出失败样本。
+    eval_dir = output_dir / eval_dir_name
     result = run_hardnet_evaluation(
         metadata_rows=split_rows,
         identity_templates_path=identity_templates_path,
         template_dir=template_dir,
         config=config,
-        output_dir=output_dir / eval_dir_name,
+        output_dir=eval_dir,
         max_impostor_identities_per_query=int(settings["max_impostor_identities_per_query"]),
         export_failures=bool(settings["export_failures"]),
-    )
-    # 5. 汇总一行 CSV/JSON，方便和其他实验横向比较。
-    summary_record = {
-        "evaluation_dataset": image_root.name,
-        "model_architecture": checkpoint_metadata.get("model_architecture", ""),
-        "descriptor_dim": int(descriptor_dim),
-        "checkpoint": str(checkpoint),
-        **summary_row(result["metrics"]),
-    }
-    summary = [summary_record]
-    summary_csv = output_dir / f"{summary_stem}.csv"
-    summary_json = output_dir / f"{summary_stem}.json"
-    write_csv_rows(summary_csv, summary)
-    write_json(
-        summary_json,
-        {
-            "summary": summary,
-            "identity_templates": str(identity_templates_path),
-            "image_templates": str(template_dir),
-            "eval_dir": str(output_dir / eval_dir_name),
-            "checkpoint": str(checkpoint),
-            "checkpoint_metadata": checkpoint_metadata,
-            "descriptor_dim": int(descriptor_dim),
-            "evaluation_dataset": resolve_path(
-                config,
-                dict(config.get("data", {})).get("image_root", ""),
-            ).name,
-            "effective_config": result["metrics"].get("effective_config"),
-            "run_settings": {
-                "output_dir": str(output_dir),
-                "skip_template_build": settings["skip_template_build"],
-                "max_impostor_identities_per_query": settings["max_impostor_identities_per_query"],
-                "limit_identities": settings["limit_identities"],
-                "limit_images_per_identity": settings["limit_images_per_identity"],
-                "export_failures": settings["export_failures"],
-            },
-        },
     )
     print(
         json.dumps(
             {
-                "summary_csv": str(summary_csv),
-                "summary_json": str(summary_json),
+                "verification_scores_csv": result["scores_path"],
+                "metrics_json": str(eval_dir / "metrics.json"),
+                "effective_config_yaml": str(
+                    eval_dir / "effective_config.yaml"
+                ),
                 "far_frr_table_csv": result["far_frr_table_path"],
                 "per_finger_far_frr_csv": result["per_finger_far_frr_path"],
                 "outputs": str(output_dir),

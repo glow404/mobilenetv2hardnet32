@@ -107,6 +107,7 @@ python -m hardnet_train.train_binary `
 
 - 待评估指纹数据集 `data.image_root`；
 - 浮点或二值模型 `model.checkpoint`；
+- 是否开启 Hadamard 二值化 `model.hadamard_binarization.enabled`；
 - 输出目录、注册模板数量和匹配阈值。
 
 完整执行模板构建、注册划分、匹配及 FAR/FRR 评估：
@@ -115,6 +116,19 @@ python -m hardnet_train.train_binary `
 python match_new\run_hardnet_matching.py `
   --config match_new\config_match_new.yaml
 ```
+
+常改的路径、模型、二值化方式和 ratio 阈值也可以直接通过命令行覆盖。例如运行
+Hadamard 二值/Hamming 实验：
+
+```powershell
+python match_new\run_hardnet_matching.py `
+  --image-root datasets\wet_select `
+  --model-path outputs\models\3\m0\m0_256_v2\best.pt `
+  --output-dir outputs\wet_select_hadamard `
+  --hadamard-binarization `
+  --hamming-ratio-threshold 0.90
+```
+
 
 如果只修改了匹配、RANSAC、纹理融合或最终判定阈值，可以复用已有模板：
 

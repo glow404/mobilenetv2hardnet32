@@ -49,10 +49,39 @@ python match_new\run_hardnet_matching.py
 ```powershell
 python match_new\run_hardnet_matching.py `
   --image-root datasets\new_data_V3 `
-  --output_dir outputs\newdataV3-8-float256+模板数30 `
+  --output-dir outputs\newdataV3-8-float256+模板数30 `
 ```
 
 **输出模板目录**：`<output_dir>/image_templates/`，每个 `.npz` 包含关键点字段、`hardnet_descriptors` 和 `overlap_image`。浮点模板使用 `float32` 列；二值模板使用 `packed_uint8` 列，`hardnet_descriptor_dim` 表示 bit 数，`hardnet_descriptor_bitorder` 保存位序。Hadamard 后处理还会保存 `hardnet_descriptor_transform_name` 和 `hardnet_descriptor_transform_id`，防止旧的 P/D 模板与当前直接 `Hf` 模板混用。灰度图保持原始尺寸和关键点坐标系，由 `np.savez_compressed` 无损压缩，`np.load` 时自动解压。
+
+主要输出结构：
+
+```text
+<output_dir>/
+  metadata_all.csv
+  image_templates/
+  identity_templates_<N>.json
+  template_build_timings.csv
+  eval_hardnet_<l2|hamming>/
+    verification_scores.csv
+    metrics.json
+    effective_config.yaml
+    match_score_threshold_curve.csv
+    far_frr_thresholds_<min>_<max>.csv
+    per_finger_far_frr_at_global_zero_far.csv
+    unlock_timing.json
+    plots/
+      score_distribution.png
+      far_frr_vs_threshold.png
+    failure_cases/
+```
+
+`template_build_timings.csv` 只有一行，统计全部成功模板在读图、SIFT 检测、
+关键点过滤、patch 裁切旋转、HardNet 推理、模板组装和保存等阶段的平均耗时，
+不再输出逐图耗时；使用 `--skip-template-build` 时本次没有模板构建计时，因此
+不生成该文件。离线评估只保留 `unlock_timing.json` 总体解锁耗时汇总，
+不再生成逐次 `unlock_timing.csv`。`far_frr_vs_threshold.png` 会直接标出 EER
+阈值/EER，以及配置匹配阈值对应的 FAR、FRR。
 
 **常用命令行覆盖**（均可不传，改用配置）：
 
@@ -61,8 +90,11 @@ python match_new\run_hardnet_matching.py `
 | `--config` | 配置文件路径，默认 `match_new/config_match_new.yaml` |
 | `--image-root` | 覆盖 `data.image_root` |
 | `--identity-depth` | 覆盖 `data.identity_depth` |
-| `--model_path` | 覆盖 `model.checkpoint` |
-| `--output_dir` | 覆盖 `output.output_dir` |
+| `--model-path` / `--model_path` | 覆盖 `model.checkpoint` |
+| `--output-dir` / `--output_dir` | 覆盖 `output.output_dir` |
+| `--hadamard-binarization` / `--no-hadamard-binarization` | 开启/关闭 `model.hadamard_binarization.enabled` |
+| `--ratio-threshold` | 覆盖浮点/L2 的 `matching.ratio_threshold` |
+| `--hamming-ratio-threshold` | 覆盖二值/Hamming 的 `matching.hamming.ratio_threshold` |
 | `--skip-template-build` / `--no-skip-template-build` | 覆盖是否跳过模板构建 |
 | `--max_impostor_identities_per_query` | 覆盖 impostor 上限 |
 | `--random_seed` | 覆盖注册随机种子 |
@@ -70,6 +102,32 @@ python match_new\run_hardnet_matching.py `
 | `--max_failure_cases_per_type` | 覆盖每类失败样本导出上限 |
 | `--limit_identities` | 调试：限制 identity 数量 |
 | `--limit_images_per_identity` | 调试：限制每个 identity 的图像数量 |
+
+浮点/L2 实验示例：
+
+```powershell
+python match_new\run_hardnet_matching.py `
+  --image-root datasets\wet_select `
+  --model-path outputs\models\3\m0\m0_256_v2\best.pt `
+  --output-dir outputs\wet_select_float `
+  --no-hadamard-binarization `
+  --ratio-threshold 0.85
+```
+
+Hadamard 二值/Hamming 实验示例：
+
+```powershell
+python match_new\run_hardnet_matching.py `
+  --image-root datasets\wet_select `
+  --model-path outputs\models\3\m0\m0_256_v2\best.pt `
+  --output-dir outputs\wet_select_hadamard `
+  --hadamard-binarization `
+  --hamming-ratio-threshold 0.90
+```
+
+`matching.hamming.*` 会覆盖同名顶层参数，所以二值/Hamming 实验应使用
+`--hamming-ratio-threshold`。切换 checkpoint 或 Hadamard 开关会改变描述子契约，
+必须重新构建模板，不能同时使用 `--skip-template-build`；只修改 ratio 阈值时可以复用模板。
 
 **离线标定与在线早停**：
 
@@ -217,7 +275,6 @@ online_unlock:
 | `patch.crop_size` / `out_size` | — | 必须与训练一致，当前为 `32` |
 | `patch.normalize` | — | 单 patch 减均值除标准差，当前为 `true` |
 | `patch.min_overlap_ratio` | — | 边界关键点丢弃阈值，当前常用 `0.75` |
-| `patch.batch_rotate` | `false` | 默认逐点局部反向采样；`true` 时启用批量旋转裁切 |
 
 ### 在线共用的匹配参数（`matching.*`）
 
@@ -288,22 +345,22 @@ Hamming 路径下，`matching.hamming.*` 会覆盖同名顶层 L2 参数。
 
 汇总中的百分位由 `online_unlock.timing.percentiles` 控制；明细 CSV 保留每次尝试的原始毫秒数。
 
-离线主实验的注册/template 构建耗时见 `template_build_timings.csv` 与 `enrollment_timing.csv/json`（第 1 节）。
+离线主实验的全量模板构建阶段平均耗时见 `template_build_timings.csv`（第 1 节）。
 
 **换 checkpoint 示例**：
 
 ```powershell
 python match_new\run_hardnet_matching.py `
-  --model_path outputs\hardnet_train_xxx\best.pt `
-  --output_dir match_new\outputs_xxx
+  --model-path outputs\hardnet_train_xxx\best.pt `
+  --output-dir match_new\outputs_xxx
 ```
 
 **复用已有模板**（只改了匹配参数、未改模型/patch/SIFT 检测参数和纹理模板格式时）：
 
 ```powershell
 python match_new\run_hardnet_matching.py `
-  --output_dir match_new\outputs `
-  --skip_template_build
+  --output-dir match_new\outputs `
+  --skip-template-build
 ```
 
 注意：旧版双描述子模板（同时含 HardNet 和 RootSIFT）**不再支持复用**，需要重新生成 HardNet 单描述子模板。

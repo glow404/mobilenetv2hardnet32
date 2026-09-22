@@ -1,0 +1,10 @@
+二值化模型推理   命令：
+python run_hardnet_matching.py --output_dir ../outputs/高低温/m0_256_512_v2_模板数40-OFHTP_ysjz --image_root ../datasets/OFHTP_ysjz --model_path ../outputs/models/3/m0/m0_256_512_v2/best.pt
+
+python run_hardnet_matching.py --output_dir ../outputs/钢化膜/m0_256_512_v2_模板数40-ID7_deno --image_root ../datasets/ID7_deno
+
+python run_hardnet_matching.py --output_dir ../outputs/湿手指/m0_256_512_v2_模板数40-wet_deno --image_root ../datasets/wet_deno
+
+
+哈达玛二值化 命令
+python run_hardnet_matching.py --output_dir ../outputs/高低温/m0_256_hadamard_v2_模板数40-OFHTP_ysjz --image_root ../datasets/OFHTP_ysjz --model_path ../outputs/models/3/m0/m0_256_v2/best.pt --

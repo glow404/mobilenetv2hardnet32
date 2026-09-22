@@ -1,0 +1,62 @@
+# Q模组+QTFT+H芯片
+#reg cfg 
+ #,min, max,bitwidth,signed,fixed,constrai
+pitch 
+= 75 
+#， pitch距离，单位um 1e-6 ,θ~1023 
+## sampling cfg 
+modulateF 
+= 1200000#， 打码频率，单位Hz,
+ phaseNum 
+= 5 
+#，采样点数，1~65535，
+低温
+ sampRate 
+62500000
+#，采样率，
+# demod cfg 
+lowPowSampMode
+0
+#，低功耗模式，即四倍频采样可用，
+offset 
+=
+θ 
+#，demod输入数据无符号转有符号的offset，
+rgtShiftBitWidth
+=
+ 4 
+#，demod接收的输入数据右移的位数，当输入是16比特后可转
+initialPhase
+=θ 
+#，demod时初始相位，用phaseQuantBit量化，
+ phaseQuantBit 
+= 30 
+#，使用coRDIc计算cos，sin时，phaseStep和initialphase
+initPhaseEstimateEn 
+1
+#，基于原始多相位数据估计相位的使能
+## psf estimate cfg 
+psfEstEn 
+= θ 
+#，psf估计的使能，：用default配置，
+defaultRadiusH 
+= 16 
+#，PSf核的高度，θ~MAXRADIUS宏（110），
+ defaultRadiusW 
+= 16 
+#，psf核的宽度，~MAXRADIUS宏(108),
+defaultc 
+= 3800 
+#，声速，单位m/s，
+defaultD 
+= 700 
+#，模组厚度，单位um,1e-6,
+defaultSNR 
+= 6 
+#， wiener滤波时的SNR参数的指数，6即为10^6，支持-6~6,
+defaultAlpha 
+= 30 
+#，回波衰减系数，单位1e-6，支持θ~65535，
+ border_top 
+= 0 
+#，psf估计时使用的局部图的上下左右坐标，θ~512,

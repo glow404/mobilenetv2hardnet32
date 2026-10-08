@@ -10,7 +10,8 @@
 extends: config_match_tuning.yaml
 
 runtime:
-  # 每个 query 最多比对几个非本人 identity；0 表示全量 impostor。
+  # 每个 query 最多比对几个非本人 identity：
+  #   -1 = 全量 impostor；0 = 不比对非本人；正整数 = 最多抽这么多个。
   max_impostor_identities_per_query: 0
 
   # 调试裁剪：只保留前 N 个 identity；0 表示不限制。正式实验必须为 0。
@@ -20,10 +21,9 @@ runtime:
   # 例如设为 42，配合 enrollment_images_per_identity=40，可形成 40 注册 + 2 query。
   limit_images_per_identity: 0
 
-data:
-  # 相对 image_root 的前几级目录共同组成一个手指的 identity_id。
-  # 当前目录形如 dy_L0/pair_1.bmp，因此使用前 1 级。
-  identity_depth: 1
+data: {}
+  # 固定结构：image_root/<手指目录>/图像文件（类似 datasets/wet）。
+  # 多一层中间目录或不放在手指目录下会直接报错。
 
 model:
   # auto：由 checkpoint 自动选择 float/L2 或 binary/Hamming。
@@ -126,33 +126,21 @@ texture_verification:
   enabled: true
 
 template_management:
-  # 动态模板库总开关。初始20张注册模板全部作为受保护seed，之后只学习HardNet模板。
-  enabled: false
+  # 离线评估中的动态模板学习总开关。
+  enabled: true
 
-  # 初始20张模板全部受保护；模板库最多再容纳20张学习模板。
+  # 活动模板库最大数量；初始受保护模板数量直接取 enrollment_images_per_identity。
   max_active_templates: 40
-  protected_seed_templates: 20
 
-  # 身份可信：至少一张模板满足严格学习条件，同时至少两张可信模板完成确认，
-  # 并且确认模板中至少包含一张初始seed。
-  learn_score_threshold: 0.85
-  learn_min_unique_inliers: 12
-  learn_min_texture_similarity: 0.75
-  confirm_score_threshold: 0.70
-  confirmation_templates: 2
-  require_seed_confirmation: true
 
-  # 使用局部灰度标准差生成真实脊线纹理coverage mask，再计算仿射对齐公共区域。
-  min_common_area_ratio: 0.35
-  min_common_area_pixels: 256
+  # 学习准入：本人匹配分数达到该阈值，且仿射对齐后的公共纹理区域率不高于该值。
+  learn_score_threshold: 0.80
+  max_common_area_ratio: 0.70
+
+  # 公共纹理区域计算参数。（计算mask掩码用）
   coverage_window_size: 9
   coverage_min_std: 5.0
   coverage_morph_kernel: 3
-
-  # 动态索引、学习模板和被替换模板都写入本次output根目录。
-  library_filename: template_library.json
-  learned_templates_dir: learned_templates
-  retired_templates_dir: retired_templates
 
 identification:
   #   max       : 注册模板里取最高图像级分数，符合手机解锁“命中一张即可”的语义；

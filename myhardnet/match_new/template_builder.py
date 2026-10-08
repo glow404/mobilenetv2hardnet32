@@ -577,25 +577,56 @@ def apply_identity_template_split(
     ]
 
 
+def select_enrollment_rows(
+    candidates: list[dict[str, str]],
+    enrollment_count: int,
+    selection_strategy: str,
+    *,
+    seed: int = 42,
+) -> list[dict[str, str]]:
+    """按目录扫描顺序从候选图像中选择注册模板。"""
+
+    ordered = list(candidates)
+    count = max(0, int(enrollment_count))
+    if count <= 0 or not ordered:
+        return []
+    strategy = str(selection_strategy or "first").strip().lower()
+    if strategy == "first":
+        return ordered[: min(count, len(ordered))]
+    if strategy == "stride":
+        step = max(1, len(ordered) // count)
+        return ordered[::step][:count]
+    if strategy == "random":
+        return random.Random(int(seed)).sample(ordered, min(count, len(ordered)))
+    raise ValueError(
+        "enrollment.selection_strategy 仅支持 first、stride 或 random，"
+        f"收到: {selection_strategy!r}"
+    )
+
+
 def build_identity_templates(
     rows: list[dict[str, str]],
     output_path: str | Path,
     enrollment_count: int,
-    seed: int,
+    seed: int = 42,
+    selection_strategy: str = "first",
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
-    """为每个 identity 随机选择注册模板，并返回内存中的 query 划分。"""
+    """为每个 identity 选择注册模板，并返回内存中的 query 划分。"""
 
     groups: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         groups[row["identity_id"]].append(row)
 
-    rng = random.Random(int(seed))
+    strategy = str(selection_strategy or "first").strip().lower()
     identities: list[dict[str, Any]] = []
     warnings: list[str] = []
-    for identity_id in sorted(groups):
-        candidates = sorted(groups[identity_id], key=lambda item: item["image_id"])
-        rng.shuffle(candidates)
-        chosen = candidates[: min(int(enrollment_count), len(candidates))]
+    for identity_id in groups:
+        chosen = select_enrollment_rows(
+            groups[identity_id],
+            enrollment_count,
+            strategy,
+            seed=int(seed),
+        )
         if len(chosen) < int(enrollment_count):
             warnings.append(f"{identity_id} has only {len(chosen)} templates")
         identities.append(
@@ -609,7 +640,7 @@ def build_identity_templates(
 
     payload = {
         "enrollment_images_per_identity": int(enrollment_count),
-        "selection_strategy": "random",
+        "selection_strategy": strategy,
         "random_seed": int(seed),
         "num_identities": len(identities),
         "identities": identities,

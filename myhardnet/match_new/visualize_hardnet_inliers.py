@@ -57,7 +57,6 @@ def parse_args() -> argparse.Namespace:
         help="Minimum unique_inliers for bottom cases. Default: 3.",
     )
     parser.add_argument("--max_lines", type=int, default=200, help="Maximum lines to draw per visualization.")
-    parser.add_argument("--identity_depth", type=int, default=1, help="How many path levels under image_root form identity_id.")
     parser.add_argument(
         "--include_impostor",
         action="store_true",
@@ -77,35 +76,15 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("enrollment", {})["enrollment_images_per_identity"] = int(args.enrollment_count)
 
 
-def scan_image_rows(image_root: str | Path, identity_depth: int) -> list[dict[str, str]]:
-    """从原始图像目录扫描 metadata。
+def scan_image_rows(image_root: str | Path) -> list[dict[str, str]]:
+    """从原始图像目录扫描 metadata；固定为 image_root/<手指目录>/图像。"""
 
-    默认 `identity_depth=1`，即 `pair_build/select_top500/zyh_L0/pair_1.bmp`
-    会得到：
-      identity_id = zyh_L0
-      image_id = pair_1
-      image_path = 原图绝对路径
-    """
+    from match_new.input_loader import scan_image_metadata
 
-    root = Path(image_root).expanduser().resolve()
-    rows: list[dict[str, str]] = []
-    for path in sorted(root.rglob("*")):
-        if path.suffix.lower() not in IMAGE_EXTENSIONS:
-            continue
-        rel = path.relative_to(root)
-        if len(rel.parts) <= identity_depth:
-            continue
-        identity_id = "/".join(rel.parts[:identity_depth])
-        rows.append(
-            {
-                "identity_id": identity_id,
-                "image_id": path.stem,
-                "image_path": str(path.resolve()),
-                "split": "",
-            }
-        )
-    return rows
-
+    return scan_image_metadata(
+        image_root,
+        validate_readable=False,
+    )
 
 def imread_grayscale(path: str | Path) -> np.ndarray | None:
     """读取灰度图，兼容 Windows 中文路径。"""
@@ -452,7 +431,7 @@ def main() -> None:
 
     output_dir = ensure_dir(args.output_dir)
     template_dir = ensure_dir(output_dir / "image_templates")
-    rows = scan_image_rows(args.image_root, int(args.identity_depth))
+    rows = scan_image_rows(args.image_root)
     if not rows:
         raise RuntimeError(f"No images found under {args.image_root}")
     write_csv_rows(output_dir / "metadata_all.csv", rows)
@@ -491,6 +470,7 @@ def main() -> None:
         identity_templates_path,
         enrollment_count=enrollment_count,
         seed=random_seed,
+        selection_strategy=str(enrollment.get("selection_strategy", "first")),
     )
 
     cases = score_genuine_pairs(

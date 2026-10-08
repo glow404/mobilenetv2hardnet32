@@ -228,6 +228,7 @@ def score_query_against_identity(
         "best_template_path": paths[best_index] if best_index >= 0 else "",
         "best_template_image_id": str(best_template.get("image_id", "")),
         "best_template_image_path": str(best_template.get("image_path", "")),
+        "best_affine_matrix": best.get("affine_matrix"),
         "num_templates": len(paths),
         "num_templates_evaluated": len(results),
         "early_stopped": int(early_stopped),

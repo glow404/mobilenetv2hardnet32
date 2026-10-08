@@ -24,19 +24,19 @@ conda activate hardnet-cuda
 |--------|------|
 | `output.output_dir` | 实验结果输出目录 |
 | `runtime.skip_template_build` | 是否复用已有模板 |
-| `runtime.max_impostor_identities_per_query` | 每个 query 最多测几个非本人身份，`0`=全量 |
+| `runtime.max_impostor_identities_per_query` | 每个 query 最多测几个非本人身份：`-1`=全量，`0`=不比对，正整数=抽样上限 |
 | `runtime.limit_identities` / `limit_images_per_identity` | 调试裁剪，正式实验保持 `0` |
-| `data.image_root` | 原始指纹图像根目录 |
-| `data.identity_depth` | 组成一个手指 identity 的目录层级数 |
+| `data.image_root` | 原始指纹根目录；固定为 `image_root/<手指目录>/图像文件` |
 | `model.checkpoint` | 浮点或二值 HardNet 权重 |
 | `model.descriptor_kind` / `model.binary_storage` / `model.binary_bitorder` | 描述子类型与二值模板存储契约，默认 `auto`/`packed_uint8`/`auto` |
 | `model.hadamard_binarization.*` | 启用时把浮点 checkpoint 的描述子按 `Hf -> sign -> packed_uint8` 二值化；不使用 P、D 或额外 state 文件 |
 | `matching.distance` | `auto` 跟随 checkpoint，也可显式写 `l2` 或 `hamming` |
 | `matching.hamming.backend` | packed-Hamming 候选后端；默认 `cpu` 使用 OpenCV SIMD/POPCNT，`cuda` 仅用于显式实验 |
 | `matching.hamming.*` | 二值 Hamming 的 ratio、绝对距离和自适应 margin，需按验证集重新标定 |
-| `enrollment.random_seed` | 注册/query 划分种子 |
+| `enrollment.random_seed` | 注册策略为 `random` 时控制抽样；其它用途仍可复用 |
+| `enrollment.selection_strategy` | `first`（默认，取前 N 张）、`stride`（等步长取样）或 `random`（随机抽样） |
 | `texture_verification.*` | 局部脊线纹理二次筛选及灰区提升参数 |
-| `template_management.*` | 在线模板学习、LRU排序和固定容量替换 |
+| `template_management.*` | 离线评估中的模板学习、LRU排序和固定容量替换 |
 
 优先级：`命令行覆盖 > 配置文件 > 程序默认值`。
 
@@ -89,7 +89,7 @@ python match_new\run_hardnet_matching.py `
 |------|------|
 | `--config` | 配置文件路径，默认 `match_new/config_match_new.yaml` |
 | `--image-root` | 覆盖 `data.image_root` |
-| `--identity-depth` | 覆盖 `data.identity_depth` |
+| `--image-root` | 覆盖 `data.image_root` |
 | `--model-path` / `--model_path` | 覆盖 `model.checkpoint` |
 | `--output-dir` / `--output_dir` | 覆盖 `output.output_dir` |
 | `--hadamard-binarization` / `--no-hadamard-binarization` | 开启/关闭 `model.hadamard_binarization.enabled` |
@@ -416,82 +416,60 @@ FAR/FRR 阈值曲线写入 `match_score_threshold_curve.csv`。默认按 `0.01` 
 
 `metrics.json` 的 `texture_verification_config` 会记录实际融合参数，`score_component_summary` 会分别汇总 genuine/impostor 中纹理参与次数，以及相对纯几何分数改变了多少次阈值判定。`matching_backend` 名称带有 `texture_fusion` 时，表示本次结果确实启用了 C 方案。
 
-### 动态模板学习、替换与LRU排序
+### 离线动态模板学习、替换与 LRU 排序
 
-离线阈值标定不再执行模板学习。当前在线入口也默认设置
-`online_unlock.template_learning_after_decision: false`，避免模板学习阻塞解锁；
-以下模块保留给后续独立的解锁后异步学习流程。
+`run_hardnet_matching.py` 可以在离线评估过程中启用模板学习；不依赖
+`online_unlock.py`。每次启动都会先重新构建 `identity_templates_40.json`，因此默认从本次注册模板重新开始，不继承上一次运行的学习结果。
 
-动态模板库由以下模块组成：
+动态模板学习复用以下模块：
 
 | 模块 | 职责 |
 |------|------|
-| `template_learning.py` | 身份可信确认、真实纹理公共区域和模板内容去重 |
-| `template_ranking.py` | 成功模板移到首位、新学习模板插入首位 |
-| `template_replacement.py` | 满载时从LRU末尾选择非保护模板 |
-| `template_library.py` | 模板文件复制、索引持久化和完整在线更新流程 |
+| `template_learning.py` | 计算仿射对齐后的公共纹理区域率，并判断学习准入 |
+| `template_ranking.py` | 成功命中的模板移到首位，新模板插入首位 |
+| `template_replacement.py` | 模板库满载时从末尾选择非保护模板 |
+| `template_library.py` | 更新活动模板列表并原子写回 `identity_templates_40.json` |
 
-当前配置为20张初始模板、最多40张活动模板。20张初始模板全部是受保护seed，永远不会被自动替换：
+默认配置：
 
 ```yaml
 template_management:
-  enabled: false
+  enabled: true
 
+  # 活动模板库最大数量；初始受保护模板数量由 enrollment.enrollment_images_per_identity 决定。
   max_active_templates: 40
-  protected_seed_templates: 20
 
+  # 本人匹配分数必须达到该值。
   learn_score_threshold: 0.85
-  learn_min_unique_inliers: 12
-  learn_min_texture_similarity: 0.75
-  confirm_score_threshold: 0.70
-  confirmation_templates: 2
-  require_seed_confirmation: true
+  # 仿射对齐后的公共纹理区域率必须不高于该值，可按实验调节。
+  max_common_area_ratio: 0.50
 
-  min_common_area_ratio: 0.35
-  min_common_area_pixels: 256
-
-  persist_replace_retries: 20
-  persist_retry_delay_ms: 100
-  persist_strict: false
+  coverage_window_size: 9
+  coverage_min_std: 5.0
+  coverage_morph_kernel: 3
 ```
 
-一次query只有同时满足以下条件才会写入模板库：
+每个 query 的处理顺序固定为：
 
 ```text
-线上LRU匹配达到解锁阈值
-AND 至少一张模板满足严格学习阈值
-AND 至少两张可信模板确认
-AND 确认模板中至少有一张初始seed
-AND 仿射对齐后的有效脊线公共区域达标
-AND 与活动模板不存在完全相同的特征内容
+1. 使用当前活动模板库完成本人匹配
+2. 本人分数达到 match_score_threshold 后，检查模板学习条件
+3. 满足 learn_score_threshold 且公共纹理区域率 <= max_common_area_ratio 时加入模板库
+4. 学习结果写回 identity_templates_40.json，仅影响后续 query
+5. 使用更新后的模板库执行非本人匹配
 ```
 
-这里不再设置按压位置、旋转角度和新增覆盖量阈值。高置信度且具有足够公共区域的非重复query会直接学习。
+学习不要求多个模板确认，也不要求初始模板确认；仍会拒绝完全重复的模板内容。初始注册模板数量由 `enrollment_images_per_identity` 决定，并全部受保护。`max_active_templates` 是活动模板库上限；当前两者都为 40 时，模板库已经满载，不能再加入学习模板。如需在保留 40 张初始模板的同时学习新模板，应将 `max_active_templates` 设置为大于 40 的值，例如 60。模板库满载后，才会从未受保护的学习模板中按 LRU 规则替换。写回 JSON 的重试次数和等待时间固定在代码内部，分别为 2 次和 1 毫秒，不放在 YAML 配置中。
 
-LRU规则：
-
-```text
-成功命中的现有模板 -> 移到第一个
-匹配失败的模板       -> 不改变顺序
-新学习模板           -> 插入第一个
-达到40张             -> 删除末尾第一个非保护学习模板
-```
-
-评估中的静态FAR/FRR分数仍先按完整模板库计算。每个query的静态记录完成后，再使用线上提前停止配置对本人模板库执行动态更新；本次更新只影响后续query。学习确认耗时不计入前台解锁耗时。
-
-主要输出：
+主要输出仍保留原有评估文件，模板库只有一个动态索引：
 
 | 输出 | 含义 |
 |------|------|
-| `template_library.json` | 当前活动模板、保护状态和持久化LRU顺序 |
-| `learned_templates/` | 已加入模板库的query NPZ副本 |
-| `retired_templates/` | 被LRU替换的学习模板，便于实验回滚 |
-| `eval_hardnet_<metric>/template_learning_events.csv` | 每次query的学习、替换和耗时摘要；`metric` 为 `l2` 或 `hamming` |
-| `eval_hardnet_<metric>/template_learning_events.json` | 包含每张确认模板详细证据的完整事件 |
+| `identity_templates_40.json` | 当前活动模板路径、模板来源、保护状态、LRU顺序和更新计数 |
+| `eval_hardnet_<metric>/metrics.json` | FAR、FRR及模板学习统计 |
+| `eval_hardnet_<metric>/verification_scores.csv` | 每次本人/非本人验证分数 |
 
-模板库管理器每次启动都从当前注册索引重建seed状态，不复用上次运行的 `template_library.json`。
-
-Windows 下杀毒软件、文件索引器或同步程序可能短暂占用 `template_library.json`，使原子替换返回 `WinError 5`。程序会使用唯一临时文件并按退避间隔重试；默认重试后仍无法替换时，不中断当前运行，而是把最新完整状态保存到 `template_library.json.pending`。后续写盘会再次尝试更新主索引。若工程部署要求索引写盘失败必须立即终止，可设置 `persist_strict: true`。
+`metrics.json` 中的 `template_management` 会记录处理 query 数、通过本人匹配数、学习模板数和替换模板数。模板学习更新发生在当前 query 的本人结果记录之后，因此新模板不会改变当前 query 已经写入的本人分数；它只参与后续 query。
 
 ---
 
@@ -600,7 +578,6 @@ python match_new\visualize_hardnet_inliers.py `
 | `--top_k` | 导出内点数最高的 case 数量，默认 10 |
 | `--bottom_k` | 导出内点数最低的 case 数量，默认 10 |
 | `--bottom_min_unique_inliers` | bottom case 的最低 unique 内点数阈值，默认 3 |
-| `--identity_depth` | 输入目录下几层路径组成 identity，默认 1 |
 | `--max_lines` | 每张连线图最多画多少条线，默认 200 |
 | `--include_impostor` | 额外计算 query 对非本人 identity 的匹配，默认关闭 |
 

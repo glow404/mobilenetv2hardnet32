@@ -38,6 +38,7 @@ from match_new.identity_matcher import (
     score_query_against_identity,
 )
 from match_new.template_builder import load_identity_templates
+from match_new.template_library import TemplateLibraryManager
 from match_new.utils import (
     ensure_dir,
     format_significant_digits,
@@ -1158,7 +1159,7 @@ def run_descriptor_l2_evaluation(
     config: dict[str, Any],
     output_dir: str | Path,
     descriptor_source: str = "hardnet",
-    max_impostor_identities_per_query: int = 0,
+    max_impostor_identities_per_query: int = -1,
     export_failures: bool = True,
 ) -> dict[str, Any]:
     """执行完整 identity 级 descriptor 验证评估。
@@ -1171,6 +1172,9 @@ def run_descriptor_l2_evaluation(
         3. 写 verification_scores.csv；
         4. 计算阈值曲线和指标；
         5. 导出配置阈值下的失败样本。
+
+    ``max_impostor_identities_per_query``：
+        ``-1`` 全量非本人；``0`` 不比对非本人；``>0`` 每个 query 最多抽这么多个非本人身份。
     """
 
     out = ensure_dir(output_dir)
@@ -1190,16 +1194,45 @@ def run_descriptor_l2_evaluation(
             f"identification.match_score_threshold must be in [0,1], got {configured_threshold}"
         )
     fusion_method = str(identification_cfg.get("fusion_method", "max"))
+    management_cfg = dict(config.get("template_management", {}))
     scoring_config = copy.deepcopy(config)
+    if bool(management_cfg.get("enabled", False)):
+        # 模板库会按 LRU 改变顺序；学习模式必须完整遍历，避免早停导致
+        # 同一 query 因模板顺序变化而得到不同的 identity 分数。
+        scoring_identification = dict(scoring_config.get("identification", {}))
+        scoring_identification["early_stop_on_unlock_threshold"] = False
+        scoring_identification["early_stop_threshold"] = None
+        scoring_config["identification"] = scoring_identification
     early_stop_threshold = resolve_early_stop_threshold(scoring_config)
     early_stop_enabled = early_stop_threshold is not None
     rng = np.random.default_rng(int(dict(config.get("enrollment", {})).get("random_seed", 42)))
-    max_impostors = max(0, int(max_impostor_identities_per_query))
+    max_impostors = int(max_impostor_identities_per_query)
+    if max_impostors < -1:
+        raise ValueError(
+            "runtime.max_impostor_identities_per_query 须为 -1（全量）、"
+            f"0（不比对非本人）或正整数，收到: {max_impostors}"
+        )
     cache: dict[str, dict[str, Any]] = {}
     scores_path = out / "verification_scores.csv"
     management_cfg = dict(config.get("template_management", {}))
+    template_manager: TemplateLibraryManager | None = None
+    learning_events: list[dict[str, Any]] = []
+    if bool(management_cfg.get("enabled", False)):
+        # identity_templates_path 在本次运行前刚由 build_identity_templates 重建，
+        # 因此每次重跑都会从初始 seed 模板重新开始。
+        template_manager = TemplateLibraryManager(
+            identities,
+            identity_templates_path,
+            management_cfg,
+            initial_template_count=int(
+                dict(config.get("enrollment", {})).get(
+                    "enrollment_images_per_identity",
+                    20,
+                )
+            ),
+        )
 
-    # 第一遍：逐 query 逐 identity 打分，并把每次验证尝试写入 CSV。
+    # 第一遍：每个 query 先完整处理本人匹配和模板学习，再处理非本人匹配。
     score_rows: list[dict[str, str]] = []
     with scores_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SCORE_FIELDNAMES)
@@ -1211,14 +1244,58 @@ def run_descriptor_l2_evaluation(
             query_template_path = Path(template_dir) / template_filename(row["identity_id"], row["image_id"])
             query_template = load_template_cached(query_template_path, cache, require=source)
             true_identity = row["identity_id"]
-            genuine = [item for item in identities if item["identity_id"] == true_identity]
-            impostors = [item for item in identities if item["identity_id"] != true_identity]
-            if max_impostors > 0 and len(impostors) > max_impostors:
+            genuine_identity = next(
+                (item for item in identities if str(item["identity_id"]) == true_identity),
+                None,
+            )
+            if genuine_identity is None:
+                raise RuntimeError(f"No registered identity found for query: {true_identity}")
+
+            for path in genuine_identity.get("template_paths", []):
+                load_template_cached(path, cache, require=source)
+            started = time.perf_counter()
+            genuine_result = score_query_against_identity(
+                query_template,
+                genuine_identity,
+                scoring_config,
+                cache,
+                descriptor_source=source,
+                early_stop_threshold=early_stop_threshold,
+            )
+            genuine_attempt_ms = (time.perf_counter() - started) * 1000.0
+
+            if template_manager is not None:
+                learning_events.append(
+                    template_manager.learn_after_match(
+                        query_template,
+                        genuine_identity,
+                        scoring_config,
+                        genuine_result,
+                        template_loader=lambda path: load_template_cached(
+                            path,
+                            cache,
+                            require=source,
+                        ),
+                        descriptor_source=source,
+                    )
+                )
+
+            # 学习完成后再读取 impostor 列表；新模板只影响当前 query 后续的匹配，
+            # 不回写或重算已经完成的 genuine 结果。
+            impostors = [
+                item for item in identities
+                if str(item["identity_id"]) != true_identity
+            ]
+            if max_impostors == 0:
+                impostors = []
+            elif max_impostors > 0 and len(impostors) > max_impostors:
                 chosen = rng.choice(len(impostors), size=max_impostors, replace=False)
                 impostors = [impostors[int(i)] for i in chosen]
-            # 每个 query 一定包含 1 个 genuine owner，外加若干 impostor owners。
-            for identity in genuine + impostors:
-                owner = str(identity["identity_id"])
+
+            attempts: list[tuple[dict[str, Any], dict[str, Any], bool, float]] = [
+                (genuine_identity, genuine_result, True, genuine_attempt_ms),
+            ]
+            for identity in impostors:
                 for path in identity.get("template_paths", []):
                     load_template_cached(path, cache, require=source)
                 started = time.perf_counter()
@@ -1230,9 +1307,18 @@ def run_descriptor_l2_evaluation(
                     descriptor_source=source,
                     early_stop_threshold=early_stop_threshold,
                 )
-                attempt_ms = (time.perf_counter() - started) * 1000.0
+                attempts.append(
+                    (
+                        identity,
+                        result,
+                        False,
+                        (time.perf_counter() - started) * 1000.0,
+                    )
+                )
+
+            for identity, result, is_genuine, attempt_ms in attempts:
+                owner = str(identity["identity_id"])
                 score = float(result["score"])
-                is_genuine = owner == true_identity
                 query_build_ms = parse_float(row.get("template_build_ms"))
                 unlock_end_to_end_ms = (
                     query_build_ms + attempt_ms
@@ -1253,7 +1339,11 @@ def run_descriptor_l2_evaluation(
                     "accepted_at_selected_threshold": int(score >= configured_threshold),
                     "query_image_path": str(query_template.get("image_path", row.get("image_path", ""))),
                     "query_template_path": str(query_template_path),
-                    **result,
+                    **{
+                        key: value
+                        for key, value in result.items()
+                        if key in SCORE_FIELDNAMES
+                    },
                     "attempt_match_ms": f"{attempt_ms:.3f}",
                     "query_template_build_ms": "" if query_build_ms is None else f"{query_build_ms:.3f}",
                     "unlock_match_ms": f"{attempt_ms:.3f}" if is_genuine else "",
@@ -1311,11 +1401,15 @@ def run_descriptor_l2_evaluation(
         else {"enabled": False, "reason": "export_failures_false"}
     )
     effective_config = build_effective_config_snapshot(scoring_config)
-    template_management_summary = {
-        "enabled": False,
-        "requested_in_config": bool(management_cfg.get("enabled", False)),
-        "reason": "offline_calibration_never_updates_templates",
-    }
+    template_management_summary = (
+        template_manager.summarize_events(learning_events)
+        if template_manager is not None
+        else {
+            "enabled": False,
+            "requested_in_config": bool(management_cfg.get("enabled", False)),
+            "reason": "template_management_disabled",
+        }
+    )
     num_queries = len(
         {
             (str(row.get("query_identity", "")), str(row.get("query_id", "")))
@@ -1398,7 +1492,7 @@ def run_hardnet_evaluation(
     template_dir: str | Path,
     config: dict[str, Any],
     output_dir: str | Path,
-    max_impostor_identities_per_query: int = 0,
+    max_impostor_identities_per_query: int = -1,
     export_failures: bool = True,
 ) -> dict[str, Any]:
     """兼容旧入口：按 HardNet 模板契约评估 L2 或 Hamming。"""

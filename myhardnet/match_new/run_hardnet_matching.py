@@ -154,14 +154,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="配置文件路径。")
     parser.add_argument("--image-root", "--image_root", dest="image_root", default=None, help="覆盖 data.image_root。")
     parser.add_argument(
-        "--identity-depth",
-        "--identity_depth",
-        dest="identity_depth",
-        type=int,
-        default=None,
-        help="覆盖 data.identity_depth。",
-    )
-    parser.add_argument(
         "--model-path",
         "--model_path",
         dest="model_path",
@@ -210,7 +202,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="覆盖 runtime.skip_template_build。可用 --skip-template-build / --no-skip-template-build。",
     )
-    parser.add_argument("--max_impostor_identities_per_query", type=int, default=None, help="覆盖 runtime.max_impostor_identities_per_query。")
+    parser.add_argument(
+        "--max_impostor_identities_per_query",
+        type=int,
+        default=None,
+        help="覆盖 runtime.max_impostor_identities_per_query（-1=全量，0=不比对非本人）。",
+    )
     parser.add_argument("--random_seed", type=int, default=None, help="覆盖 enrollment.random_seed。")
     parser.add_argument("--max_failure_cases_per_type", type=int, default=None, help="覆盖 evaluation.failure_export.max_cases_per_type。")
     parser.add_argument(
@@ -231,8 +228,6 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
 
     if args.image_root is not None:
         config.setdefault("data", {})["image_root"] = str(Path(args.image_root).expanduser().resolve())
-    if args.identity_depth is not None:
-        config.setdefault("data", {})["identity_depth"] = int(args.identity_depth)
     if args.model_path:
         config.setdefault("model", {})["checkpoint"] = str(Path(args.model_path).expanduser().resolve())
     if args.output_dir is not None:
@@ -281,7 +276,7 @@ def resolve_run_settings(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "output_dir": output_dir,
         "skip_template_build": bool(runtime_cfg.get("skip_template_build", False)),
-        "max_impostor_identities_per_query": int(runtime_cfg.get("max_impostor_identities_per_query", 0)),
+        "max_impostor_identities_per_query": int(runtime_cfg.get("max_impostor_identities_per_query", -1)),
         "limit_identities": int(runtime_cfg.get("limit_identities", 0)),
         "limit_images_per_identity": int(runtime_cfg.get("limit_images_per_identity", 0)),
         "export_failures": bool(failure_cfg.get("enabled", True)),
@@ -615,13 +610,14 @@ def main() -> None:
         descriptor_metadata=checkpoint_metadata,
     )
 
-    # 3. 固定随机种子，为每个 identity 选择注册模板，其余作为 query。
+    # 3. 按策略为每个 identity 选择注册模板，其余作为 query。
     identity_templates_path = output_dir / f"identity_templates_{enrollment_count}.json"
     _identity_payload, split_rows = build_identity_templates(
         success_rows,
         identity_templates_path,
         enrollment_count=enrollment_count,
         seed=int(enrollment.get("random_seed", 42)),
+        selection_strategy=str(enrollment.get("selection_strategy", "first")),
     )
 
     # 4. 执行身份验证评估，并在配置阈值下导出失败样本。

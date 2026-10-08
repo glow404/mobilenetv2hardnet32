@@ -72,10 +72,4 @@ match_new/tests/__pycache__/
 
 # Keep trained model checkpoints in outputs/, but ignore other generated output files.
 outputs/**
-!outputs/
-!outputs/**/
-!outputs/**/*.pt
-!outputs/**/*.pth
-!outputs/**/*.ckpt
-!outputs/**/*.onnx
 !outputs/models/**

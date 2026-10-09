@@ -23,8 +23,8 @@ from match_new.template_replacement import remove_entry, replacement_required, s
 
 
 TemplateLoader = Callable[[str], dict[str, Any]]
-PERSIST_REPLACE_RETRIES = 2
-PERSIST_RETRY_DELAY_SECONDS = 0.001
+PERSIST_REPLACE_RETRIES = 5
+PERSIST_RETRY_DELAY_SECONDS = 0.01
 
 
 class TemplateLibraryManager:

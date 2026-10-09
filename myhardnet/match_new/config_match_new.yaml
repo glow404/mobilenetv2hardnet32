@@ -127,7 +127,7 @@ texture_verification:
 
 template_management:
   # 离线评估中的动态模板学习总开关。
-  enabled: true
+  enabled: false
 
   # 活动模板库最大数量；初始受保护模板数量直接取 enrollment_images_per_identity。
   max_active_templates: 40

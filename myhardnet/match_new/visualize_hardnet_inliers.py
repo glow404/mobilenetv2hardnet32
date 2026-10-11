@@ -25,6 +25,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from match_new.frontend_data import (
+    attach_frontend_metadata, refresh_frontend_quality, validate_frontend_template,
+)
 from match_new.hardnet_matcher import match_templates_descriptor_l2
 from match_new.template_builder import build_hardnet_templates, build_identity_templates, load_image_template
 from match_new.utils import ensure_dir, load_config, resolve_path, safe_id, template_filename, write_csv_rows, write_json
@@ -32,7 +35,6 @@ from match_new.utils import ensure_dir, load_config, resolve_path, safe_id, temp
 
 MATCH_NEW_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = MATCH_NEW_DIR / "config_match_new.yaml"
-DEFAULT_IMAGE_ROOT = ROOT / "pair_build" / "select_top500"
 DEFAULT_OUTPUT_DIR = MATCH_NEW_DIR / "hardnet_inlier_visuals"
 IMAGE_EXTENSIONS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
@@ -42,7 +44,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="Visualize top/bottom HardNet unique-inlier genuine matches.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="match_new config YAML.")
-    parser.add_argument("--image_root", default=str(DEFAULT_IMAGE_ROOT), help="Input fingerprint image directory.")
+    parser.add_argument("--image_root", default=None, help="Input fingerprint image directory; defaults to data.image_root in config.")
     parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_DIR), help="Output directory.")
     parser.add_argument("--model_path", default=None, help="Override model.checkpoint in config.")
     parser.add_argument("--skip_template_build", action="store_true", help="Reuse existing output_dir/image_templates.")
@@ -275,7 +277,9 @@ def score_genuine_pairs(
         query_template_path = template_dir / template_filename(query_identity, query_id)
         if not query_template_path.exists():
             continue
-        query_template = load_template_cached(query_template_path, cache)
+        query_template = refresh_frontend_quality(
+            load_template_cached(query_template_path, cache), row, config
+        )
         owner_candidates = identities if include_impostor else [identity_by_id.get(query_identity)]
         for owner in owner_candidates:
             if not owner:
@@ -425,13 +429,16 @@ def main() -> None:
     args = parse_args()
     config = load_config(args.config)
     apply_overrides(config, args)
+    if args.image_root is None:
+        args.image_root = str(resolve_path(config, config["data"]["image_root"]))
     checkpoint = resolve_path(config, dict(config.get("model", {}))["checkpoint"])
     if not checkpoint.exists() and not args.skip_template_build:
         raise FileNotFoundError(f"HardNet checkpoint does not exist: {checkpoint}")
 
     output_dir = ensure_dir(args.output_dir)
     template_dir = ensure_dir(output_dir / "image_templates")
-    rows = scan_image_rows(args.image_root)
+    config.setdefault("data", {})["image_root"] = str(Path(args.image_root).expanduser().resolve())
+    rows = attach_frontend_metadata(scan_image_rows(args.image_root), config)
     if not rows:
         raise RuntimeError(f"No images found under {args.image_root}")
     write_csv_rows(output_dir / "metadata_all.csv", rows)
@@ -444,6 +451,7 @@ def main() -> None:
                 row["image_id"],
             )
             if template_path.exists():
+                validate_frontend_template(load_image_template(template_path, require="hardnet"), row, config)
                 success_rows.append(
                     {
                         **row,

@@ -1,17 +1,13 @@
-"""HardNet 身份验证评估与失败样本导出。
+"""HardNet 身份级离线匹配评估与失败样本导出。
 
 作用：
-    这个脚本负责把“图像级匹配器”扩展成“手机解锁式 identity 级验证实验”。
-    HardNet 模板可使用 float/L2 或 binary/Hamming 描述子，后续评估流程保持一致。
-
-    1. 每个 query 对本人 identity 的注册模板打分，得到 genuine attempt；
-    2. 同一个 query 对非本人 identity 的注册模板打分，得到 impostor attempts；
-    3. identity 级分数默认取注册模板中的最大图像级 score；
-    4. 根据 identity 级 score 计算 FAR、FRR、EER 和 AUC；
-    5. 在配置的解锁阈值下导出 false reject / false accept 原图和拼接预览图。
+    1. 每个 query 对本人 identity 的全部注册模板打分，得到 genuine attempt；
+    2. 对全部非本人 identity 的注册模板打分，得到 impostor attempts；
+    3. 按配置融合完整的图像级分数，计算 FAR、FRR、EER 和 AUC；
+    4. 在选定阈值下导出 false reject / false accept 原图和拼接预览图。
 
 注意：
-    这里所有 FAR/FRR 都是 identity 级 attempt 统计，不是单图对单图统计。
+    FAR/FRR 是 identity 级 attempt 统计，不是单图对单图统计。
 """
 
 from __future__ import annotations
@@ -34,9 +30,10 @@ from tqdm import tqdm
 from match_new.identity_matcher import (
     compute_end_to_end_core_ms,
     load_template_cached,
-    resolve_early_stop_threshold,
     score_query_against_identity,
 )
+from match_new.frontend_data import refresh_frontend_quality
+from match_new.quality_adaptation import QUALITY_RESULT_FIELDS
 from match_new.template_builder import load_identity_templates
 from match_new.template_library import TemplateLibraryManager
 from match_new.utils import (
@@ -45,6 +42,7 @@ from match_new.utils import (
     read_csv_rows,
     resolve_path,
     safe_id,
+    short_case_directory_name,
     template_filename,
     write_csv_rows,
     write_json,
@@ -71,11 +69,10 @@ SCORE_FIELDNAMES = [
     "best_template_image_id",
     "best_template_image_path",
     "num_templates",
-    "num_templates_evaluated",
-    "early_stopped",
-    "early_stop_threshold",
     "best_image_score",
     "best_quality_score",
+    *QUALITY_RESULT_FIELDS,
+    "query_frontend_mask_applied",
     "num_raw_matches",
     "num_abs_distance_pass",
     "num_one_way_ratio_pass",
@@ -142,6 +139,24 @@ SCORE_FIELDNAMES = [
     "unlock_end_to_end_ms",
     "unlock_end_to_end_core_ms",
 ]
+
+
+# Identity-level stages included in the match-only wall-clock interval.
+# The per-image stages are accumulated across all registered templates for one identity.
+MATCH_ONLY_STAGE_FIELDS = (
+    "registered_template_load_ms",
+    "descriptor_prepare_ms",
+    "candidate_generation_ms",
+    "candidate_filter_ms",
+    "ransac_ms",
+    "inlier_refinement_ms",
+    "unique_inlier_dedup_ms",
+    "texture_similarity_ms",
+    "score_fusion_ms",
+    "postprocess_ms",
+    "identity_fusion_ms",
+    "identity_match_overhead_ms",
+)
 
 
 def parse_float(value: Any) -> float | None:
@@ -682,12 +697,13 @@ def build_effective_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
         "sift",
         "patch",
         "keypoint_filter",
+        "frontend",
+        "quality_adaptation",
         "matching",
         "texture_verification",
         "enrollment",
         "template_management",
         "identification",
-        "online_unlock",
         "evaluation",
         "descriptor_sources",
     ):
@@ -707,6 +723,16 @@ def build_effective_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
             data_cfg[field] = _resolve_config_path(config, data_cfg.get(field)) or data_cfg.get(field)
     if data_cfg:
         snapshot["data"] = data_cfg
+
+    frontend_cfg = dict(snapshot.get("frontend", {}))
+    for section, field in (("mask", "root"), ("quality", "csv_path")):
+        section_cfg = dict(frontend_cfg.get(section, {}))
+        if section_cfg.get(field):
+            section_cfg[field] = _resolve_config_path(config, section_cfg[field]) or section_cfg[field]
+        if section_cfg:
+            frontend_cfg[section] = section_cfg
+    if frontend_cfg:
+        snapshot["frontend"] = frontend_cfg
 
     model_cfg = dict(snapshot.get("model", {}))
     checkpoint = _resolve_config_path(config, model_cfg.get("checkpoint"))
@@ -924,11 +950,10 @@ def export_failure_cases(
         type_dir = ensure_dir(root / f"{failure_type}s")
         for local_idx, item in enumerate(items[: max_cases if max_cases > 0 else None], start=1):
             score_text = format_significant_digits(float(item["score"]))
-            case_id = (
-                f"{failure_type}_{local_idx:05d}"
-                f"__score_{safe_id(score_text)}"
-                f"__q_{safe_id(item['query_id'])}"
-                f"__owner_{safe_id(item['owner_identity'])}"
+            case_id = short_case_directory_name(
+                local_idx,
+                item["query_id"],
+                item["owner_identity"],
             )
             case_dir = ensure_dir(type_dir / case_id)
             query_src = item["query_image_path"]
@@ -1092,16 +1117,15 @@ def write_plots(
 
 
 def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str | Path) -> dict[str, Any]:
-    """从本人验证记录中生成手机解锁总体耗时汇总。
-
-    不再输出逐次解锁 CSV；准确的线上延迟仍应由
-    ``run_online_unlock.py --benchmark`` 测量。
-    """
+    """从离线本人匹配记录中汇总达到选定阈值的匹配耗时。"""
 
     total_genuine_attempts = 0
     failed_genuine_attempts = 0
     successful_unlocks_timed = 0
     match_values: list[float] = []
+    match_stage_values: dict[str, list[float]] = {
+        field: [] for field in MATCH_ONLY_STAGE_FIELDS
+    }
     end_to_end_values: list[float] = []
     end_to_end_core_values: list[float] = []
     for row in score_rows:
@@ -1117,6 +1141,10 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
         end_to_end_core_ms = parse_float(row.get("unlock_end_to_end_core_ms"))
         if match_ms is not None:
             match_values.append(match_ms)
+        for field in MATCH_ONLY_STAGE_FIELDS:
+            stage_ms = parse_float(row.get(field))
+            if stage_ms is not None:
+                match_stage_values[field].append(stage_ms)
         if end_to_end_core_ms is not None:
             end_to_end_core_values.append(end_to_end_core_ms)
         elif end_to_end_ms is not None:
@@ -1127,10 +1155,34 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
             end_to_end_values.append(end_to_end_ms)
     out = ensure_dir(output_dir)
     (Path(out) / "unlock_timing.csv").unlink(missing_ok=True)
+    match_only_summary = summarize_timing(match_values)
+    match_only_stage_summary = {
+        field: summarize_timing(values)
+        for field, values in match_stage_values.items()
+    }
+    stage_sum_of_means_ms = sum(
+        float(item.get("average_ms", 0.0))
+        for item in match_only_stage_summary.values()
+    )
+    match_only_summary.update(
+        {
+            "by_stage": match_only_stage_summary,
+            "stage_sum_of_means_ms": stage_sum_of_means_ms,
+            "unaccounted_mean_ms": (
+                float(match_only_summary.get("average_ms", 0.0))
+                - stage_sum_of_means_ms
+            ),
+        }
+    )
     summary = {
         "definition": {
             "timing_scope": "只统计在 selected threshold 下成功接受的本人解锁记录。",
-            "unlock_match_ms": "查询模板已存在时，与一个手指的注册模板集合完成匹配的时间。",
+            "unlock_match_ms": "查询模板已存在时，与一个手指的注册模板集合完成匹配的时间；match_only.by_stage 按同一成功本人记录拆分该时间。",
+            "match_only.by_stage": (
+                "match_only 的阶段统计；registered_template_load_ms 是注册模板缓存读取，"
+                "descriptor_prepare_ms 到 postprocess_ms 为全部注册模板逐图匹配阶段，"
+                "identity_fusion_ms 和 identity_match_overhead_ms 为身份级汇总阶段。"
+            ),
             "unlock_end_to_end_ms": "query_template_build_ms + unlock_match_ms；不包含模型/SIFT初始化和传感器采集。",
             "unlock_end_to_end_core_ms": (
                 "unlock_end_to_end_ms 扣除 descriptor_prepare_ms、postprocess_ms、"
@@ -1144,7 +1196,7 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
         "total_genuine_attempts": total_genuine_attempts,
         "successful_unlocks_timed": successful_unlocks_timed,
         "failed_unlocks_excluded": failed_genuine_attempts,
-        "match_only": summarize_timing(match_values),
+        "match_only": match_only_summary,
         "end_to_end": summarize_timing(end_to_end_core_values),
         "end_to_end_wall_clock": summarize_timing(end_to_end_values),
     }
@@ -1196,15 +1248,6 @@ def run_descriptor_l2_evaluation(
     fusion_method = str(identification_cfg.get("fusion_method", "max"))
     management_cfg = dict(config.get("template_management", {}))
     scoring_config = copy.deepcopy(config)
-    if bool(management_cfg.get("enabled", False)):
-        # 模板库会按 LRU 改变顺序；学习模式必须完整遍历，避免早停导致
-        # 同一 query 因模板顺序变化而得到不同的 identity 分数。
-        scoring_identification = dict(scoring_config.get("identification", {}))
-        scoring_identification["early_stop_on_unlock_threshold"] = False
-        scoring_identification["early_stop_threshold"] = None
-        scoring_config["identification"] = scoring_identification
-    early_stop_threshold = resolve_early_stop_threshold(scoring_config)
-    early_stop_enabled = early_stop_threshold is not None
     rng = np.random.default_rng(int(dict(config.get("enrollment", {})).get("random_seed", 42)))
     max_impostors = int(max_impostor_identities_per_query)
     if max_impostors < -1:
@@ -1242,7 +1285,11 @@ def run_descriptor_l2_evaluation(
             desc=f"evaluate {source}_{dict(config.get('matching', {})).get('distance', 'auto')}",
         ):
             query_template_path = Path(template_dir) / template_filename(row["identity_id"], row["image_id"])
-            query_template = load_template_cached(query_template_path, cache, require=source)
+            query_template = refresh_frontend_quality(
+                load_template_cached(query_template_path, cache, require=source),
+                row,
+                scoring_config,
+            )
             true_identity = row["identity_id"]
             genuine_identity = next(
                 (item for item in identities if str(item["identity_id"]) == true_identity),
@@ -1260,7 +1307,6 @@ def run_descriptor_l2_evaluation(
                 scoring_config,
                 cache,
                 descriptor_source=source,
-                early_stop_threshold=early_stop_threshold,
             )
             genuine_attempt_ms = (time.perf_counter() - started) * 1000.0
 
@@ -1305,7 +1351,6 @@ def run_descriptor_l2_evaluation(
                     scoring_config,
                     cache,
                     descriptor_source=source,
-                    early_stop_threshold=early_stop_threshold,
                 )
                 attempts.append(
                     (
@@ -1426,14 +1471,8 @@ def run_descriptor_l2_evaluation(
             "num_genuine_attempts": int(np.sum(labels == 1)),
             "num_impostor_attempts": int(np.sum(labels == 0)),
             "fusion_method": fusion_method,
-            "scoring_mode": (
-                "early_stop_query_pool_evaluation"
-                if early_stop_enabled
-                else "full_query_pool_evaluation"
-            ),
-            "offline_full_template_scoring": not early_stop_enabled,
-            "early_stop_on_unlock_threshold": early_stop_enabled,
-            "early_stop_threshold": early_stop_threshold,
+            "scoring_mode": "full_query_pool_evaluation",
+            "offline_full_template_scoring": True,
             "max_impostor_identities_per_query": max_impostors,
             "matching_config": dict(scoring_config.get("matching", {})),
             "texture_verification_config": dict(scoring_config.get("texture_verification", {})),

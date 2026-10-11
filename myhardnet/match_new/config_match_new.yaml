@@ -1,17 +1,14 @@
-# match_new 正式实验配置
+# match_new 离线全量匹配评估配置
 #
-# 这个配置对应一套支持 HardNet 浮点或二值描述子的手机解锁式指纹验证实验：
-#   1. 每个 identity 随机选 40 张图作为注册模板；
-#   2. 其余图作为 query；
-#   3. query 分别对本人模板库和所有非本人模板库打 identity 级分数；
-#   4. 使用 checkpoint 对应的 L2/Hamming 距离生成候选，再通过 RANSAC/脊线纹理融合输出 match score；
-#   5. 在配置的解锁阈值下导出 false reject / false accept 原图，方便人工排查失败原因。
+#   1. 每个 identity 按 enrollment 配置选择注册图像；
+#   2. 其余图像作为 query；
+#   3. 每个 query 与本人及非本人 identity 的全部注册模板匹配；
+#   4. 基于完整匹配分数计算 FAR/FRR、EER、阈值曲线并导出失败案例。
 
 extends: config_match_tuning.yaml
 
 runtime:
-  # 每个 query 最多比对几个非本人 identity：
-  #   -1 = 全量 impostor；0 = 不比对非本人；正整数 = 最多抽这么多个。
+  # 每个 query 比对的非本人 identity 数量：-1 表示全量，正式 FAR 评估应使用 -1。
   max_impostor_identities_per_query: 0
 
   # 调试裁剪：只保留前 N 个 identity；0 表示不限制。正式实验必须为 0。
@@ -47,16 +44,31 @@ model:
     bitorder: little
     zero_is_one: true
 
+  # 在 CPU/FP32 环境测量推理；仅在加载权重后的 eval 推理实例中融合 Conv–BN。
+  device: cpu
+  fuse_conv_bn: true
+
   # 建模版时，HardNet patch 一次批量推理 batch size个patch。
   batch_size: 512
 
-  # 在线动态关键点统一补齐到该 batch，避免每种关键点数触发一次 CUDA shape 初始化。
-  # 0 表示保留动态 batch；当前最多 500 个关键点，因此固定为 512。
-  fixed_inference_batch_size: 512
+  # 0 使用实际 patch 数；CPU 测时无需为了 CUDA shape 初始化而补齐。
+  fixed_inference_batch_size: 0
 
-  # GPU 推理优化。FP16 仅用于 CNN 前向；浮点描述子返回 FP32，二值描述子返回打包 uint8。
-  inference_precision: fp16
-  channels_last: true
+  # CPU FP32 推理后端：本机基准最快的是 ONNX Runtime CPU。
+  inference_backend: onnxruntime
+  # 外部后端下 PyTorch 只负责少量后处理；主干推理由 backend_num_threads 控制。
+  cpu_num_threads: 1
+  # PyTorch CPU oneDNN/MKLDNN 卷积；切回 pytorch 后端时生效。
+  mkldnn_enabled: true
+  # CPU PyTorch 可测试 channels_last；ONNX/OpenVINO 输入固定为 NCHW，此处不生效。
+  channels_last: false
+  # ORT 主干推理线程数；本机实测较快值。OpenVINO 可从 8 开始测。
+  backend_num_threads: 28
+  backend_inter_op_num_threads: 1
+  backend_graph_optimization: all
+
+  # FP32 精度；下面的 CUDA 专用选项在 CPU 上不生效。
+  inference_precision: fp32
   pin_memory: false
   cudnn_benchmark: false
   allow_tf32: true
@@ -79,7 +91,7 @@ sift:
 patch:
   # keypoint 靠近边界时，如果裁剪窗口与原图有效重叠过低，就丢弃该点。
   min_overlap_ratio: 0.75
-  # 局部块按关键点方向做反向坐标采样（双线性插值），适配单次解锁场景。
+  # 局部块按关键点方向做反向坐标采样（双线性插值），适用于全量离线评估。
 
 keypoint_filter:
   # 每张图最多保留的 SIFT keypoints 数，按 response 从高到低截断。
@@ -143,48 +155,11 @@ template_management:
   coverage_morph_kernel: 3
 
 identification:
-  #   max       : 注册模板里取最高图像级分数，符合手机解锁“命中一张即可”的语义；
-  #   top3_mean : 可用于消融，更保守。
+  # 注册模板之间的 identity 分数融合方式；max 表示取全部注册模板中的最高图像级分数。
   fusion_method: max
 
-  # [0,1] 连续匹配分数阈值，不再表示 unique inlier 数。
-  # 离线评估和在线解锁都使用该阈值。
+  # [0,1] 连续匹配分数阈值，用于选定工作点并报告 FAR/FRR。
   match_score_threshold: 0.80
-
-  # 解锁式匹配加速：当某张注册模板的图像级 score 已经达到解锁阈值时，
-  # 立即返回该 identity 的结果，不再继续匹配剩余注册模板。
-  # 离线评估与在线解锁共用该开关；关闭后会遍历全部注册模板以得到完整 identity 最大分数。
-  # 只对 max / max_quality_tiebreak 融合方式启用；mean / top3_mean 会自动关闭。
-  early_stop_on_unlock_threshold: true
-
-  # 为空/null 时默认使用 match_score_threshold。若要用其他线上解锁阈值，可在这里单独设置。
-  early_stop_threshold:
-
-online_unlock:
-  # 在线入口直接从 output.output_dir（或命令行 --artifacts）读取注册模板索引、
-  # metadata_all.csv 和图像模板。query 划分由注册模板索引在内存中推导。
-  # 相对路径相对于产物目录解析；留空时按注册模板数量自动推导默认文件名。
-  identity_templates:
-  image_templates_dir: image_templates
-
-  # 启动时将注册模板加载到内存，模板加载时间不计入单次解锁耗时。
-  preload_templates: true
-
-  # 模型启动后用空patch预热，预热时间单独统计。
-  model_warmup_runs: 3
-
-  # query模板只在内存中使用，不写入image_templates。
-  persist_query_template: false
-
-  # 当前在线延迟路径不执行模板学习；后续应在返回解锁结果后异步处理。
-  template_learning_after_decision: false
-
-  # 相对于output.output_dir的批量在线延迟测试目录。
-  benchmark_output_dir: online_unlock_benchmark
-
-  # 汇总只统计 accepted=true 的成功解锁；失败尝试仅保留在明细 CSV 中。
-  timing:
-    percentiles: [50, 90, 95, 99]
 
 evaluation:
   # 全部未注册 query 使用同一个池计算阈值曲线并报告最终指标。

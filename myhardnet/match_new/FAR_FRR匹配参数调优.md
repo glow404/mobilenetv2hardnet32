@@ -173,10 +173,9 @@ L2 与 Hamming **阈值不能混用**；二值时以 `matching.hamming.*` 为准
 | --- | --- |
 | `runtime.max_impostor_identities_per_query` | 正式实验必须为 `-1`；`0` 不产 FAR；正整数抽样会降低 FAR 可信度 |
 | `runtime.limit_identities` / `limit_images_per_identity` | 仅调试；正式为 `0` |
-| `identification.early_stop_*` | 主要影响耗时；开启后曲线上的 identity 分可能低于完整遍历最大值 |
-| `template_management.*` | 离线标定不更新模板库，不影响本次 FAR/FRR |
-| 推理 batch、半精度、`hamming.backend` | 速度为主 |
-| `evaluation.failure_export.*`、`online_unlock.*`、`output.*` | 不改匹配分数 |
+| `template_management.*` | 离线启用模板学习时会改变后续 query 使用的模板库，应作为独立实验因素报告 |
+| 推理 batch、半精度、`hamming.backend` | 主要影响速度；修改后应确认描述子与评估指标 |
+| `evaluation.failure_export.*`、`output.*` | 不改匹配分数 |
 
 `data.image_root`、划分方式属于**评估协议**，对比实验必须固定。
 
@@ -204,7 +203,7 @@ L2 与 Hamming **阈值不能混用**；二值时以 `matching.hamming.*` 为准
 - 错误接受 / 错误拒绝绝对数量（小样本 FAR 极敏感）
 - genuine / impostor 分数分位数
 - 候选数、RANSAC 成功率、唯一内点、纹理可用率
-- 单次匹配耗时（若关心解锁体验）
+- 单次匹配耗时（如需评估实际使用延迟）
 
 ---
 

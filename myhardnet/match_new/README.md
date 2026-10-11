@@ -12,6 +12,15 @@ conda activate hardnet-cuda
 常调实验参数集中在 `match_new/config_match_tuning.yaml`；主配置通过
 `extends` 自动继承，运行命令和 `--config` 路径无需修改。
 
+## 前端输出接入
+
+当前常调配置已经连接 `data/output_v8/04_denoise` 的最终图像、`05_mask` 的
+指纹前景掩码和 `06_quality/fingerprint_quality_results.csv` 的质量分数。
+注册/查询模板只提取前景关键点；低质量查询按 0–100 分连续调整 ratio 与
+RANSAC 容差/迭代次数，最终身份接受阈值保持不变。首次接入必须重建模板。
+经验初值、后续搜索范围、关闭对照及复用条件详见
+[前后端联动与质量自适应](FRONTEND_INTEGRATION.md)。
+
 ---
 
 ## 1. `run_hardnet_matching.py`
@@ -79,9 +88,96 @@ python match_new\run_hardnet_matching.py `
 `template_build_timings.csv` 只有一行，统计全部成功模板在读图、SIFT 检测、
 关键点过滤、patch 裁切旋转、HardNet 推理、模板组装和保存等阶段的平均耗时，
 不再输出逐图耗时；使用 `--skip-template-build` 时本次没有模板构建计时，因此
-不生成该文件。离线评估只保留 `unlock_timing.json` 总体解锁耗时汇总，
-不再生成逐次 `unlock_timing.csv`。`far_frr_vs_threshold.png` 会直接标出 EER
-阈值/EER，以及配置匹配阈值对应的 FAR、FRR。
+不生成该文件。`metrics.json` 保存全量匹配生成的 FAR/FRR、EER 和 AUC 等评估汇总。
+`far_frr_vs_threshold.png` 标出 EER 及配置阈值对应的 FAR/FRR。
+
+离线耗时保持现有输出格式：`verification_scores.csv` 的 `attempt_match_ms` 记录
+每次本人/非本人匹配耗时，`metrics.json` 的 `matching_stage_summary` 汇总全部
+尝试的各阶段平均耗时；`unlock_timing.json` 只汇总在配置阈值下被接受的本人记录。其 `match_only` 保留原有总耗时统计，并新增 `by_stage`，按 `registered_template_load_ms`、描述子准备、候选生成/过滤、RANSAC、内点细化、一对一去重、纹理相似度、分数融合、后处理和身份级汇总拆分；`stage_sum_of_means_ms` 是各阶段平均值之和，`unaccounted_mean_ms` 用于发现阶段计时与外层墙钟时间之间的未覆盖开销。
+
+`match_only.by_stage` 只统计成功本人匹配，且不包含 query 模板构建、SIFT、HardNet 推理和模型初始化。每个阶段的时间已经累计了该 query 与一个 identity 的全部注册模板匹配；因此前端接入后应同时检查 `candidate_generation_ms`、`ransac_ms`、`texture_similarity_ms` 以及 `templates_with_candidates`，不能只看单个图像模板的时间。
+这里沿用 `unlock_*` 字段名称，它们属于离线统计，不是独立解锁入口。
+端到端耗时由模板构建时间加匹配时间得到，不包含模型初始化、传感器采集和模板
+预加载时间，也不代表实时请求延迟。复用模板时没有本次构建计时，端到端统计
+可能缺失或引用已有 metadata 中的历史构建耗时。
+
+### CPU 推理融合与细分计时
+
+当前主配置指定 `model.device: cpu`、`inference_precision: fp32`，并开启
+`model.fuse_conv_bn: true`。权重先按原模型结构加载，再在推理实例的 `eval()`
+模式下融合 Sequential 内直接相邻的 Conv2d 和 BatchNorm2d；训练模型、原始
+checkpoint、GroupNorm/LayerNorm 不会被修改。`fuse_conv_bn: false` 可用于对照。
+融合数学等价，但浮点计算顺序可能产生微小误差，Hadamard 系数接近零时可能
+改变 bit，正式采用前仍应使用固定数据验证 FAR/FRR。
+
+`hardnet_inference_ms` 仍表示 `describe` 完整调用时间，细分为互不重叠的：
+
+- `hardnet_input_prepare_ms`：连续 FP32 输入数组及 CPU Tensor 准备。
+- `hardnet_batch_prepare_ms`：分批、padding、锁页内存和设备传输；不含单独计时的布局转换。
+- `hardnet_layout_conversion_ms`：CPU PyTorch 的 NCHW→channels_last 转换；外部后端需要的 NumPy/NCHW 连续化也计入此项。
+- `hardnet_cnn_ms`：模型/backbone 前向（含输出归一化），不含 hash head 或二值化。
+- `hardnet_hash_head_ms`：二值 checkpoint 的 hash head；浮点/Hadamard 路径为 0。
+- `hardnet_output_transfer_ms`：输出拼接、回传 CPU、类型转换及 NumPy 转换。
+- `hardnet_binarization_ms`：Hadamard + sign + packbits，或二值网络 sign + bit packing；纯浮点路径为 0。
+- `hardnet_inference_overhead_ms`：结果校验、计时和包装等剩余开销；回退时含失败尝试耗时。
+
+以上子项之和等于总时间，不要把子项与 `hardnet_inference_ms` 重复相加。
+计时多 batch 时累加每个 batch；CNN 时间包含配置启用的 padding 计算。
+空 patch 输入 CNN/hash/二值化耗时均为 0。
+
+### CPU 内存布局、oneDNN 与推理后端对比
+
+主配置 `config_match_new.yaml` 默认使用本机基准中速度最快的 **ONNX Runtime CPU**：`model.inference_backend: onnxruntime`、FP32、`CPUExecutionProvider`、图优化 `all`，主干推理 28 线程；`cpu_num_threads: 1` 用于限制 PyTorch 后处理的线程数。ONNX Runtime/OpenVINO 要求 `device: cpu`，外部后端固定使用 NCHW 输入，`channels_last` 和 `mkldnn_enabled` 不参与其主干推理。
+
+切换回 PyTorch CPU 时，`model.channels_last` 会转换输入和模型权重，`model.mkldnn_enabled: true` 允许 PyTorch 使用 oneDNN/MKLDNN CPU 运算；布局转换耗时单独记录在 `hardnet_layout_conversion_ms`。`model.cpu_num_threads` 是 PyTorch 线程数。ONNX Runtime 的 `backend_graph_optimization` 可设为 `disabled`、`basic`、`extended` 或 `all`；`backend_num_threads` 是 ONNX Runtime 主干推理线程数，也是 OpenVINO 的推理线程数。
+
+本机基准是在 Intel Core i7-14700、PyTorch 2.13.0+cpu 上，用真实图像提取的 394 个 32×32 patch 测得（2 次预热、8 次计时）：ONNX Runtime 28 线程中位数 48.77 ms、P95 50.21 ms；PyTorch oneDNN + `channels_last`、28 线程为 71.15 ms、P95 80.26 ms；OpenVINO 8 线程为 64.13 ms、P95 65.45 ms。初始化/编译约 150–155 ms，不计入单次 `describe()` 耗时。以上只说明该机器和样本上的测速结果；部署机器、patch 数和 batch 设置不同，最快选项可能改变。尚未完成全数据集 FAR/FRR 回归，正式使用前应在独立输出目录重建模板并重新评估。
+
+**默认后端的配置**位于 `config_match_new.yaml` 的 `model:` 节。修改 `inference_backend` 即可切换运行时，同时按对应后端调整线程项：
+
+```yaml
+model:
+  device: cpu
+  inference_precision: fp32
+  inference_backend: onnxruntime
+  cpu_num_threads: 1
+  backend_num_threads: 28
+  backend_inter_op_num_threads: 1
+  backend_graph_optimization: all
+  channels_last: false
+```
+
+切换为 PyTorch CPU + oneDNN 时，设 `inference_backend: pytorch`、`cpu_num_threads: 28`、`mkldnn_enabled: true` 和 `channels_last: true`；`backend_num_threads` 对 PyTorch 不生效。切换为 OpenVINO 时，设 `inference_backend: openvino`、`cpu_num_threads: 1`、`backend_num_threads: 8`；`backend_num_threads` 即 OpenVINO 推理线程数。可在部署机器上用下方基准命令重新扫描线程数和 PyTorch 内存布局。
+
+ONNX Runtime 默认依赖 `onnx` 和 `onnxruntime`，在项目使用的 Python 环境中安装：
+
+```powershell
+python -m pip install onnx onnxruntime
+```
+
+依赖缺失时程序会报安装提示，不会自动切回 PyTorch；请在实际运行脚本的 Python 环境中执行安装。直接修改主配置中已有的 `model:` 项即可，不要再添加第二个同名配置节。`config_match_tuning.yaml` 用于常调实验参数，但以上推理项已在主配置中明确指定，应直接修改 `config_match_new.yaml`。
+
+若要选择 OpenVINO，再安装：
+
+```powershell
+python -m pip install openvino
+```
+
+后端根据当前 checkpoint 和 Conv–BN 融合状态导出/缓存 ONNX 图。浮点模型输出
+保持 L2 归一化；Hadamard、`zero_is_one`、sign 和 bit packing 继续走相同的工程
+后处理代码，不由后端重写。原生二值 checkpoint 由图输出 backbone 的归一化前特征，
+随后仍使用原 Torch hash head 和原位序打包。ONNX 图默认缓存到系统临时目录；
+也可通过 `model.onnx_path` 指定位置。外部后端要求 CPU，且始终使用 NCHW 输入；
+此时 `channels_last` 与 `mkldnn_enabled` 不生效。
+
+CPU 推理后端的线程参数仍保留在 `config_match_new.yaml`；本次用于比较 CPU 后端的临时基准脚本已在完成分析后删除。正式运行不依赖该脚本。
+
+离线 `template_build_timings.csv` 和 `eval_hardnet_<metric>/unlock_timing.json` 分别记录模板构建阶段、本人匹配阶段的耗时。
+
+CPU 计时使用 `perf_counter`，模型加载/融合/预热不计入单次推理；CUDA
+细分计时在阶段边界同步设备，避免把异步 CNN 时间误算到回传阶段，但会增加
+同步开销，不能与未同步的 GPU 吞吐测试直接比较。普通 `describe()` 不添加
+这些阶段同步。实际设备/精度写入结果，CUDA 失败回退时记录最终 CPU 设备。
 
 **常用命令行覆盖**（均可不传，改用配置）：
 
@@ -129,132 +225,25 @@ python match_new\run_hardnet_matching.py `
 `--hamming-ratio-threshold`。切换 checkpoint 或 Hadamard 开关会改变描述子契约，
 必须重新构建模板，不能同时使用 `--skip-template-build`；只修改 ratio 阈值时可以复用模板。
 
-**离线标定与在线早停**：
+**离线全量匹配与阈值评估**：
 
-`config_match_new.yaml` 中默认启用：
+每个 query 都会对本人 identity 和配置范围内的非本人 identity 遍历全部注册模板，使用完整的 identity 分数计算 FAR/FRR、阈值曲线、EER 和 AUC。正式 FAR 评估应将 `runtime.max_impostor_identities_per_query` 设为 `-1`。`identification.match_score_threshold` 只用于选择并报告工作点，不会截断模板遍历。
 
-```yaml
-identification:
-  match_score_threshold: 0.55
-  early_stop_on_unlock_threshold: true
-  early_stop_threshold:
-```
+`verification_scores.csv` 中，`num_templates` 表示该 identity 注册模板总数；`metrics.json` 中 `scoring_mode` 为 `full_query_pool_evaluation`，表示使用全量 query 分数评估。
 
-含义：对某个 query 匹配某个 identity 的注册模板库时，只要某张注册模板的图像级连续匹配分数 `score >= early_stop_threshold`，就立即返回，不再继续跑剩余模板。`early_stop_threshold` 留空时使用 `match_score_threshold`。这里的阈值范围是 `[0,1]`，不再表示内点数量。
+## 2. 离线评估参数参考
 
-输出 CSV 中：
+`identification` 配置用于融合每个 identity 的模板分数，并选择 FAR/FRR 工作点：
 
-| 字段 | 含义 |
-|------|------|
-| `num_templates` | 该 identity 的注册模板总数 |
-| `num_templates_evaluated` | 本次实际匹配了几张模板 |
-| `early_stopped` | 是否因为达到阈值提前停止 |
-| `early_stop_threshold` | 本次使用的提前停止阈值 |
+| 配置项 | 作用 |
+|--------|------|
+| `fusion_method` | `max`、`mean`、`top3_mean` 或 `max_quality_tiebreak` |
+| `match_score_threshold` | `[0,1]` 连续分数阈值，用于报告选定工作点的 FAR/FRR |
 
-该策略由 `identification.early_stop_on_unlock_threshold` 控制，离线评估与在线解锁共用同一配置。开启后，`run_hardnet_matching.py` 与 `run_online_unlock.py` 都会在模板分数达到阈值时提前停止；关闭后两者都会完整遍历全部注册模板。`metrics.json` 中的 `offline_full_template_scoring` 会标记本次离线评估是否使用了完整模板遍历。
 
-开启早停可显著降低本人匹配耗时；若需要完整的 identity 最大分数用于阈值曲线、AUC 或 EER，请将 `early_stop_on_unlock_threshold` 设为 `false`。
+### 模型与特征参数（`model.*` / `sift.*` / `patch.*`）
 
-## 2. `run_online_unlock.py`
-
-**作用**：模拟手机端固定阈值解锁。进程启动后常驻模型、SIFT 检测器和注册模板；每次请求从一张原始指纹图在内存中构建 query 模板，再与**指定的一个**已注册 identity 匹配并返回接受/拒绝结果。支持单次解锁和批量本人 query 延迟基准。
-
-**前置条件**：先运行 `run_hardnet_matching.py` 生成离线产物目录，其中至少包含：
-
-- `image_templates/`：注册模板 `.npz`
-- `metadata_all.csv`：原图索引（benchmark 用来推导 query 列表）
-- `identity_templates_<N>.json`：注册模板索引（`<N>` 为 `enrollment.enrollment_images_per_identity`）
-
-**配置优先级**：`命令行 > config_match_new.yaml > 程序缺省值`。在线入口**读取当前 YAML 中的模型、SIFT、patch、matching、纹理和 identification 参数**，不要求与生成 `artifacts` 那次离线实验完全一致；但 checkpoint 必须与注册模板描述子契约兼容。
-
-**在线不会读取**：`evaluation.*`（FAR/FRR 标定）、`runtime.max_impostor_identities_per_query`（impostor 全量扫描仅离线有）、`template_management.enabled`（当前解锁路径不执行模板学习）。
-
-### 运行模式
-
-| 模式 | 命令 | 匹配范围 | 主要输出 |
-|------|------|----------|----------|
-| 单次解锁 | `--image` + `--identity` | 1 张 query 图 → 1 个指定 identity | 终端 JSON |
-| 延迟基准 | `--benchmark` | 批量本人 query → 各自 identity | `online_unlock_attempts.csv`、`online_unlock_summary.json` |
-
-在线**不支持**“每个 query 对本人 + 全部非本人 identity”的全量扫描；该能力仅由 `run_hardnet_matching.py` 提供。
-
-### 命令行参数
-
-| 参数 | 缺省值 | 作用 |
-|------|--------|------|
-| `--config` | `match_new/config_match_new.yaml` | 本次在线测试使用的 YAML |
-| `--artifacts` | 读取 `output.output_dir` | 离线产物根目录（含模板与 metadata） |
-| `--image` | （与 `--benchmark` 二选一） | 单次解锁的 query 原图路径 |
-| `--identity` | 无 | 与 `--image` 配合，指定已注册手指 ID |
-| `--benchmark` | 无 | 对 metadata 中全部 query 跑本人延迟基准 |
-| `--limit` | `0` | benchmark 最多测几条 query；`0` 表示全量 |
-| `--output-dir` | `<artifacts>/<benchmark_output_dir>` | 覆盖 benchmark 结果输出目录 |
-
-**单次解锁示例**：
-
-```powershell
-python match_new\run_online_unlock.py `
-  --artifacts "..\outputs\你的实验目录" `
-  --identity dy_L0 `
-  --image "D:\query.bmp"
-```
-
-**批量延迟基准示例**：
-
-```powershell
-python match_new\run_online_unlock.py `
-  --artifacts "..\outputs\你的实验目录" `
-  --benchmark `
-  --limit 100 `
-  --output-dir "..\outputs\你的实验目录\online_unlock_benchmark"
-```
-
-### `online_unlock.*` 专用参数
-
-| 配置项 | 缺省值 | 作用 |
-|--------|--------|------|
-| `identity_templates` | 空 → 自动使用 `identity_templates_<enrollment_images_per_identity>.json` | 注册模板索引 JSON；相对路径相对于 `--artifacts` |
-| `image_templates_dir` | `image_templates` | 注册模板 `.npz` 子目录 |
-| `preload_templates` | `true` | 启动时预加载全部注册模板到内存；预加载耗时**不计入**单次解锁 |
-| `model_warmup_runs` | `0` | 模型空 patch 预热次数；预热耗时单独统计 |
-| `persist_query_template` | `false` | 必须为 `false`；query 模板只在内存中使用 |
-| `template_learning_after_decision` | `false` | 必须为 `false`；当前路径不在解锁返回后写模板库 |
-| `benchmark_output_dir` | `online_unlock_benchmark` | benchmark 结果相对 `--artifacts` 的子目录 |
-| `timing.percentiles` | `[50, 90, 95, 99]` | 汇总 JSON 中输出的耗时百分位 |
-
-示例：
-
-```yaml
-online_unlock:
-  identity_templates:
-  image_templates_dir: image_templates
-  preload_templates: true
-  model_warmup_runs: 3
-  persist_query_template: false
-  template_learning_after_decision: false
-  benchmark_output_dir: online_unlock_benchmark
-  timing:
-    percentiles: [50, 90, 95, 99]
-```
-
-### `identification.*` 判定与早停
-
-| 配置项 | 缺省值 | 作用 |
-|--------|--------|------|
-| `fusion_method` | `max` | identity 分数融合：`max` / `mean` / `top3_mean` / `max_quality_tiebreak` |
-| `match_score_threshold` | `0.55` | 解锁分数阈值，范围 `[0,1]` |
-| `early_stop_on_unlock_threshold` | `true` | 是否在模板分数达到阈值后立即停止遍历 |
-| `early_stop_threshold` | 空 | 早停阈值；空/null 时使用 `match_score_threshold` |
-
-规则：
-
-- 早停仅对 `max`、`max_quality_tiebreak` 生效；`mean`、`top3_mean` 必须跑完所有模板。
-- 开启早停时，接受/拒绝结论与完整遍历一致，但耗时更低。
-- 关闭早停时，解锁阈值仍用 `match_score_threshold`（或 `early_stop_threshold` 若显式填写）。
-
-### 在线共用的模型与特征参数（`model.*` / `sift.*` / `patch.*`）
-
-在线构建 query 模板时使用与离线相同的 HardNet + SIFT 流水线。
+离线模板构建和评估使用相同的 HardNet + SIFT 特征提取流水线。
 
 | 配置段 | 主要项 | 程序缺省值 | 说明 |
 |--------|--------|------------|------|
@@ -263,8 +252,8 @@ online_unlock:
 | `model.binary_storage` / `binary_bitorder` | `auto` | 二值 checkpoint 的 packed 存储契约 |
 | `model.device` | `auto` | 优先 CUDA，失败可回退 CPU（`fallback_to_cpu: true`） |
 | `model.batch_size` | `512` | HardNet patch 批量推理大小 |
-| `model.fixed_inference_batch_size` | `512` | 在线动态关键点补齐 batch |
-| `model.inference_precision` | `fp16` | CNN 前向精度；描述子仍返回 FP32 / packed uint8 |
+| `model.fixed_inference_batch_size` | `0` | `0` | 固定推理 batch 大小；设为正数时补齐最后一个 batch |
+| `model.inference_precision` | `fp32` | `fp32` | CNN 前向精度；描述子仍返回 FP32 / packed uint8 |
 | `sift.nfeatures` | OpenCV 默认 | 当前配置常用 `500` |
 | `sift.nOctaveLayers` | `3` | 尺度层数 |
 | `sift.contrastThreshold` | `0.04`（OpenCV） | 当前配置常用 `0.03` |
@@ -276,7 +265,7 @@ online_unlock:
 | `patch.normalize` | — | 单 patch 减均值除标准差，当前为 `true` |
 | `patch.min_overlap_ratio` | — | 边界关键点丢弃阈值，当前常用 `0.75` |
 
-### 在线共用的匹配参数（`matching.*`）
+### 匹配参数（`matching.*`）
 
 | 配置项 | 程序缺省值 | `config_match_new.yaml` 常见值 | 作用 |
 |--------|------------|-------------------------------|------|
@@ -301,7 +290,7 @@ online_unlock:
 
 Hamming 路径下，`matching.hamming.*` 会覆盖同名顶层 L2 参数。
 
-### 在线共用的纹理融合参数（`texture_verification.*`）
+### 纹理融合参数（`texture_verification.*`）
 
 | 配置项 | 程序缺省值 | 常见值 | 作用 |
 |--------|------------|--------|------|
@@ -318,34 +307,7 @@ Hamming 路径下，`matching.hamming.*` 会覆盖同名顶层 L2 参数。
 
 启用纹理融合时，注册模板必须含 `overlap_image` 字段。
 
-### 输出文件与耗时字段
-
-**单次解锁**：结果打印到终端 JSON，字段包括 `accepted`、`decision_score`、`threshold`、`match_ms`、`end_to_end_ms`、`end_to_end_core_ms` 以及各阶段 `*_ms`。
-
-**批量 benchmark**（默认写入 `<artifacts>/online_unlock_benchmark/`）：
-
-| 文件 | 内容 |
-|------|------|
-| `online_unlock_attempts.csv` | 每次尝试明细；`included_in_timing_statistics=true` 表示进入汇总 |
-| `online_unlock_summary.json` | 仅统计 `accepted=true` 的成功解锁 |
-
-`online_unlock_summary.json` 主要字段：
-
-- `timing_scope`：固定为 `accepted_unlocks_only`
-- `template_build` / `matching` / `end_to_end`：总耗时及各阶段 `fastest_ms`、`average_ms`、`p50_ms`、`p90_ms` 等
-- `end_to_end`：使用 `end_to_end_core_ms`（不含 `descriptor_prepare_ms`、`postprocess_ms`、`identity_match_overhead_ms`、`matching_wrapper_overhead_ms`）
-- `end_to_end_wall_clock`：完整墙钟 `end_to_end_ms`
-- `startup`：`model_initialization_ms`、`model_warmup_ms`、`template_preload_ms`（不计入单次解锁）
-- `early_stop_rate_on_successful_unlocks`：成功解锁中触发早停的比例
-
-分阶段耗时字段：
-
-- 模板构建：`image_read_ms`、`sift_keypoint_detection_ms`、`keypoint_filter_ms`、`patch_crop_rotate_ms`、`hardnet_inference_ms`、`template_assembly_ms`、`template_total_ms`
-- 匹配：`registered_template_load_ms`、`descriptor_prepare_ms`、`candidate_generation_ms`、`candidate_filter_ms`、`ransac_ms`、`inlier_refinement_ms`、`unique_inlier_dedup_ms`（一对一去重，含于 refinement 总时长内）、`texture_similarity_ms`、`score_fusion_ms`、`postprocess_ms`、`identity_fusion_ms`、`identity_match_total_ms`、`match_ms`、`end_to_end_ms`
-
-汇总中的百分位由 `online_unlock.timing.percentiles` 控制；明细 CSV 保留每次尝试的原始毫秒数。
-
-离线主实验的全量模板构建阶段平均耗时见 `template_build_timings.csv`（第 1 节）。
+离线评估输出的 `template_build_timings.csv` 汇总全量模板构建阶段耗时；各次 query 的匹配耗时、本人/非本人分数和 FAR/FRR 指标分别写入评估结果目录。
 
 **换 checkpoint 示例**：
 
@@ -402,7 +364,7 @@ identification:
   match_score_threshold: 0.55
 ```
 
-`unique_inliers` 继续作为诊断字段输出，但不再直接充当 `score` 或解锁阈值。离线评估会直接使用全部 query 的 identity 级分数扫描 FAR/FRR，并在 `identification.match_score_threshold` 下报告最终结果。`verification_scores.csv` 会额外输出 `geometry_similarity`、`texture_similarity`、有效重叠比例、有效块数和实际融合权重。
+`unique_inliers` 继续作为诊断字段输出，但不再直接充当 `score` 或匹配阈值。离线评估会直接使用全部 query 的 identity 级分数扫描 FAR/FRR，并在 `identification.match_score_threshold` 下报告最终结果。`verification_scores.csv` 会额外输出 `geometry_similarity`、`texture_similarity`、有效重叠比例、有效块数和实际融合权重。
 
 FAR/FRR 阈值曲线写入 `match_score_threshold_curve.csv`。默认按 `0.01` 在 `[0,1]` 范围扫描，不再生成整数内点阈值曲线。
 
@@ -418,8 +380,7 @@ FAR/FRR 阈值曲线写入 `match_score_threshold_curve.csv`。默认按 `0.01` 
 
 ### 离线动态模板学习、替换与 LRU 排序
 
-`run_hardnet_matching.py` 可以在离线评估过程中启用模板学习；不依赖
-`online_unlock.py`。每次启动都会先重新构建 `identity_templates_40.json`，因此默认从本次注册模板重新开始，不继承上一次运行的学习结果。
+`run_hardnet_matching.py` 可以在离线评估过程中启用模板学习。每次启动都会先重新构建 `identity_templates_40.json`，因此默认从本次注册模板重新开始，不继承上一次运行的学习结果。
 
 动态模板学习复用以下模块：
 
@@ -569,7 +530,7 @@ python match_new\visualize_hardnet_inliers.py `
 | 参数 | 作用 |
 |------|------|
 | `--config` | 配置文件路径，默认 `match_new/config_match_new.yaml` |
-| `--image_root` | 输入原始图像目录，默认 `pair_build/select_top500` |
+| `--image_root` | 输入原始图像目录，默认读取配置中的 `data.image_root` |
 | `--output_dir` | 可视化输出目录，默认 `match_new/hardnet_inlier_visuals` |
 | `--model_path` | 覆盖配置中的 HardNet checkpoint |
 | `--skip_template_build` | 按当前原图 metadata 复用 `<output_dir>/image_templates` 中已存在的模板 |

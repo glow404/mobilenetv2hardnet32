@@ -1,4 +1,4 @@
-"""HardNet 浮点/二值手机解锁式指纹验证主入口。
+"""HardNet 浮点/二值指纹离线全量匹配评估主入口。
 
 作用：
     1. 扫描原始指纹图像目录，构建每张图像的 `.npz` 模板；
@@ -48,6 +48,8 @@ from match_new.descriptor_contract import (
     require_supported_contract,
     resolve_descriptor_contract,
 )
+from match_new.frontend_data import validate_frontend_template
+from match_new.runtime import HARDNET_INFERENCE_STAGE_FIELDS
 from match_new.evaluation import run_hardnet_evaluation
 from match_new.hadamard_binarization import (
     HadamardBinarizer,
@@ -75,6 +77,7 @@ OBSOLETE_ROOT_OUTPUT_FILENAMES = (
 # 聚合/兼容字段，避免重复计算同一阶段。
 TEMPLATE_BUILD_STAGE_FIELDS = (
     "image_read_ms",
+    "frontend_mask_load_ms",
     "sift_keypoint_detection_ms",
     "keypoint_filter_ms",
     "patch_crop_rotate_ms",
@@ -115,6 +118,8 @@ def build_template_timing_average(
     average_fields = (
         "template_build_ms",
         *TEMPLATE_BUILD_STAGE_FIELDS,
+        *HARDNET_INFERENCE_STAGE_FIELDS,
+        "hardnet_fused_conv_bn_pairs",
         "num_keypoints",
     )
     for field in average_fields:
@@ -133,6 +138,17 @@ def build_template_timing_average(
             if values
             else ""
         )
+    for field in (
+        "hardnet_inference_device",
+        "hardnet_inference_precision",
+        "hardnet_inference_backend",
+        "hardnet_inference_mkldnn",
+        "hardnet_inference_channels_last",
+        "hardnet_inference_cpu_threads",
+    ):
+        summary[field] = ",".join(sorted({
+            str(row[field]) for row in success_rows if field in row
+        }))
     return summary
 
 
@@ -149,10 +165,15 @@ def parse_args() -> argparse.Namespace:
     """解析命令行参数。默认值都在配置文件中；这里只提供覆盖项。"""
 
     parser = argparse.ArgumentParser(
-        description="运行 HardNet 浮点/L2 或二值/Hamming 手机指纹解锁离线评估；默认参数来自 --config 指定的 YAML。",
+        description="运行 HardNet 浮点/L2 或二值/Hamming 指纹离线全量匹配评估；默认参数来自 --config 指定的 YAML。",
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="配置文件路径。")
     parser.add_argument("--image-root", "--image_root", dest="image_root", default=None, help="覆盖 data.image_root。")
+    parser.add_argument("--mask-root", default=None, help="覆盖 frontend.mask.root 并启用前端掩码。")
+    parser.add_argument("--quality-csv", default=None, help="覆盖 frontend.quality.csv_path 并启用前端质量读取。")
+    parser.add_argument("--frontend-mask", action=argparse.BooleanOptionalAction, default=None, help="开启/关闭前端掩码关键点过滤。")
+    parser.add_argument("--frontend-quality", action=argparse.BooleanOptionalAction, default=None, help="开启/关闭前端质量 CSV 读取。")
+    parser.add_argument("--quality-adaptation", action=argparse.BooleanOptionalAction, default=None, help="开启/关闭查询质量自适应匹配。")
     parser.add_argument(
         "--model-path",
         "--model_path",
@@ -194,6 +215,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="覆盖 matching.hamming.ratio_threshold（二值/Hamming）。",
     )
+    parser.add_argument("--ransac-max-iters", type=int, default=None, help="覆盖 matching.ransac_max_iters；质量自适应仍按配置叠加。")
     parser.add_argument(
         "--skip-template-build",
         "--skip_template_build",
@@ -228,6 +250,18 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
 
     if args.image_root is not None:
         config.setdefault("data", {})["image_root"] = str(Path(args.image_root).expanduser().resolve())
+    for argument, section, field in (("mask_root", "mask", "root"), ("quality_csv", "quality", "csv_path")):
+        value = getattr(args, argument, None)
+        if value is not None:
+            target = config.setdefault("frontend", {}).setdefault(section, {})
+            target[field] = str(Path(value).expanduser().resolve())
+            target["enabled"] = True
+    for argument, section in (("frontend_mask", "mask"), ("frontend_quality", "quality")):
+        value = getattr(args, argument, None)
+        if value is not None:
+            config.setdefault("frontend", {}).setdefault(section, {})["enabled"] = bool(value)
+    if getattr(args, "quality_adaptation", None) is not None:
+        config.setdefault("quality_adaptation", {})["enabled"] = bool(args.quality_adaptation)
     if args.model_path:
         config.setdefault("model", {})["checkpoint"] = str(Path(args.model_path).expanduser().resolve())
     if args.output_dir is not None:
@@ -246,6 +280,10 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
         config.setdefault("matching", {}).setdefault("hamming", {})[
             "ratio_threshold"
         ] = float(args.hamming_ratio_threshold)
+    if args.ransac_max_iters is not None:
+        if int(args.ransac_max_iters) <= 0:
+            raise ValueError("--ransac-max-iters must be positive")
+        config.setdefault("matching", {})["ransac_max_iters"] = int(args.ransac_max_iters)
     if args.skip_template_build is not None:
         config.setdefault("runtime", {})["skip_template_build"] = bool(args.skip_template_build)
     if args.max_impostor_identities_per_query is not None:
@@ -585,6 +623,9 @@ def main() -> None:
             template_path = template_dir / template_filename(*key)
             if not template_path.exists():
                 continue
+            validate_frontend_template(
+                load_image_template(template_path, require="hardnet"), candidate, config
+            )
             row = dict(candidate)
             row["template_path"] = str(template_path)
             row["status"] = "success"

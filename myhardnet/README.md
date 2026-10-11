@@ -5,14 +5,14 @@
 
 1. `pair_build/`：从原始指纹图像生成正样本局部块、训练/验证 CSV 和质量检查结果。
 2. `hardnet_train/`：读取构建好的数据，训练浮点描述子或二值描述子网络。
-3. `match_new/`：使用训练完成的模型构建注册模板，执行离线评估和在线匹配识别。
+3. `match_new/`：使用训练完成的模型构建注册模板，执行离线全量匹配评估。
 
 ## 目录说明
 
 - `hardnet.pdf`：HardNet 论文原文。
 - `pair_build/`：正样本数据集构建代码与配置。
 - `hardnet_train/`：网络、损失函数、采样器和训练入口。
-- `match_new/`：注册模板构建、匹配评估和在线识别入口。
+- `match_new/`：注册模板构建、全量匹配评估和 FAR/FRR 指标分析。
 - `outputs/`：数据构建与训练输出目录，包含 patch、CSV、checkpoint 和日志。
 - `finger/`：已有的指纹匹配/C++ 相关代码。
 
@@ -139,24 +139,6 @@ python match_new\run_hardnet_matching.py `
 ```
 
 如果修改了模型、SIFT、局部块提取方式或关键点参数，不能复用旧模板。
-
-对一张指纹执行在线身份验证：
-
-```powershell
-python match_new\run_online_unlock.py `
-  --config match_new\config_match_new.yaml `
-  --image "datasets\normal_pic\dy_L0\pair_41.bmp" `
-  --identity "dy_L0"
-```
-
-在线批量延迟测试：
-
-```powershell
-python match_new\run_online_unlock.py `
-  --config match_new\config_match_new.yaml `
-  --benchmark `
-  --limit 100
-```
 
 ## 关键设计
 

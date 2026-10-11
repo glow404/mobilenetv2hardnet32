@@ -4,14 +4,41 @@
 # 模型、数据集、输出目录、Hadamard 开关、注册数量及匹配阈值变化时，优先只修改这里。
 
 output:
-  output_dir: ../outputs/normal/m0_256_v2_hadamard_模板数40-数据集normal
-  
+  output_dir: ../outputs/frontend_v8/m0_256_v2_hadamard_mask_quality_模板数40
 
 runtime:
   skip_template_build: false
 
 data:
-  image_root: ../datasets/normal_pic
+  # 使用生成 05_mask / 06_quality 时的最终图像；当前前端运行包含 V3 去噪。
+  image_root: ../../data/output_v8/04_denoise
+
+frontend:
+  mask:
+    enabled: true
+    root: ../../data/output_v8/05_mask
+    # foreground >= 128；尺寸必须和图像一致，按关键点中心过滤，不把背景涂黑。通常mask图像只有0，255
+    # error: 缺少掩码立即报错；warn: 显式警告后该图使用全图检测。
+    missing_policy: warn
+  quality:
+    enabled: true
+    csv_path: ../../data/output_v8/06_quality/fingerprint_quality_results.csv
+    # error: 缺失/失败/非法分数立即报错；warn: 警告后使用基础匹配参数。
+    missing_policy: warn
+
+quality_adaptation:
+  enabled: true
+  # 0–100 分；Q>=60 不变，Q<=20 达到上限，中间线性插值。
+  normal_quality_min: 60.0
+  low_quality_below: 40.0  # 仅用于日志中的 medium / low 分档。
+  quality_floor: 20.0
+  # 当前 L2: 0.85 -> 0.89；Hamming: 0.90 -> 0.94，绝对距离上限保持不变。
+  ratio_threshold_increment: 0.04
+  ratio_threshold_cap: 0.94
+  # 当前 RANSAC 容差 0.5 -> 1.0 原图像素；迭代 3000 -> 5000。
+  ransac_reproj_multiplier_max: 2.0
+  ransac_max_iters_increment: 1000
+  # 接受阈值、尺度范围、最少内点数、纹理权重均不随质量改变。
 
 model:
   checkpoint: ../outputs/models/3/m0/m0_256_v2/best.pt
@@ -48,7 +75,7 @@ texture_verification:
   min_overlap_fraction: 0.20
 
 enrollment:
-  enrollment_images_per_identity: 20
+  enrollment_images_per_identity: 40
   # first：按 image_id 排序后取前 N 张（默认）。
   # stride：按总数/N 计算步长后等间隔取样。
   # random：按 random_seed 对每个身份独立无放回抽样。

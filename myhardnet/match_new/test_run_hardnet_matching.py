@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 
 from match_new import evaluation, identity_matcher
 from match_new.run_hardnet_matching import main as base_main
+from match_new.frontend_data import FRONTEND_ROW_FIELDS
 from match_new.runtime import HardNetDescriptor, build_sift
 from match_new.template_builder import build_hardnet_template_from_image
 
@@ -70,6 +71,7 @@ def _score_with_inverted_query_retry(
             "identity_id": query_identity,
             "image_id": cache_key[1],
             "image_path": str(query_template.get("image_path", "")),
+            **{field: query_template.get(field, "") for field in FRONTEND_ROW_FIELDS},
         }
         with tempfile.TemporaryDirectory(prefix="hardnet_inverted_query_") as temp_dir:
             inverted_path = Path(temp_dir) / "inverted_query.png"

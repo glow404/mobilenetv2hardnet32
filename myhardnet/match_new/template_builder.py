@@ -33,6 +33,12 @@ from match_new.descriptor_contract import (
     require_supported_contract,
     resolve_descriptor_contract,
 )
+from match_new.frontend_data import (
+    attach_frontend_metadata,
+    frontend_section,
+    load_frontend_mask,
+    quality_score_or_none,
+)
 from match_new.runtime import (
     HardNetDescriptor,
     build_sift,
@@ -47,10 +53,13 @@ from .utils import ensure_dir, template_filename, write_json
 LOGGER = logging.getLogger(__name__)
 
 
-def detect_keypoints_only(image: np.ndarray, config: dict[str, Any], sift: cv2.SIFT) -> list[cv2.KeyPoint]:
-    """HardNet 模板构建用：只检测关键点，不计算 SIFT 描述子。"""
+def detect_keypoints_only(
+    image: np.ndarray, config: dict[str, Any], sift: cv2.SIFT,
+    mask: np.ndarray | None = None,
+) -> list[cv2.KeyPoint]:
+    """HardNet 模板构建用：只检测指纹前景关键点，不计算 SIFT 描述子。"""
 
-    return detect_sift_keypoints(image, sift, config)
+    return detect_sift_keypoints(image, sift, config, mask=mask)
 
 
 def extract_keypoint_patches(
@@ -91,7 +100,7 @@ def hardnet_template_payload(
     descriptor_transform_name: str = "",
     descriptor_transform_id: str = "",
 ) -> dict[str, Any]:
-    """构造注册阶段和在线解锁共用的内存模板结构。"""
+    """构造统一的内存模板结构，供注册与匹配流程使用。"""
 
     xy = np.asarray([kp.pt for kp in keypoints], dtype=np.float32).reshape(-1, 2)
     gray = np.asarray(overlap_image)
@@ -119,11 +128,17 @@ def hardnet_template_payload(
     if dimension <= 0:
         raise ValueError(f"HardNet descriptor dimension must be positive, got {dimension}")
     template = {
-        "template_format_version": 6,
+        "template_format_version": 7,
         "descriptor_schema_version": DESCRIPTOR_SCHEMA_VERSION,
         "identity_id": str(row["identity_id"]),
         "image_id": str(row["image_id"]),
         "image_path": str(row["image_path"]),
+        "frontend_relative_path": str(row.get("frontend_relative_path", "")),
+        "frontend_quality_score": quality_score_or_none(row.get("frontend_quality_score")),
+        "frontend_quality_csv": str(row.get("frontend_quality_csv", "")),
+        "frontend_mask_path": str(row.get("frontend_mask_path", "")),
+        "frontend_mask_applied": False,
+        "frontend_mask_signature": "",
         "keypoints_xy": xy,
         "keypoints_size": np.asarray([kp.size for kp in keypoints], dtype=np.float32),
         "keypoints_angle": np.asarray(
@@ -175,6 +190,7 @@ def save_hardnet_template_payload(output_path: str | Path, template: dict[str, A
             f"path={target}, descriptors={descriptors.shape}, "
             f"dimension={contract.dimension}, storage={contract.storage}."
         )
+    saved_quality = quality_score_or_none(template.get("frontend_quality_score"))
     np.savez_compressed(
         target,
         template_format_version=np.asarray(
@@ -188,6 +204,15 @@ def save_hardnet_template_payload(output_path: str | Path, template: dict[str, A
         identity_id=np.asarray(template["identity_id"]),
         image_id=np.asarray(template["image_id"]),
         image_path=np.asarray(template["image_path"]),
+        frontend_relative_path=np.asarray(str(template.get("frontend_relative_path", ""))),
+        frontend_quality_score=np.asarray(
+            saved_quality if saved_quality is not None else np.nan,
+            dtype=np.float64,
+        ),
+        frontend_quality_csv=np.asarray(str(template.get("frontend_quality_csv", ""))),
+        frontend_mask_path=np.asarray(str(template.get("frontend_mask_path", ""))),
+        frontend_mask_applied=np.asarray(bool(template.get("frontend_mask_applied", False))),
+        frontend_mask_signature=np.asarray(str(template.get("frontend_mask_signature", ""))),
         keypoints_xy=np.asarray(template["keypoints_xy"], dtype=np.float32),
         keypoints_size=np.asarray(template["keypoints_size"], dtype=np.float32),
         keypoints_angle=np.asarray(template["keypoints_angle"], dtype=np.float32),
@@ -245,11 +270,15 @@ def build_hardnet_template_from_image(
     """从一张原始图像构建查询或注册模板，并记录各阶段耗时。
 
     返回值中的第一项是可直接参与匹配的内存模板；第二项包含图像读取、SIFT
-    关键点检测、局部块提取、HardNet 描述子推理及总耗时。注册流程会进一步
-    持久化模板，在线解锁则只在本次请求期间保留该模板。
+    关键点检测、局部块提取、HardNet 描述子推理及总耗时。批量评估流程会先
+    构建并持久化模板，再从磁盘加载模板进行匹配。
     """
 
     total_started = time.perf_counter()
+    started = time.perf_counter()
+    if "frontend_relative_path" not in row:
+        row = attach_frontend_metadata([row], config)[0]
+    frontend_metadata_ms = (time.perf_counter() - started) * 1000.0
     started = time.perf_counter()
     image = imread_grayscale(row["image_path"])
     image_read_ms = (time.perf_counter() - started) * 1000.0
@@ -257,8 +286,12 @@ def build_hardnet_template_from_image(
         raise FileNotFoundError(row["image_path"])
 
     started = time.perf_counter()
-    keypoints = detect_keypoints_only(image, config, sift=sift)
+    mask, mask_signature = load_frontend_mask(row, image.shape, config)
+    frontend_mask_load_ms = (time.perf_counter() - started) * 1000.0 + frontend_metadata_ms
+    started = time.perf_counter()
+    keypoints = detect_keypoints_only(image, config, sift=sift, mask=mask)
     sift_keypoint_detection_ms = (time.perf_counter() - started) * 1000.0
+    num_foreground_keypoints = len(keypoints)
 
     started = time.perf_counter()
     max_keypoints = int(dict(config.get("keypoint_filter", {})).get("max_keypoints", 400))
@@ -281,8 +314,12 @@ def build_hardnet_template_from_image(
     patch_extract_ms = (time.perf_counter() - started) * 1000.0
 
     started = time.perf_counter()
-    hardnet_descriptors = hardnet.describe(patches)
+    hardnet_descriptors, inference_timings = hardnet.describe_with_timing(patches)
     hardnet_ms = (time.perf_counter() - started) * 1000.0
+    # 保留外层完整调用时间；调用包装开销也计入细分 overhead，便于对账。
+    inference_timings["hardnet_inference_overhead_ms"] += max(
+        0.0, hardnet_ms - float(inference_timings["hardnet_inference_ms"])
+    )
     if hardnet_descriptors.shape[0] != len(selected_keypoints):
         raise ValueError("descriptor/keypoint alignment failed")
 
@@ -300,10 +337,16 @@ def build_hardnet_template_from_image(
         descriptor_transform_name=hardnet.descriptor_transform_name,
         descriptor_transform_id=hardnet.descriptor_transform_id,
     )
+    template["frontend_mask_applied"] = mask is not None
+    template["frontend_mask_signature"] = mask_signature
+    if not bool(frontend_section(config, "quality").get("enabled", False)):
+        template["frontend_quality_score"] = None
+        template["frontend_quality_csv"] = ""
     template_assembly_ms = (time.perf_counter() - started) * 1000.0
     template_total_ms = (time.perf_counter() - total_started) * 1000.0
     accounted_ms = (
         image_read_ms
+        + frontend_mask_load_ms
         + sift_keypoint_detection_ms
         + keypoint_filter_ms
         + patch_extract_ms
@@ -312,11 +355,15 @@ def build_hardnet_template_from_image(
     )
     timings = {
         "image_read_ms": image_read_ms,
+        "frontend_mask_load_ms": frontend_mask_load_ms,
+        "frontend_mask_applied": int(mask is not None),
+        "num_foreground_keypoints": num_foreground_keypoints,
         "sift_keypoint_detection_ms": sift_keypoint_detection_ms,
         "keypoint_filter_ms": keypoint_filter_ms,
         "sift_ms": sift_ms,
         "patch_crop_rotate_ms": patch_extract_ms,
         "patch_extract_ms": patch_extract_ms,
+        **inference_timings,
         "hardnet_inference_ms": hardnet_ms,
         "hardnet_ms": hardnet_ms,
         "template_assembly_ms": template_assembly_ms,
@@ -434,6 +481,12 @@ def load_image_template(path: str | Path, *, require: str | None = None) -> dict
             "identity_id": str(np.asarray(data["identity_id"]).item()),
             "image_id": str(np.asarray(data["image_id"]).item()),
             "image_path": str(np.asarray(data["image_path"]).item()),
+            "frontend_relative_path": str(np.asarray(data["frontend_relative_path"]).item()) if "frontend_relative_path" in keys else "",
+            "frontend_quality_score": quality_score_or_none(np.asarray(data["frontend_quality_score"]).item()) if "frontend_quality_score" in keys else None,
+            "frontend_quality_csv": str(np.asarray(data["frontend_quality_csv"]).item()) if "frontend_quality_csv" in keys else "",
+            "frontend_mask_path": str(np.asarray(data["frontend_mask_path"]).item()) if "frontend_mask_path" in keys else "",
+            "frontend_mask_applied": bool(np.asarray(data["frontend_mask_applied"]).item()) if "frontend_mask_applied" in keys else False,
+            "frontend_mask_signature": str(np.asarray(data["frontend_mask_signature"]).item()) if "frontend_mask_signature" in keys else "",
             "keypoints_xy": np.asarray(data["keypoints_xy"], dtype=np.float32) if "keypoints_xy" in keys else np.zeros((0, 2), dtype=np.float32),
             "keypoints_size": np.asarray(data["keypoints_size"], dtype=np.float32) if "keypoints_size" in keys else np.zeros((n_xy,), dtype=np.float32),
             "keypoints_angle": np.asarray(data["keypoints_angle"], dtype=np.float32) if "keypoints_angle" in keys else np.zeros((n_xy,), dtype=np.float32),
@@ -462,6 +515,8 @@ def build_hardnet_templates(
 ) -> dict[str, Any]:
     """批量构建 HardNet 图像模板。"""
 
+    if any("frontend_relative_path" not in row for row in rows):
+        rows = attach_frontend_metadata(rows, config)
     out = ensure_dir(output_dir)
     hardnet = HardNetDescriptor(config)
     sift = build_sift(config)
@@ -508,7 +563,9 @@ def build_hardnet_templates(
                     "template_path": str(path),
                     "template_build_ms": f"{elapsed_ms:.3f}",
                     **{
-                        field: f"{float(value):.3f}"
+                        field: (
+                            value if isinstance(value, str) else f"{float(value):.3f}"
+                        )
                         for field, value in stage_timings.items()
                     },
                     "template_persist_ms": f"{template_persist_ms:.3f}",

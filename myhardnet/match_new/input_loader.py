@@ -11,6 +11,7 @@ from typing import Any, Iterable
 import cv2
 import numpy as np
 
+from .frontend_data import attach_frontend_metadata
 from .utils import resolve_path
 
 
@@ -162,11 +163,12 @@ def load_raw_image_metadata(config: dict[str, Any]) -> list[dict[str, str]]:
             "data.identity_depth 已移除：数据集必须固定为 "
             "`image_root/<手指目录>/图像文件`，请从配置中删除该字段。"
         )
-    return scan_image_metadata(
+    rows = scan_image_metadata(
         resolve_path(config, image_root),
         image_extensions=data_cfg.get("image_extensions", DEFAULT_IMAGE_EXTENSIONS),
         validate_readable=bool(data_cfg.get("validate_readable", True)),
     )
+    return attach_frontend_metadata(rows, config)
 
 
 def validate_identity_image_counts(

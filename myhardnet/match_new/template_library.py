@@ -199,14 +199,11 @@ class TemplateLibraryManager:
             raise FileNotFoundError(f"query 模板文件不存在: {query_path}")
         return query_path
 
-    def _unlock_threshold(self, full_config: dict[str, Any]) -> float:
+    def _match_threshold(self, full_config: dict[str, Any]) -> float:
         identification = dict(full_config.get("identification", {}))
-        value = identification.get("early_stop_threshold")
-        if value in {"", None}:
-            value = identification.get("match_score_threshold", 0.55)
-        threshold = float(value)
+        threshold = float(identification.get("match_score_threshold", 0.55))
         if not 0.0 <= threshold <= 1.0:
-            raise ValueError(f"unlock threshold must be in [0,1], got {threshold}")
+            raise ValueError(f"learning threshold must be in [0,1], got {threshold}")
         return threshold
 
     def learn_after_match(
@@ -225,19 +222,19 @@ class TemplateLibraryManager:
         identity_id = str(identity.get("identity_id", ""))
         entries = self.ordered_entries(identity_id)
         score = float(match_result.get("score", 0.0))
-        unlock_threshold = self._unlock_threshold(full_config)
+        learning_threshold = self._match_threshold(full_config)
         event: dict[str, Any] = {
             "identity_id": identity_id,
             "query_image_id": str(query_template.get("image_id", "")),
-            "accepted": bool(score >= unlock_threshold),
+            "accepted": bool(score >= learning_threshold),
             "matched_template_path": str(match_result.get("best_template_path", "")),
-            "unlock_score": score,
+            "match_score": score,
             "learned": False,
             "learned_template_path": "",
             "replaced_template_path": "",
-            "learning_reasons": ["unlock_failed"],
+            "learning_reasons": ["score_below_match_threshold"],
         }
-        if score < unlock_threshold:
+        if score < learning_threshold:
             return event
 
         matched_path = event["matched_template_path"]
@@ -356,7 +353,7 @@ class TemplateLibraryManager:
             "max_active_templates": self.max_active_templates,
             "initial_template_count": self.initial_template_count,
             "num_queries_processed": len(events),
-            "num_unlock_accepts": len(accepted),
+            "num_accepted_matches": len(accepted),
             "num_templates_learned": len(learned),
             "num_templates_replaced": len(replaced),
             "update_counter": int(self.state.get("update_counter", 0)),

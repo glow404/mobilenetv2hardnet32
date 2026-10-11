@@ -1,9 +1,8 @@
-"""离线阈值评估与在线解锁共用的 identity 级匹配实现。
+"""离线全量阈值评估使用的 identity 级匹配实现。
 
-一个已注册手指由多张图像模板组成。本模块负责逐模板计算图像级分数，再按配置
-融合为一个 identity 级分数。离线评估必须遍历全部模板以获得真实完整分数；
-在线解锁在最大值类融合下可于任一模板达到固定阈值后提前结束，同时保持接受/
-拒绝结论与完整遍历一致。
+一个已注册手指由多张图像模板组成。本模块逐一计算查询模板与该 identity 全部
+注册模板的图像级分数，再按配置融合为 identity 级分数。所有模板均参与评分，
+以便阈值曲线和 FAR/FRR 使用完整分数。
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from match_new.hardnet_matcher import match_templates_descriptor
+from match_new.quality_adaptation import QUALITY_RESULT_FIELDS
 from match_new.template_builder import load_image_template
 
 
@@ -24,12 +24,7 @@ def load_template_cached(
     *,
     require: str | None = None,
 ) -> dict[str, Any]:
-    """加载一份图像模板并放入进程内缓存。
-
-    缓存键同时包含文件路径和描述子类型要求，防止同一路径在 HardNet/SIFT
-    两种加载约束下错误复用。在线引擎可在启动阶段预加载注册模板，避免把磁盘
-    读取时间计入每次解锁。
-    """
+    """加载一份图像模板并按路径和描述子类型约束缓存。"""
 
     key = str(Path(path).expanduser())
     cache_key = f"{key}::{require or 'any'}"
@@ -39,10 +34,10 @@ def load_template_cached(
 
 
 def fuse_image_results(results: list[dict[str, Any]], method: str) -> float:
-    """把同一手指多张模板的图像级分数融合为 identity 级分数。
+    """把同一手指全部模板的图像级分数融合为 identity 级分数。
 
-    ``max`` 与 ``max_quality_tiebreak`` 属于最大值类融合，可以安全使用固定
-    阈值早停；``mean`` 和 ``top3_mean`` 必须取得完整分数集合后才能计算。
+    ``max`` 和 ``max_quality_tiebreak`` 取最高分；``mean`` 和 ``top3_mean``
+    分别计算全体分数均值和最高三项均值。
     """
 
     if not results:
@@ -63,30 +58,6 @@ def fuse_image_results(results: list[dict[str, Any]], method: str) -> float:
         )
         return float(best.get("score", 0.0))
     raise ValueError(f"unsupported fusion method: {method}")
-
-
-def resolve_early_stop_threshold(config: dict[str, Any]) -> float | None:
-    """根据 identification 配置解析早停阈值；关闭早停时返回 None。"""
-
-    identification_cfg = dict(config.get("identification", {}))
-    if not bool(identification_cfg.get("early_stop_on_unlock_threshold", True)):
-        return None
-    fusion_method = str(identification_cfg.get("fusion_method", "max")).lower()
-    if fusion_method not in {"max", "max_quality_tiebreak"}:
-        raise ValueError(
-            "早停只支持 max 或 max_quality_tiebreak 融合；"
-            f"当前融合方式为 {fusion_method}"
-        )
-    configured_early_stop = identification_cfg.get("early_stop_threshold")
-    threshold_value = (
-        configured_early_stop
-        if configured_early_stop not in {"", None}
-        else identification_cfg.get("match_score_threshold", 0.55)
-    )
-    threshold = float(threshold_value)
-    if not 0.0 <= threshold <= 1.0:
-        raise ValueError(f"早停阈值必须位于 [0,1]，当前值为 {threshold}")
-    return threshold
 
 
 END_TO_END_EXCLUDED_MATCH_OVERHEAD_MS_FIELDS: tuple[str, ...] = (
@@ -118,26 +89,12 @@ def score_query_against_identity(
     config: dict[str, Any],
     template_cache: dict[str, dict[str, Any]],
     descriptor_source: str = "hardnet",
-    *,
-    early_stop_threshold: float | None = None,
 ) -> dict[str, Any]:
-    """计算一份查询模板与一个已注册手指模板集合的匹配结果。
-
-    ``early_stop_threshold=None`` 时始终遍历全部注册模板，用于离线阈值扫描，
-    从而保留真实 identity 最大分数。在线解锁显式传入离线标定的固定阈值；
-    在最大值类融合下，一旦某张模板分数达到阈值，最终“接受”结论已不可逆，
-    因此可以提前返回。若全部模板均未达到阈值，则仍会完整遍历并返回“拒绝”。
-    """
+    """完整遍历一份查询模板与一个已注册手指的全部模板并融合分数。"""
 
     identity_started = time.perf_counter()
     paths = [str(path) for path in identity.get("template_paths", [])]
     method = str(dict(config.get("identification", {})).get("fusion_method", "max")).lower()
-    if early_stop_threshold is not None:
-        if method not in {"max", "max_quality_tiebreak"}:
-            raise ValueError(f"early stop requires max-like fusion, got {method}")
-        early_stop_threshold = float(early_stop_threshold)
-        if not 0.0 <= early_stop_threshold <= 1.0:
-            raise ValueError(f"early_stop_threshold must be in [0,1], got {early_stop_threshold}")
     require = "sift" if str(descriptor_source).lower() in {"sift", "rootsift"} else "hardnet"
     low_unique_inliers = int(
         dict(config.get("texture_verification", {})).get(
@@ -148,7 +105,6 @@ def score_query_against_identity(
 
     results: list[dict[str, Any]] = []
     best_index = -1
-    early_stopped = False
     template_load_ms = 0.0
     timing_fields = (
         "descriptor_prepare_ms",
@@ -188,10 +144,6 @@ def score_query_against_identity(
             result_key = (float(result.get("score", 0.0)), float(result.get("quality_score", 0.0)))
             if result_key > best_key:
                 best_index = index
-        if early_stop_threshold is not None and float(result.get("score", 0.0)) >= early_stop_threshold:
-            early_stopped = True
-            break
-
     if results:
         best_index = max(
             range(len(results)),
@@ -230,11 +182,10 @@ def score_query_against_identity(
         "best_template_image_path": str(best_template.get("image_path", "")),
         "best_affine_matrix": best.get("affine_matrix"),
         "num_templates": len(paths),
-        "num_templates_evaluated": len(results),
-        "early_stopped": int(early_stopped),
-        "early_stop_threshold": "" if early_stop_threshold is None else float(early_stop_threshold),
         "best_image_score": float(best.get("score", 0.0)),
         "best_quality_score": float(best.get("quality_score", 0.0)),
+        **{field: best.get(field, "") for field in QUALITY_RESULT_FIELDS},
+        "query_frontend_mask_applied": int(bool(query_template.get("frontend_mask_applied", False))),
         "num_raw_matches": int(best.get("num_raw_matches", 0)),
         "num_abs_distance_pass": int(best.get("num_abs_distance_pass", 0)),
         "num_one_way_ratio_pass": int(best.get("num_one_way_ratio_pass", 0)),

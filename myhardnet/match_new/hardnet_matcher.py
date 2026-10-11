@@ -44,6 +44,7 @@ from match_new.descriptor_contract import (
     require_supported_contract,
     resolve_descriptor_contract,
 )
+from match_new.quality_adaptation import adapt_query_matching_config
 
 
 @dataclass(frozen=True)
@@ -1398,7 +1399,12 @@ def match_templates_descriptor(query: dict[str, Any], gallery: dict[str, Any], c
             "Query/gallery descriptor storage width mismatch: "
             f"query={desc_q.shape[1]}, gallery={desc_g.shape[1]}."
         )
-    cfg = metric_matching_config(cfg, contract.metric)
+    effective_config, quality_diagnostics = adapt_query_matching_config(
+        config, query.get("frontend_quality_score"), contract.metric
+    )
+    cfg = metric_matching_config(dict(effective_config.get("matching", {})), contract.metric)
+    base.update(quality_diagnostics)
+    base["query_frontend_mask_applied"] = int(bool(query.get("frontend_mask_applied", False)))
     timings["descriptor_prepare_ms"] = (
         time.perf_counter() - stage_started
     ) * 1000.0
@@ -1542,7 +1548,7 @@ def match_templates_descriptor(query: dict[str, Any], gallery: dict[str, Any], c
         gallery,
         np.asarray(matrix, dtype=np.float64),
         unique_count,
-        config,
+        effective_config,
     )
     score_elapsed_ms = (time.perf_counter() - stage_started) * 1000.0
     timings["texture_similarity_ms"] = float(

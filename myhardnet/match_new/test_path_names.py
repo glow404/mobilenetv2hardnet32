@@ -25,14 +25,3 @@ def test_short_case_directory_name_stays_compact_for_long_ids() -> None:
     assert name.startswith("123_q_query")
     assert len(name) < 120
     assert "_" not in compact_path_token("pair_35")
-
-
-def test_failure_copy_target_stays_below_legacy_windows_limit() -> None:
-    failure_type_dir = Path(
-        r"C:\Users\Administrator\Desktop\research\project\hardnet32\myhardnet"
-        r"\outputs\frontend_v8\m0_256_v2_hadamard_mask_quality_模板数40"
-        r"\eval_hardnet_hamming\failure_cases\threshold_0.8\false_rejects"
-    )
-    case_name = short_case_directory_name(1, "pair_76", "xyy_R0")
-    target = failure_type_dir / case_name / "best_template.bmp"
-    assert len(str(target)) < 260

@@ -42,7 +42,6 @@ from match_new.utils import (
     read_csv_rows,
     resolve_path,
     safe_id,
-    short_case_directory_name,
     template_filename,
     write_csv_rows,
     write_json,
@@ -139,24 +138,6 @@ SCORE_FIELDNAMES = [
     "unlock_end_to_end_ms",
     "unlock_end_to_end_core_ms",
 ]
-
-
-# Identity-level stages included in the match-only wall-clock interval.
-# The per-image stages are accumulated across all registered templates for one identity.
-MATCH_ONLY_STAGE_FIELDS = (
-    "registered_template_load_ms",
-    "descriptor_prepare_ms",
-    "candidate_generation_ms",
-    "candidate_filter_ms",
-    "ransac_ms",
-    "inlier_refinement_ms",
-    "unique_inlier_dedup_ms",
-    "texture_similarity_ms",
-    "score_fusion_ms",
-    "postprocess_ms",
-    "identity_fusion_ms",
-    "identity_match_overhead_ms",
-)
 
 
 def parse_float(value: Any) -> float | None:
@@ -950,10 +931,11 @@ def export_failure_cases(
         type_dir = ensure_dir(root / f"{failure_type}s")
         for local_idx, item in enumerate(items[: max_cases if max_cases > 0 else None], start=1):
             score_text = format_significant_digits(float(item["score"]))
-            case_id = short_case_directory_name(
-                local_idx,
-                item["query_id"],
-                item["owner_identity"],
+            case_id = (
+                f"{failure_type}_{local_idx:05d}"
+                f"__score_{safe_id(score_text)}"
+                f"__q_{safe_id(item['query_id'])}"
+                f"__owner_{safe_id(item['owner_identity'])}"
             )
             case_dir = ensure_dir(type_dir / case_id)
             query_src = item["query_image_path"]
@@ -1123,9 +1105,6 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
     failed_genuine_attempts = 0
     successful_unlocks_timed = 0
     match_values: list[float] = []
-    match_stage_values: dict[str, list[float]] = {
-        field: [] for field in MATCH_ONLY_STAGE_FIELDS
-    }
     end_to_end_values: list[float] = []
     end_to_end_core_values: list[float] = []
     for row in score_rows:
@@ -1141,10 +1120,6 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
         end_to_end_core_ms = parse_float(row.get("unlock_end_to_end_core_ms"))
         if match_ms is not None:
             match_values.append(match_ms)
-        for field in MATCH_ONLY_STAGE_FIELDS:
-            stage_ms = parse_float(row.get(field))
-            if stage_ms is not None:
-                match_stage_values[field].append(stage_ms)
         if end_to_end_core_ms is not None:
             end_to_end_core_values.append(end_to_end_core_ms)
         elif end_to_end_ms is not None:
@@ -1155,34 +1130,10 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
             end_to_end_values.append(end_to_end_ms)
     out = ensure_dir(output_dir)
     (Path(out) / "unlock_timing.csv").unlink(missing_ok=True)
-    match_only_summary = summarize_timing(match_values)
-    match_only_stage_summary = {
-        field: summarize_timing(values)
-        for field, values in match_stage_values.items()
-    }
-    stage_sum_of_means_ms = sum(
-        float(item.get("average_ms", 0.0))
-        for item in match_only_stage_summary.values()
-    )
-    match_only_summary.update(
-        {
-            "by_stage": match_only_stage_summary,
-            "stage_sum_of_means_ms": stage_sum_of_means_ms,
-            "unaccounted_mean_ms": (
-                float(match_only_summary.get("average_ms", 0.0))
-                - stage_sum_of_means_ms
-            ),
-        }
-    )
     summary = {
         "definition": {
             "timing_scope": "只统计在 selected threshold 下成功接受的本人解锁记录。",
-            "unlock_match_ms": "查询模板已存在时，与一个手指的注册模板集合完成匹配的时间；match_only.by_stage 按同一成功本人记录拆分该时间。",
-            "match_only.by_stage": (
-                "match_only 的阶段统计；registered_template_load_ms 是注册模板缓存读取，"
-                "descriptor_prepare_ms 到 postprocess_ms 为全部注册模板逐图匹配阶段，"
-                "identity_fusion_ms 和 identity_match_overhead_ms 为身份级汇总阶段。"
-            ),
+            "unlock_match_ms": "查询模板已存在时，与一个手指的注册模板集合完成匹配的时间。",
             "unlock_end_to_end_ms": "query_template_build_ms + unlock_match_ms；不包含模型/SIFT初始化和传感器采集。",
             "unlock_end_to_end_core_ms": (
                 "unlock_end_to_end_ms 扣除 descriptor_prepare_ms、postprocess_ms、"
@@ -1196,7 +1147,7 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
         "total_genuine_attempts": total_genuine_attempts,
         "successful_unlocks_timed": successful_unlocks_timed,
         "failed_unlocks_excluded": failed_genuine_attempts,
-        "match_only": match_only_summary,
+        "match_only": summarize_timing(match_values),
         "end_to_end": summarize_timing(end_to_end_core_values),
         "end_to_end_wall_clock": summarize_timing(end_to_end_values),
     }

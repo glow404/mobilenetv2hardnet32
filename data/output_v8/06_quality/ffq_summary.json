@@ -1,0 +1,126 @@
+{
+  "algorithm": "FFQ-Lite V1.5 Traditional-Enhanced",
+  "config": {
+    "max_side": 320,
+    "block_size": 16,
+    "sobel_ksize": 3,
+    "min_block_std": 0.035,
+    "min_block_gradient": 0.02,
+    "min_block_mean": 0.03,
+    "max_block_mean": 0.97,
+    "keep_largest_component": true,
+    "external_mask_block_ratio": 0.1,
+    "low_coherence_threshold": 0.35,
+    "high_coherence_threshold": 0.65,
+    "orientation_jump_threshold": 0.3,
+    "gbfoe_percentile": 19.0,
+    "gbfoe_sigma_smooth": 1.25,
+    "gbfoe_median_size": 5,
+    "gbfoe_sigma_base": 9.0,
+    "gbfoe_sigma_multiplier": 15.0,
+    "gbfoe_sigma_min": 3.0,
+    "gbfoe_sigma_max": 18.0,
+    "freq_window_width": 23,
+    "freq_window_height": 43,
+    "freq_period_min": 5.0,
+    "freq_period_max": 20.0,
+    "freq_min_valid_distances": 4,
+    "freq_min_mask_ratio": 0.55,
+    "freq_peak_tolerance": 2.0,
+    "weight_area": 0.06,
+    "weight_coherence": 0.3,
+    "weight_flow": 0.18,
+    "weight_frequency": 0.2,
+    "weight_contrast": 0.13,
+    "weight_sharpness": 0.05,
+    "weight_noise": 0.08
+  },
+  "summary": {
+    "total_images": 3600,
+    "successful_images": 3600,
+    "failed_images": 0,
+    "quality_level_counts": {
+      "较差": 834,
+      "一般": 1250,
+      "良好": 1446,
+      "优秀": 70
+    },
+    "score_bin_counts": [
+      {
+        "score_range": "0-9",
+        "count": 0,
+        "ratio": 0.0
+      },
+      {
+        "score_range": "10-19",
+        "count": 0,
+        "ratio": 0.0
+      },
+      {
+        "score_range": "20-29",
+        "count": 253,
+        "ratio": 0.070278
+      },
+      {
+        "score_range": "30-39",
+        "count": 581,
+        "ratio": 0.161389
+      },
+      {
+        "score_range": "40-49",
+        "count": 515,
+        "ratio": 0.143056
+      },
+      {
+        "score_range": "50-59",
+        "count": 735,
+        "ratio": 0.204167
+      },
+      {
+        "score_range": "60-69",
+        "count": 1033,
+        "ratio": 0.286944
+      },
+      {
+        "score_range": "70-79",
+        "count": 413,
+        "ratio": 0.114722
+      },
+      {
+        "score_range": "80-89",
+        "count": 70,
+        "ratio": 0.019444
+      },
+      {
+        "score_range": "90-100",
+        "count": 0,
+        "ratio": 0.0
+      }
+    ],
+    "score_mean": 54.02552230555556,
+    "score_median": 57.21995,
+    "score_min": 20.9627,
+    "score_max": 84.0128,
+    "score_std": 14.959295659498615,
+    "processing_time_mean_ms": 23.962954000000003,
+    "processing_time_median_ms": 23.45635,
+    "processing_time_p95_ms": 32.485015,
+    "processing_time_p99_ms": 36.46216799999999,
+    "processing_time_min_ms": 9.4376,
+    "processing_time_max_ms": 44.7962,
+    "processing_time_std_ms": 4.9718103307123895,
+    "total_time_mean_ms": 24.23125711111111,
+    "total_time_p95_ms": 32.79415999999999,
+    "subscore_mean": {
+      "area": 82.0,
+      "coherence": 54.79160072222223,
+      "flow": 92.49503475000002,
+      "frequency": 89.75656752777778,
+      "contrast": 99.99941063888889,
+      "sharpness": 100.0,
+      "noise": 27.174084583333336
+    },
+    "batch_wall_time_s": 88.1031357999891,
+    "batch_wall_fps": 40.861201673600874
+  }
+}

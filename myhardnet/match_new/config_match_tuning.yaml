@@ -34,7 +34,7 @@ quality_adaptation:
   quality_floor: 20.0
   # 当前 L2: 0.85 -> 0.89；Hamming: 0.90 -> 0.94，绝对距离上限保持不变。
   ratio_threshold_increment: 0.04
-  ratio_threshold_cap: 0.94
+  ratio_threshold_cap: 0.97
   # 当前 RANSAC 容差 0.5 -> 1.0 原图像素；迭代 3000 -> 5000。
   ransac_reproj_multiplier_max: 2.0
   ransac_max_iters_increment: 1000

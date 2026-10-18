@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import math
 import re
@@ -226,30 +225,6 @@ def safe_id(value: str) -> str:
     """把 identity_id/image_id 转为适合文件名使用的安全字符串。"""
 
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
-
-
-def compact_path_token(value: str, max_length: int = 20) -> str:
-    """压缩路径中的 ID；长 ID 使用稳定摘要，完整 ID 仍保留在结果文件中。"""
-
-    if max_length < 10:
-        raise ValueError("max_length must be at least 10")
-    raw = str(value)
-    token = re.sub(r"[^A-Za-z0-9-]+", "", raw).strip("-")
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
-    if not token:
-        token = f"item-{digest}"
-    if len(token) > max_length:
-        token = f"{token[: max_length - 9]}-{digest}"
-    return token
-
-
-def short_case_directory_name(index: int, query_id: str, owner_identity: str) -> str:
-    """生成短失败案例目录名，例如 ``05_q_pair35_zysR0``。"""
-
-    return (
-        f"{index:02d}_q_{compact_path_token(query_id)}"
-        f"_{compact_path_token(owner_identity)}"
-    )
 
 
 def template_filename(identity_id: str, image_id: str) -> str:

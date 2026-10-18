@@ -63,15 +63,18 @@ python run_frontend_pipeline.py \
   --output-root /data/output_v7
 
 # V8：独立 wo/wi 初相；附带 mask 与质量评分
-python run_frontend_pipeline.py \
-  --input-root /data/normal \
-  --output-root /data/output_v8 \
-  --diffraction v8 --run-segmentation --run-quality --device cuda
+python run_frontend_pipeline.py `
+  --input-root /data/normal `
+  --output-root /data/output_v8 `
+  --diffraction v8 `
+  --run-segmentation `
+  --run-quality `
+  --device cuda
 
 # V9：共同初相后进行 wo/wi 复数全局相位对齐
-python run_frontend_pipeline.py \
-  --input-root /data/normal \
-  --output-root /data/output_v9 \
+python run_frontend_pipeline.py 、
+  --input-root /data/normal 、
+  --output-root /data/output_v9 、
   --diffraction v9 --run-segmentation --run-quality
 ```
 
@@ -152,6 +155,18 @@ python 05_optional_growth/export_structural_growth_v3.py --help
 ```
 
 请先在少量样本上人工检查，避免在低置信区域生成不可信纹线。
+
+## 与后端特征提取和匹配连接
+
+本仓库的 `myhardnet/match_new` 已支持读取本工具包的输出：使用本次最终图像
+（默认 `04_denoise`），以 `手指目录/文件名` 关联 `05_mask` 掩码与
+`06_quality/fingerprint_quality_results.csv` 的 `relative_path` / `quality_score`。
+掩码用于排除非指纹区域的关键点；0–100 的前端质量分数用于调整查询的候选
+ratio 与几何验证参数，不直接作为身份匹配分数，也不降低最终接受阈值。
+
+后端路径、经验阈值、参数调整方式和运行命令见
+[前后端联动与质量自适应](../myhardnet/match_new/FRONTEND_INTEGRATION.md)。
+本工具包仍可单独使用，前端运行不依赖后端代码。
 
 ## 注意
 

@@ -93,9 +93,7 @@ python match_new\run_hardnet_matching.py `
 
 离线耗时保持现有输出格式：`verification_scores.csv` 的 `attempt_match_ms` 记录
 每次本人/非本人匹配耗时，`metrics.json` 的 `matching_stage_summary` 汇总全部
-尝试的各阶段平均耗时；`unlock_timing.json` 只汇总在配置阈值下被接受的本人记录。其 `match_only` 保留原有总耗时统计，并新增 `by_stage`，按 `registered_template_load_ms`、描述子准备、候选生成/过滤、RANSAC、内点细化、一对一去重、纹理相似度、分数融合、后处理和身份级汇总拆分；`stage_sum_of_means_ms` 是各阶段平均值之和，`unaccounted_mean_ms` 用于发现阶段计时与外层墙钟时间之间的未覆盖开销。
-
-`match_only.by_stage` 只统计成功本人匹配，且不包含 query 模板构建、SIFT、HardNet 推理和模型初始化。每个阶段的时间已经累计了该 query 与一个 identity 的全部注册模板匹配；因此前端接入后应同时检查 `candidate_generation_ms`、`ransac_ms`、`texture_similarity_ms` 以及 `templates_with_candidates`，不能只看单个图像模板的时间。
+尝试的各阶段平均耗时；`unlock_timing.json` 只汇总在配置阈值下被接受的本人记录。
 这里沿用 `unlock_*` 字段名称，它们属于离线统计，不是独立解锁入口。
 端到端耗时由模板构建时间加匹配时间得到，不包含模型初始化、传感器采集和模板
 预加载时间，也不代表实时请求延迟。复用模板时没有本次构建计时，端到端统计

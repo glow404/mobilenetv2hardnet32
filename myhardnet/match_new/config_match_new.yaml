@@ -1,15 +1,15 @@
-# match_new 离线全量匹配评估配置
+# match_new 离线身份匹配配置（最大值融合与动态阈值早停）
 #
 #   1. 每个 identity 按 enrollment 配置选择注册图像；
 #   2. 其余图像作为 query；
-#   3. 每个 query 与本人及非本人 identity 的全部注册模板匹配；
-#   4. 基于完整匹配分数计算 FAR/FRR、EER、阈值曲线并导出失败案例。
+#   3. 每个 query 与本人及非本人 identity 的注册模板进行匹配，达到 query 动态阈值后可提前停止；
+#   4. 输出匹配分数、阈值统计、失败案例和耗时信息。
 
 extends: config_match_tuning.yaml
 
 runtime:
   # 每个 query 比对的非本人 identity 数量：-1 表示全量，正式 FAR 评估应使用 -1。
-  max_impostor_identities_per_query: 0
+  max_impostor_identities_per_query: -1
 
   # 调试裁剪：只保留前 N 个 identity；0 表示不限制。正式实验必须为 0。
   limit_identities: 0
@@ -51,7 +51,7 @@ model:
   # 建模版时，HardNet patch 一次批量推理 batch size个patch。
   batch_size: 512
 
-  # 0 使用实际 patch 数；CPU 测时无需为了 CUDA shape 初始化而补齐。
+  # fixed_inference_batch_size: 0 表示 CPU 下使用实际 patch 数量，不为了凑固定尺寸额外补零
   fixed_inference_batch_size: 0
 
   # CPU FP32 推理后端：本机基准最快的是 ONNX Runtime CPU。
@@ -75,7 +75,7 @@ model:
 
 sift:
   # SIFT 在 HardNet 主实验中只负责提供关键点位置和方向； 这里的参数与邓宇的sift，训练时用的sift保持一致，可试着修改。
-  nfeatures: 500    #每层最多检测的关键点数。越大检测越密集
+  nfeatures: 500   #每层最多检测的关键点数。越大检测越密集
   nOctaveLayers: 3   #尺度层数。越大尺度采样越细，关键点更多
   contrastThreshold: 0.03  #对比度阈值，低于此值的点不作为关键点。越小越容易保留弱纹理 0.02-0.04
   edgeThreshold: 17.5  #边缘响应阈值，避免检测到边缘点，越大越容易保留边缘点 10-14
@@ -95,7 +95,7 @@ patch:
 
 keypoint_filter:
   # 每张图最多保留的 SIFT keypoints 数，按 response 从高到低截断。
-  max_keypoints: 500
+  max_keypoints: 400
 
 matching:
   # auto：浮点 checkpoint 使用 L2，二值 checkpoint 使用归一化 Hamming。
@@ -112,7 +112,7 @@ matching:
   top_k: 1
 
   # 候选过多会拖慢 RANSAC，也容易引入噪声；超限时只按描述子距离从小到大截断。
-  max_candidates_for_ransac: 250
+  max_candidates_for_ransac: 200
 
   # 以下参数只控制最终内点的方向一致性诊断，完全不影响匹配结果。
   orientation_hist_bin_deg: 10.0
@@ -124,7 +124,7 @@ matching:
 
   # RANSAC 几何验证参数。使用 estimateAffinePartial2D，适合局部旋转/缩放/平移。
   ransac_reproj_threshold: 0.5  
-  ransac_max_iters: 3000
+  ransac_max_iters: 2000
   ransac_confidence: 0.995
 
   # 指纹图像主要是平移/旋转，只有极少量尺度变化。
@@ -155,7 +155,7 @@ template_management:
   coverage_morph_kernel: 3
 
 identification:
-  # 注册模板之间的 identity 分数融合方式；max 表示取全部注册模板中的最高图像级分数。
+  # 仅支持 max；达到当前 query 的动态身份阈值后提前返回首个达标模板分数。
   fusion_method: max
 
   # [0,1] 连续匹配分数阈值，用于选定工作点并报告 FAR/FRR。

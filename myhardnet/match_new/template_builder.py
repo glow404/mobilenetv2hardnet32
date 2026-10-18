@@ -287,6 +287,7 @@ def build_hardnet_template_from_image(
 
     started = time.perf_counter()
     mask, mask_signature = load_frontend_mask(row, image.shape, config)
+    # 前端掩码读取属于前端预处理，不计入模板构建阶段统计。
     frontend_mask_load_ms = (time.perf_counter() - started) * 1000.0 + frontend_metadata_ms
     started = time.perf_counter()
     keypoints = detect_keypoints_only(image, config, sift=sift, mask=mask)
@@ -343,10 +344,12 @@ def build_hardnet_template_from_image(
         template["frontend_quality_score"] = None
         template["frontend_quality_csv"] = ""
     template_assembly_ms = (time.perf_counter() - started) * 1000.0
-    template_total_ms = (time.perf_counter() - total_started) * 1000.0
+    raw_template_total_ms = (time.perf_counter() - total_started) * 1000.0
+    # 统计口径排除前端掩码读取；模板保存发生在本函数外层，单独排除。
+    template_total_ms = max(0.0, raw_template_total_ms - frontend_mask_load_ms)
+
     accounted_ms = (
         image_read_ms
-        + frontend_mask_load_ms
         + sift_keypoint_detection_ms
         + keypoint_filter_ms
         + patch_extract_ms

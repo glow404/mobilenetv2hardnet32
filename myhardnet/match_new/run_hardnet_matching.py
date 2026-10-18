@@ -74,17 +74,15 @@ OBSOLETE_ROOT_OUTPUT_FILENAMES = (
 )
 
 # 单张模板构建总时长的完整组成。这里不包含 template_total_ms、sift_ms 等
-# 聚合/兼容字段，避免重复计算同一阶段。
+# 聚合/兼容字段，也不把前端掩码读取时间作为模板构建统计阶段。
 TEMPLATE_BUILD_STAGE_FIELDS = (
     "image_read_ms",
-    "frontend_mask_load_ms",
     "sift_keypoint_detection_ms",
     "keypoint_filter_ms",
     "patch_crop_rotate_ms",
     "hardnet_inference_ms",
     "template_assembly_ms",
     "template_pipeline_overhead_ms",
-    "template_persist_ms",
     "template_registration_overhead_ms",
 )
 

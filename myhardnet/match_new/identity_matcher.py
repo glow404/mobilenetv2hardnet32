@@ -1,8 +1,8 @@
-"""离线全量阈值评估使用的 identity 级匹配实现。
+"""离线身份级匹配实现。
 
-一个已注册手指由多张图像模板组成。本模块逐一计算查询模板与该 identity 全部
-注册模板的图像级分数，再按配置融合为 identity 级分数。所有模板均参与评分，
-以便阈值曲线和 FAR/FRR 使用完整分数。
+一个已注册手指由多张图像模板组成。本模块按 ``max`` 或
+``max_quality_tiebreak`` 规则逐一匹配注册模板，并在 query 的实际身份阈值
+达到后提前返回首个达标模板的分数。
 """
 
 from __future__ import annotations
@@ -11,11 +11,18 @@ import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from match_new.hardnet_matcher import match_templates_descriptor
 from match_new.quality_adaptation import QUALITY_RESULT_FIELDS
 from match_new.template_builder import load_image_template
+
+
+ALLOWED_FUSION_METHODS = {"max", "max_quality_tiebreak"}
+END_TO_END_EXCLUDED_MATCH_OVERHEAD_MS_FIELDS: tuple[str, ...] = (
+    "descriptor_prepare_ms",
+    "postprocess_ms",
+    "identity_match_overhead_ms",
+    "matching_wrapper_overhead_ms",
+)
 
 
 def load_template_cached(
@@ -34,38 +41,26 @@ def load_template_cached(
 
 
 def fuse_image_results(results: list[dict[str, Any]], method: str) -> float:
-    """把同一手指全部模板的图像级分数融合为 identity 级分数。
-
-    ``max`` 和 ``max_quality_tiebreak`` 取最高分；``mean`` 和 ``top3_mean``
-    分别计算全体分数均值和最高三项均值。
-    """
+    """按允许的最大值类规则融合图像级分数。"""
 
     if not results:
         return 0.0
-    scores = np.asarray([float(item.get("score", 0.0)) for item in results], dtype=np.float32)
     method = str(method).lower()
-    if method == "max":
-        return float(np.max(scores))
-    if method == "mean":
-        return float(np.mean(scores))
-    if method == "top3_mean":
-        top = np.sort(scores)[-min(3, scores.size) :]
-        return float(np.mean(top)) if top.size else 0.0
-    if method == "max_quality_tiebreak":
-        best = max(
-            results,
-            key=lambda item: (float(item.get("score", 0.0)), float(item.get("quality_score", 0.0))),
+    if method not in ALLOWED_FUSION_METHODS:
+        raise ValueError(
+            "identification.fusion_method must be max or max_quality_tiebreak; "
+            f"got {method!r}"
         )
-        return float(best.get("score", 0.0))
-    raise ValueError(f"unsupported fusion method: {method}")
-
-
-END_TO_END_EXCLUDED_MATCH_OVERHEAD_MS_FIELDS: tuple[str, ...] = (
-    "descriptor_prepare_ms",
-    "postprocess_ms",
-    "identity_match_overhead_ms",
-    "matching_wrapper_overhead_ms",
-)
+    if method == "max":
+        return max(float(item.get("score", 0.0)) for item in results)
+    best = max(
+        results,
+        key=lambda item: (
+            float(item.get("score", 0.0)),
+            float(item.get("quality_score", 0.0)),
+        ),
+    )
+    return float(best.get("score", 0.0))
 
 
 def sum_end_to_end_excluded_match_overhead_ms(row: dict[str, Any]) -> float:
@@ -83,6 +78,26 @@ def compute_end_to_end_core_ms(end_to_end_ms: float, row: dict[str, Any]) -> flo
     return max(0.0, float(end_to_end_ms) - sum_end_to_end_excluded_match_overhead_ms(row))
 
 
+def _identity_acceptance_threshold(
+    result: dict[str, Any], config: dict[str, Any]
+) -> float:
+    """读取本 query 的实际动态身份阈值。"""
+
+    value = result.get("effective_identity_acceptance_threshold")
+    if value in {"", None}:
+        value = dict(config.get("identification", {})).get(
+            "match_score_threshold",
+            0.55,
+        )
+    threshold = float(value)
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            "effective identity acceptance threshold must be in [0,1], "
+            f"got {threshold}"
+        )
+    return threshold
+
+
 def score_query_against_identity(
     query_template: dict[str, Any],
     identity: dict[str, Any],
@@ -90,12 +105,23 @@ def score_query_against_identity(
     template_cache: dict[str, dict[str, Any]],
     descriptor_source: str = "hardnet",
 ) -> dict[str, Any]:
-    """完整遍历一份查询模板与一个已注册手指的全部模板并融合分数。"""
+    """按身份融合规则匹配；max 类融合在 query 实际阈值达到时早停。"""
 
     identity_started = time.perf_counter()
     paths = [str(path) for path in identity.get("template_paths", [])]
-    method = str(dict(config.get("identification", {})).get("fusion_method", "max")).lower()
-    require = "sift" if str(descriptor_source).lower() in {"sift", "rootsift"} else "hardnet"
+    method = str(
+        dict(config.get("identification", {})).get("fusion_method", "max")
+    ).lower()
+    if method not in ALLOWED_FUSION_METHODS:
+        raise ValueError(
+            "identification.fusion_method must be max or max_quality_tiebreak; "
+            f"got {method!r}"
+        )
+    require = (
+        "sift"
+        if str(descriptor_source).lower() in {"sift", "rootsift"}
+        else "hardnet"
+    )
     low_unique_inliers = int(
         dict(config.get("texture_verification", {})).get(
             "low_unique_inliers",
@@ -136,22 +162,25 @@ def score_query_against_identity(
         results.append(result)
         for field in timing_fields:
             timing_totals[field] += float(result.get(field, 0.0))
-        if best_index < 0:
-            best_index = index
-        else:
-            best = results[best_index]
-            best_key = (float(best.get("score", 0.0)), float(best.get("quality_score", 0.0)))
-            result_key = (float(result.get("score", 0.0)), float(result.get("quality_score", 0.0)))
-            if result_key > best_key:
-                best_index = index
-    if results:
-        best_index = max(
-            range(len(results)),
-            key=lambda idx: (
-                float(results[idx].get("score", 0.0)),
-                float(results[idx].get("quality_score", 0.0)),
-            ),
+
+        result_key = (
+            float(result.get("score", 0.0)),
+            float(result.get("quality_score", 0.0)),
         )
+        best_key = (
+            float(results[best_index].get("score", 0.0)),
+            float(results[best_index].get("quality_score", 0.0)),
+        ) if best_index >= 0 else None
+        if best_key is None or result_key > best_key:
+            best_index = index
+
+        # 最大值类融合下，首个达到 query 动态阈值的模板足以确定接受结论。
+        if float(result.get("score", 0.0)) >= _identity_acceptance_threshold(
+            result, config
+        ):
+            best_index = index
+            break
+
     best = results[best_index] if best_index >= 0 else {}
     best_template = (
         load_template_cached(paths[best_index], template_cache, require=require)
@@ -159,11 +188,9 @@ def score_query_against_identity(
         else {}
     )
     fusion_started = time.perf_counter()
-    identity_score = float(fuse_image_results(results, method))
+    identity_score = fuse_image_results(results, method)
     identity_fusion_ms = (time.perf_counter() - fusion_started) * 1000.0
-    identity_match_total_ms = (
-        time.perf_counter() - identity_started
-    ) * 1000.0
+    identity_match_total_ms = (time.perf_counter() - identity_started) * 1000.0
     identity_match_overhead_ms = max(
         0.0,
         identity_match_total_ms
@@ -172,7 +199,7 @@ def score_query_against_identity(
         - identity_fusion_ms,
     )
     return {
-        "score": identity_score,
+        "score": float(identity_score),
         "descriptor_source": str(best.get("descriptor_source", descriptor_source)),
         "descriptor_kind": str(best.get("descriptor_kind", "float")),
         "descriptor_metric": str(best.get("descriptor_metric", "l2")),
@@ -185,7 +212,9 @@ def score_query_against_identity(
         "best_image_score": float(best.get("score", 0.0)),
         "best_quality_score": float(best.get("quality_score", 0.0)),
         **{field: best.get(field, "") for field in QUALITY_RESULT_FIELDS},
-        "query_frontend_mask_applied": int(bool(query_template.get("frontend_mask_applied", False))),
+        "query_frontend_mask_applied": int(
+            bool(query_template.get("frontend_mask_applied", False))
+        ),
         "num_raw_matches": int(best.get("num_raw_matches", 0)),
         "num_abs_distance_pass": int(best.get("num_abs_distance_pass", 0)),
         "num_one_way_ratio_pass": int(best.get("num_one_way_ratio_pass", 0)),
@@ -251,13 +280,9 @@ def score_query_against_identity(
         "unique_query_inliers": int(best.get("unique_query_inliers", 0)),
         "unique_gallery_inliers": int(best.get("unique_gallery_inliers", 0)),
         "inlier_ratio": float(best.get("inlier_ratio", 0.0)),
-        "mean_descriptor_distance": float(
-            best.get("mean_descriptor_distance", 0.0)
-        ),
+        "mean_descriptor_distance": float(best.get("mean_descriptor_distance", 0.0)),
         "mean_l2_distance": float(best.get("mean_l2_distance", 0.0)),
-        "mean_hamming_distance": float(
-            best.get("mean_hamming_distance", 0.0)
-        ),
+        "mean_hamming_distance": float(best.get("mean_hamming_distance", 0.0)),
         "mean_reproj_error": float(best.get("mean_reproj_error", 0.0)),
         "orientation_consistency": float(best.get("orientation_consistency", 0.0)),
         "dominant_angle_delta": float(best.get("dominant_angle_delta", 0.0)),

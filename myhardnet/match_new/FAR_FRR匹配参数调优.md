@@ -2,10 +2,7 @@
 
 面向 `match_new` 离线评估（`run_hardnet_matching.py`）。常调项优先改 `config_match_tuning.yaml`，其余在 `config_match_new.yaml`。
 
-本文回答两件事：
-
-1. 哪些参数**更可能同时压低 FAR 和 FRR**（改善区分能力）；
-2. 哪些参数**基本是此消彼长**（一个降、另一个升）。
+离线评估入口只支持 `max` 与 `max_quality_tiebreak` 两种最大值类身份融合，不提供 `mean`、`top3_mean` 或其他 fusion rule。模板达到 query 动态身份阈值后会早停，因此输出的 FAR/FRR、EER 和曲线只是决策分数统计，不是完整遍历模板的精确阈值评估。
 
 ---
 
@@ -46,7 +43,7 @@
 | `bidirectional_ratio_test`、`allow_many_to_one_before_ransac` | 抑制一对多噪声或找回被误杀的真候选 | 与 `candidate_policy`、双向开关强耦合；效果看场景 |
 | `reproj_error_weight` | 一对一去重时更偏向几何一致的点 | 影响常较小且非单调 |
 | SIFT / 关键点上限（与训练分布一致时） | 点更稳、覆盖更好，可同时减假匹配与漏匹配 | **须重建模板**；乱改会偏离训练分布，两边都可能变差 |
-| 注册模板数量与覆盖（配合合理融合） | 覆盖更多按压姿态，本人更容易命中 | 在 `fusion_method=max` 下，模板增多也可能抬非本人最高分 → FAR 有上行风险，需重标定后看工作点 |
+| 注册模板数量与覆盖（max 类融合） | 覆盖更多按压姿态，本人更容易命中 | 模板增多可能抬高非本人最高分；早停顺序也会影响延迟，需重新验证工作点 |
 
 **实践口诀**：想两边一起降，优先换模型 / 开对纹理融合 / 把候选从“更多”调到“更干净”，再用阈值曲线选工作点；不要指望只拧 `match_score_threshold`。
 
@@ -56,12 +53,13 @@
 
 固定最终分阈值时，下表方向最常见。若你改完后又沿曲线重选阈值，表中趋势仍可参考“容错变宽还是变严”。
 
-### 3.1 最终判定（纯工作点滑动）
+### 3.1 最终判定（固定阈值下的工作点）
+
+当前身份融合只支持 `max` 和 `max_quality_tiebreak`；两者都在 query 的动态身份阈值达到后提前停止。
 
 | 参数 | 拧紧时 | 放宽时 |
 | --- | --- | --- |
 | `identification.match_score_threshold` | FAR↓ FRR↑ | FAR↑ FRR↓ |
-| `identification.fusion_method`：`max` → `top3_mean` / `mean` | 通常 FAR↓ FRR↑（更保守） | 回到 `max` 通常 FRR↓、FAR 风险升 |
 
 ### 3.2 纹理与几何硬门槛（更严 → FAR↓ FRR↑）
 
@@ -109,7 +107,7 @@
 
 | 参数 | 当前常见值 | 类型 |
 | --- | ---: | --- |
-| `identification.fusion_method` | `max` | 取舍（`max` vs `top3_mean`） |
+| `identification.fusion_method` | `max` | 最大值类身份融合；达到动态阈值后早停 |
 | `enrollment.enrollment_images_per_identity` | `40` | 弱取舍 / 覆盖；须留至少 1 张 query |
 | `enrollment.selection_strategy` | `first` | `first` 取前 N 张；`stride` 等步长取样；`random` 用 `random_seed` 随机抽取 |
 | `enrollment.random_seed` | `42` | 注册选取不再随机；仍可用于 impostor 抽样等 |

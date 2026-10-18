@@ -1,9 +1,9 @@
 """HardNet 身份级离线匹配评估与失败样本导出。
 
 作用：
-    1. 每个 query 对本人 identity 的全部注册模板打分，得到 genuine attempt；
-    2. 对全部非本人 identity 的注册模板打分，得到 impostor attempts；
-    3. 按配置融合完整的图像级分数，计算 FAR、FRR、EER 和 AUC；
+    1. 每个 query 对本人和非本人 identity 按注册模板顺序匹配，达到动态阈值时早停；
+    2. 对全部配置范围内的非本人 identity 执行同样的身份决策；
+    3. 按早停决策分数计算 FAR、FRR、EER 和 AUC；
     4. 在选定阈值下导出 false reject / false accept 原图和拼接预览图。
 
 注意：
@@ -19,7 +19,7 @@ import math
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import cv2
 import matplotlib.pyplot as plt
@@ -38,6 +38,7 @@ from match_new.template_builder import load_identity_templates
 from match_new.template_library import TemplateLibraryManager
 from match_new.utils import (
     ensure_dir,
+    failure_case_directory_name,
     format_significant_digits,
     read_csv_rows,
     resolve_path,
@@ -58,6 +59,7 @@ SCORE_FIELDNAMES = [
     "label",
     "score",
     "accepted_at_selected_threshold",
+    "accepted_at_configured_threshold",
     "query_image_path",
     "query_template_path",
     "descriptor_source",
@@ -150,6 +152,12 @@ def parse_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
 
+
+def effective_identity_threshold(row: Mapping[str, Any], default: float) -> float:
+    """读取 query 实际使用的 identity 阈值，兼容旧结果行。"""
+
+    value = parse_float(row.get("effective_identity_acceptance_threshold"))
+    return float(default) if value is None else float(value)
 
 def classify_false_reject(
     row: dict[str, Any],
@@ -408,6 +416,39 @@ def rate_at_threshold(labels: np.ndarray, scores: np.ndarray, threshold: float) 
         "impostor_total": impostor_total,
     }
 
+
+def rate_at_per_row_threshold(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    thresholds: np.ndarray,
+) -> dict[str, Any]:
+    """按每个 query 的实际身份阈值计算 FAR/FRR/TAR。"""
+
+    threshold_array = np.asarray(thresholds, dtype=np.float64).reshape(-1)
+    if threshold_array.shape != scores.reshape(-1).shape:
+        raise ValueError("per-row threshold count must equal score count")
+    accepted = scores >= threshold_array
+    genuine = labels == 1
+    impostor = labels == 0
+    genuine_total = int(np.sum(genuine))
+    impostor_total = int(np.sum(impostor))
+    genuine_accept = int(np.sum(accepted & genuine))
+    impostor_accept = int(np.sum(accepted & impostor))
+    return {
+        "threshold_mode": "per_query",
+        "mean_threshold": float(np.mean(threshold_array)) if threshold_array.size else None,
+        "min_threshold": float(np.min(threshold_array)) if threshold_array.size else None,
+        "max_threshold": float(np.max(threshold_array)) if threshold_array.size else None,
+        "far": float(impostor_accept / impostor_total) if impostor_total else None,
+        "frr": float((genuine_total - genuine_accept) / genuine_total) if genuine_total else None,
+        "tar": float(genuine_accept / genuine_total) if genuine_total else None,
+        "genuine_accept": genuine_accept,
+        "genuine_reject": int(genuine_total - genuine_accept),
+        "genuine_total": genuine_total,
+        "impostor_accept": impostor_accept,
+        "impostor_reject": int(impostor_total - impostor_accept),
+        "impostor_total": impostor_total,
+    }
 
 def build_threshold_curve(labels: np.ndarray, scores: np.ndarray, config: dict[str, Any]) -> list[dict[str, Any]]:
     """在 [0,1] 连续匹配分数范围内构建阈值曲线。"""
@@ -857,15 +898,16 @@ def export_failure_cases(
     for index, row in enumerate(score_rows):
         label = int(row["label"])
         score = float(row["score"])
+        row_threshold = effective_identity_threshold(row, threshold)
         failure_type = ""
-        if label == 1 and score < threshold:
+        if label == 1 and score < row_threshold:
             failure_type = "false_reject"
-        elif label == 0 and score >= threshold:
+        elif label == 0 and score >= row_threshold:
             failure_type = "false_accept"
         if not failure_type:
             continue
         failure_stage = (
-            classify_false_reject(row, threshold, config)
+            classify_false_reject(row, row_threshold, config)
             if failure_type == "false_reject"
             else "impostor_score_above_threshold"
         )
@@ -874,7 +916,8 @@ def export_failure_cases(
                 "case_index": index,
                 "failure_type": failure_type,
                 "failure_stage": failure_stage,
-                "threshold": threshold,
+                "threshold": row_threshold,
+                "configured_threshold": threshold,
                 "score": score,
                 "query_id": row.get("query_id", ""),
                 "query_identity": row.get("query_identity", ""),
@@ -931,12 +974,9 @@ def export_failure_cases(
         type_dir = ensure_dir(root / f"{failure_type}s")
         for local_idx, item in enumerate(items[: max_cases if max_cases > 0 else None], start=1):
             score_text = format_significant_digits(float(item["score"]))
-            case_id = (
-                f"{failure_type}_{local_idx:05d}"
-                f"__score_{safe_id(score_text)}"
-                f"__q_{safe_id(item['query_id'])}"
-                f"__owner_{safe_id(item['owner_identity'])}"
-            )
+            # 失败案例的完整信息会写入 case.json 和 CSV；目录名保持很短，
+            # 避免 Windows 传统 MAX_PATH 限制导致复制文件失败。
+            case_id = failure_case_directory_name(local_idx)
             case_dir = ensure_dir(type_dir / case_id)
             query_src = item["query_image_path"]
             template_src = item["best_template_image_path"]
@@ -1132,8 +1172,8 @@ def write_unlock_timing_report(score_rows: list[dict[str, str]], output_dir: str
     (Path(out) / "unlock_timing.csv").unlink(missing_ok=True)
     summary = {
         "definition": {
-            "timing_scope": "只统计在 selected threshold 下成功接受的本人解锁记录。",
-            "unlock_match_ms": "查询模板已存在时，与一个手指的注册模板集合完成匹配的时间。",
+            "timing_scope": "只统计按 query 实际 identity 阈值成功接受的本人解锁记录。",
+            "unlock_match_ms": "查询模板已存在时，与一个手指的注册模板集合完成匹配的时间；接受状态使用 effective_identity_acceptance_threshold。",
             "unlock_end_to_end_ms": "query_template_build_ms + unlock_match_ms；不包含模型/SIFT初始化和传感器采集。",
             "unlock_end_to_end_core_ms": (
                 "unlock_end_to_end_ms 扣除 descriptor_prepare_ms、postprocess_ms、"
@@ -1165,19 +1205,13 @@ def run_descriptor_l2_evaluation(
     max_impostor_identities_per_query: int = -1,
     export_failures: bool = True,
 ) -> dict[str, Any]:
-    """执行完整 identity 级 descriptor 验证评估。
+    """执行 identity 级 descriptor 验证评估。
 
     距离算法由 matching.distance 与模板契约共同约束，可为 L2 或 Hamming。
-    输入是已经固定好的 split metadata、identity_templates_20.json 和 image_templates。
-    本函数不再重新构建模板，只负责：
-        1. 遍历 query；
-        2. 生成 genuine/impostor attempts；
-        3. 写 verification_scores.csv；
-        4. 计算阈值曲线和指标；
-        5. 导出配置阈值下的失败样本。
-
-    ``max_impostor_identities_per_query``：
-        ``-1`` 全量非本人；``0`` 不比对非本人；``>0`` 每个 query 最多抽这么多个非本人身份。
+    每个 identity 仅使用 max 类融合；模板分数达到当前 query 的动态身份阈值后
+    提前结束，未达到时遍历全部注册模板。函数仍生成原有 CSV、JSON、曲线和失败
+    样本输出，但这些分数是早停决策分数，不保证等于完整模板最大分数；
+    metrics.json 标记为 early_stop_query_pool_evaluation。
     """
 
     out = ensure_dir(output_dir)
@@ -1196,7 +1230,12 @@ def run_descriptor_l2_evaluation(
         raise ValueError(
             f"identification.match_score_threshold must be in [0,1], got {configured_threshold}"
         )
-    fusion_method = str(identification_cfg.get("fusion_method", "max"))
+    fusion_method = str(identification_cfg.get("fusion_method", "max")).lower()
+    if fusion_method not in {"max", "max_quality_tiebreak"}:
+        raise ValueError(
+            "identification.fusion_method must be max or max_quality_tiebreak; "
+            f"got {fusion_method!r}"
+        )
     management_cfg = dict(config.get("template_management", {}))
     scoring_config = copy.deepcopy(config)
     rng = np.random.default_rng(int(dict(config.get("enrollment", {})).get("random_seed", 42)))
@@ -1315,6 +1354,11 @@ def run_descriptor_l2_evaluation(
             for identity, result, is_genuine, attempt_ms in attempts:
                 owner = str(identity["identity_id"])
                 score = float(result["score"])
+                effective_threshold = effective_identity_threshold(
+                    result, configured_threshold
+                )
+                configured_accept = int(score >= configured_threshold)
+                effective_accept = int(score >= effective_threshold)
                 query_build_ms = parse_float(row.get("template_build_ms"))
                 unlock_end_to_end_ms = (
                     query_build_ms + attempt_ms
@@ -1332,7 +1376,8 @@ def run_descriptor_l2_evaluation(
                     "owner_identity": owner,
                     "label": int(is_genuine),
                     "score": score,
-                    "accepted_at_selected_threshold": int(score >= configured_threshold),
+                    "accepted_at_selected_threshold": effective_accept,
+                    "accepted_at_configured_threshold": configured_accept,
                     "query_image_path": str(query_template.get("image_path", row.get("image_path", ""))),
                     "query_template_path": str(query_template_path),
                     **{
@@ -1380,10 +1425,25 @@ def run_descriptor_l2_evaluation(
     metrics["configured_threshold"] = configured_threshold
     metrics["selected_threshold"] = selected_threshold
     metrics["fixed_threshold"] = rate_at_threshold(labels, scores, selected_threshold)
+    effective_thresholds = np.asarray(
+        [
+            effective_identity_threshold(row, configured_threshold)
+            for row in score_rows
+        ],
+        dtype=np.float64,
+    )
+    metrics["effective_identity_threshold"] = rate_at_per_row_threshold(
+        labels,
+        scores,
+        effective_thresholds,
+    )
 
     for row in score_rows:
         score = float(row["score"])
-        row["accepted_at_selected_threshold"] = int(score >= selected_threshold)
+        row["accepted_at_configured_threshold"] = int(score >= selected_threshold)
+        row["accepted_at_selected_threshold"] = int(
+            score >= effective_identity_threshold(row, selected_threshold)
+        )
     write_csv_rows(out / "verification_scores.csv", score_rows)
     unlock_timing = write_unlock_timing_report(score_rows, out)
     failure_summary = (
@@ -1422,8 +1482,8 @@ def run_descriptor_l2_evaluation(
             "num_genuine_attempts": int(np.sum(labels == 1)),
             "num_impostor_attempts": int(np.sum(labels == 0)),
             "fusion_method": fusion_method,
-            "scoring_mode": "full_query_pool_evaluation",
-            "offline_full_template_scoring": True,
+            "scoring_mode": "early_stop_query_pool_evaluation",
+            "offline_full_template_scoring": False,
             "max_impostor_identities_per_query": max_impostors,
             "matching_config": dict(scoring_config.get("matching", {})),
             "texture_verification_config": dict(scoring_config.get("texture_verification", {})),

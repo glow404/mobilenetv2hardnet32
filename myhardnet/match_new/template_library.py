@@ -222,11 +222,22 @@ class TemplateLibraryManager:
         identity_id = str(identity.get("identity_id", ""))
         entries = self.ordered_entries(identity_id)
         score = float(match_result.get("score", 0.0))
-        learning_threshold = self._match_threshold(full_config)
+        learning_threshold = float(
+            match_result.get(
+                "effective_identity_acceptance_threshold",
+                self._match_threshold(full_config),
+            )
+        )
+        if not 0.0 <= learning_threshold <= 1.0:
+            raise ValueError(
+                "effective identity acceptance threshold must be in [0,1], "
+                f"got {learning_threshold}"
+            )
         event: dict[str, Any] = {
             "identity_id": identity_id,
             "query_image_id": str(query_template.get("image_id", "")),
             "accepted": bool(score >= learning_threshold),
+            "acceptance_threshold": learning_threshold,
             "matched_template_path": str(match_result.get("best_template_path", "")),
             "match_score": score,
             "learned": False,

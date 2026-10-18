@@ -32,13 +32,15 @@ quality_adaptation:
   normal_quality_min: 60.0
   low_quality_below: 40.0  # 仅用于日志中的 medium / low 分档。
   quality_floor: 20.0
-  # 当前 L2: 0.85 -> 0.89；Hamming: 0.90 -> 0.94，绝对距离上限保持不变。
+  # 当前仅自适应描述子匹配参数和最终身份接受阈值：ratio、绝对距离、identity threshold。
+  # Q<=20 时，ratio 增量和身份阈值下降量达到上限，绝对距离阈值最多放大 10%。
   ratio_threshold_increment: 0.04
   ratio_threshold_cap: 0.97
-  # 当前 RANSAC 容差 0.5 -> 1.0 原图像素；迭代 3000 -> 5000。
-  ransac_reproj_multiplier_max: 2.0
-  ransac_max_iters_increment: 1000
-  # 接受阈值、尺度范围、最少内点数、纹理权重均不随质量改变。
+  abs_distance_threshold_multiplier_max: 1.10
+  # 基础身份阈值 0.80；Q<=20 时按 strength 最多下降 0.05，不能低于 0.70。
+  identity_threshold_decrement: 0.05
+  identity_threshold_floor: 0.70
+  # RANSAC 重投影容差和最大迭代次数暂时固定，始终使用 matching 基础配置。
 
 model:
   checkpoint: ../outputs/models/3/m0/m0_256_v2/best.pt

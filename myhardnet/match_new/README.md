@@ -16,8 +16,7 @@ conda activate hardnet-cuda
 
 当前常调配置已经连接 `data/output_v8/04_denoise` 的最终图像、`05_mask` 的
 指纹前景掩码和 `06_quality/fingerprint_quality_results.csv` 的质量分数。
-注册/查询模板只提取前景关键点；低质量查询按 0–100 分连续调整 ratio 与
-RANSAC 容差/迭代次数，最终身份接受阈值保持不变。首次接入必须重建模板。
+注册/查询模板只提取前景关键点；低质量查询按 0–100 分连续调整描述子匹配的绝对距离阈值、ratio 和最终身份接受阈值。RANSAC 重投影容差、最大迭代次数、最少唯一内点数以及纹理参数暂时保持基础配置不变。首次接入必须重建模板。
 经验初值、后续搜索范围、关闭对照及复用条件详见
 [前后端联动与质量自适应](FRONTEND_INTEGRATION.md)。
 
@@ -25,7 +24,7 @@ RANSAC 容差/迭代次数，最终身份接受阈值保持不变。首次接入
 
 ## 1. `run_hardnet_matching.py`
 
-**作用**：HardNet 全量离线阈值标定实验。只检测 SIFT 关键点位置/方向，计算 HardNet 描述子并匹配；支持 float32/L2 与 packed binary/Hamming 两种 checkpoint 契约，后续候选生成、RANSAC、纹理融合和 identity 级评估共用。所有未注册 query 都会遍历本人和全部非本人 identity 的全部注册模板，不再拆分 validation/test；阈值曲线和最终 FAR/FRR 均基于同一份全量匹配结果。
+**作用**：HardNet 离线身份匹配评估。对本人和非本人身份按注册模板顺序匹配；只支持 `max` 与 `max_quality_tiebreak` 两种最大值类融合，并在当前 query 的动态身份阈值达到后提前停止。其余 CSV、JSON、阈值曲线和失败样本仍照常输出，但早停后的分数并非所有注册模板的完整最高分；相关 FAR/FRR、EER、AUC 和曲线不等价于完整模板遍历标定结果。
 
 **运行参数**默认写在 `match_new/config_match_new.yaml`：
 
@@ -85,9 +84,7 @@ python match_new\run_hardnet_matching.py `
     failure_cases/
 ```
 
-`template_build_timings.csv` 只有一行，统计全部成功模板在读图、SIFT 检测、
-关键点过滤、patch 裁切旋转、HardNet 推理、模板组装和保存等阶段的平均耗时，
-不再输出逐图耗时；使用 `--skip-template-build` 时本次没有模板构建计时，因此
+模板保存耗时 `template_persist_ms` 仍保留在逐条内部记录中，但不计入 `template_build_timings.csv` 的平均模板构建阶段；前端掩码读取耗时 `frontend_mask_load_ms` 同样不计入平均模板构建阶段。不再输出逐图耗时；使用 `--skip-template-build` 时本次没有模板构建计时，因此
 不生成该文件。`metrics.json` 保存全量匹配生成的 FAR/FRR、EER 和 AUC 等评估汇总。
 `far_frr_vs_threshold.png` 标出 EER 及配置阈值对应的 FAR/FRR。
 
@@ -223,11 +220,11 @@ python match_new\run_hardnet_matching.py `
 `--hamming-ratio-threshold`。切换 checkpoint 或 Hadamard 开关会改变描述子契约，
 必须重新构建模板，不能同时使用 `--skip-template-build`；只修改 ratio 阈值时可以复用模板。
 
-**离线全量匹配与阈值评估**：
+**正式运行与评估**：当前只保留一个离线评估入口，身份级匹配采用上述早停；所有原有 CSV、JSON、阈值曲线、耗时和失败样本文件照常生成。由于早停返回首个达标模板分数，本次输出不代表完整模板最大分数的 FAR/FRR 标定。
 
-每个 query 都会对本人 identity 和配置范围内的非本人 identity 遍历全部注册模板，使用完整的 identity 分数计算 FAR/FRR、阈值曲线、EER 和 AUC。正式 FAR 评估应将 `runtime.max_impostor_identities_per_query` 设为 `-1`。`identification.match_score_threshold` 只用于选择并报告工作点，不会截断模板遍历。
+**离线评估说明**：每个 query 的本人和非本人身份匹配都会在某个注册模板分数达到该 query 的 `effective_identity_acceptance_threshold` 后提前停止；若未达到阈值，则继续遍历剩余模板。早停时返回首个达标模板分数；未早停时返回已计算模板中的最高分。所有原有输出文件仍照常生成，并标记为 `early_stop_query_pool_evaluation`；这些分数不代表完整遍历模板的最大分数。
 
-`verification_scores.csv` 中，`num_templates` 表示该 identity 注册模板总数；`metrics.json` 中 `scoring_mode` 为 `full_query_pool_evaluation`，表示使用全量 query 分数评估。
+`verification_scores.csv` 中，`num_templates` 表示该 identity 注册模板总数；`accepted_at_selected_threshold` 表示按 query 实际动态阈值的判定，`accepted_at_configured_threshold` 表示按固定基础阈值的对照判定。`metrics.json` 同时记录固定阈值和动态阈值结果。
 
 ## 2. 离线评估参数参考
 
@@ -235,8 +232,8 @@ python match_new\run_hardnet_matching.py `
 
 | 配置项 | 作用 |
 |--------|------|
-| `fusion_method` | `max`、`mean`、`top3_mean` 或 `max_quality_tiebreak` |
-| `match_score_threshold` | `[0,1]` 连续分数阈值，用于报告选定工作点的 FAR/FRR |
+| `fusion_method` | 仅支持 `max` 或 `max_quality_tiebreak`；两种规则都可在动态阈值达成时早停 |
+| `match_score_threshold` | `[0,1]` 基础身份分数阈值；高质量 query 使用该值，低质量 query 可按 `quality_adaptation` 下调 |
 
 
 ### 模型与特征参数（`model.*` / `sift.*` / `patch.*`）
@@ -362,9 +359,9 @@ identification:
   match_score_threshold: 0.55
 ```
 
-`unique_inliers` 继续作为诊断字段输出，但不再直接充当 `score` 或匹配阈值。离线评估会直接使用全部 query 的 identity 级分数扫描 FAR/FRR，并在 `identification.match_score_threshold` 下报告最终结果。`verification_scores.csv` 会额外输出 `geometry_similarity`、`texture_similarity`、有效重叠比例、有效块数和实际融合权重。
+`unique_inliers` 继续作为诊断字段输出，但不再直接充当 `score` 或匹配阈值。当前离线评估按身份动态阈值做决策：达到 query 的实际阈值后返回首个达标模板分数，否则返回全部模板中已计算结果的最大分数。输出文件仍照常生成；由于早停分数不是始终完整遍历得到的最大分数，`match_score_threshold_curve.csv`、EER 和 FAR/FRR 结果只能作为本次决策分数的统计，不能解释为完整模板遍历的精确阈值曲线。`verification_scores.csv` 会额外输出 `effective_identity_acceptance_threshold`、`geometry_similarity`、`texture_similarity`、有效重叠比例、有效块数和实际融合权重。
 
-FAR/FRR 阈值曲线写入 `match_score_threshold_curve.csv`。默认按 `0.01` 在 `[0,1]` 范围扫描，不再生成整数内点阈值曲线。
+FAR/FRR 阈值曲线仍写入 `match_score_threshold_curve.csv`，表示基于本次早停决策分数的固定全局阈值扫描；`metrics.json` 的 `effective_identity_threshold` 记录按 query 动态阈值直接判定的结果。默认按 `0.01` 在 `[0,1]` 范围扫描，不再生成整数内点阈值曲线。
 
 固定阈值区间的 FAR/FRR 对照表由 `evaluation.far_frr_table` 控制，默认
 `0.50--0.85`（步长 `0.01`），写入 `far_frr_thresholds_0.50_0.85.csv`。此外，
@@ -412,7 +409,7 @@ template_management:
 
 ```text
 1. 使用当前活动模板库完成本人匹配
-2. 本人分数达到 match_score_threshold 后，检查模板学习条件
+2. 本人分数达到 query 对应的 `effective_identity_acceptance_threshold` 后，检查模板学习条件
 3. 满足 learn_score_threshold 且公共纹理区域率 <= max_common_area_ratio 时加入模板库
 4. 学习结果写回 identity_templates_40.json，仅影响后续 query
 5. 使用更新后的模板库执行非本人匹配
@@ -564,3 +561,4 @@ match_new/hardnet_inlier_visuals/
 | `overlap_and.png` | 两张图二值化后重叠区域的 AND |
 | `overlap_xor.png` | 两张图二值化后差异区域的 XOR |
 | `match_result.json` | 匹配指标、affine matrix、输出路径和 debug 计数 |
+ matrix、输出路径和 debug 计数 |

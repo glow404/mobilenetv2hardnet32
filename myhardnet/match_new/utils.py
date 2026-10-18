@@ -227,6 +227,12 @@ def safe_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
 
 
+def failure_case_directory_name(index: int) -> str:
+    """生成短失败案例目录名，避免 Windows 长路径限制。"""
+
+    return f"{index:05d}"
+
+
 def template_filename(identity_id: str, image_id: str) -> str:
     """生成单张图像模板 `.npz` 文件名。"""
 

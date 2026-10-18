@@ -70,9 +70,18 @@ frontend:
 
 ## 3. 当前质量自适应规则
 
-自适应只读取 **查询图像** 的前端质量，与被比较的注册模板质量、身份和是否
+自适应只读取 **查询图像** 的前端质量，与被比较的注册模板、身份和是否
 本人无关。同一个 query 与所有本人、非本人模板使用相同参数，不能依据匹配
 结果或真实身份再选择宽松参数。
+
+当前版本只根据质量调整三项参数：
+
+1. **ratio 阈值**：允许保留更多较弱的最近邻候选；
+2. **绝对距离阈值**：允许更大的描述子距离通过候选阶段；
+3. **最终身份接受阈值**：低质量 query 可使用较低的 identity 分数阈值。
+
+RANSAC 重投影容差和最大迭代次数在当前版本暂时不做质量自适应，始终沿用
+`matching` 中的基础配置。最少唯一内点数、纹理参数以及其它几何门槛也不变。
 
 ```yaml
 quality_adaptation:
@@ -82,8 +91,9 @@ quality_adaptation:
   quality_floor: 20.0
   ratio_threshold_increment: 0.04
   ratio_threshold_cap: 0.97
-  ransac_reproj_multiplier_max: 2.0
-  ransac_max_iters_increment: 2000
+  abs_distance_threshold_multiplier_max: 1.10
+  identity_threshold_decrement: 0.05
+  identity_threshold_floor: 0.70
 ```
 
 质量分档用于结果日志：
@@ -102,50 +112,53 @@ ratio(Q) = max(base_ratio,
                min(ratio_threshold_cap,
                    base_ratio + ratio_threshold_increment * s))
 
-ransac_reproj_threshold(Q)
-    = base_reproj_threshold * (1 + (ransac_reproj_multiplier_max - 1) * s)
+abs_distance_threshold(Q)
+    = base_abs_distance_threshold
+      * (1 + (abs_distance_threshold_multiplier_max - 1) * s)
 
-ransac_max_iters(Q)
-    = base_max_iters + round(ransac_max_iters_increment * s)
+identity_threshold(Q)
+    = max(identity_threshold_floor,
+          base_identity_threshold - identity_threshold_decrement * s)
 ```
 
 关闭自适应或无有效分数时，`s=0`。`low_quality_below` 只改变日志分档，不改变
 上述插值公式。程序要求 `0 <= quality_floor < low_quality_below < normal_quality_min <= 100`。
-基础 ratio 如果已经高于 cap，则保持原值，不因为“放宽”反而收紧。
+基础 ratio 如果已经高于 cap，则保持原值，不因为“放宽”反而收紧。绝对距离阈值的
+放大倍率由 `abs_distance_threshold_multiplier_max` 控制，当前最多放大 10%。身份阈值由
+`identity_threshold_decrement` 和 `identity_threshold_floor` 控制，当前基础阈值 `0.80`
+在 Q<=20 时最低降至 `0.75`。最终实际阈值会写入
+`effective_identity_acceptance_threshold`，用于该 query 的接受/拒绝判定。
+RANSAC 的基础 `ransac_reproj_threshold` 和 `ransac_max_iters` 在所有质量段保持不变。
 
 按当前基础参数，典型工作点为：
 
-- `Q >= 60`：L2 ratio `0.85`，Hamming ratio `0.90`；RANSAC 重投影阈值
-  `0.50` 像素，最大迭代 `3000`。
-- `Q = 50`：L2 ratio `0.86`，Hamming ratio `0.91`；重投影阈值 `0.625` 像素，
-  最大迭代 `3500`。
-- `Q = 40`：L2 ratio `0.87`，Hamming ratio `0.92`；重投影阈值 `0.75` 像素，
-  最大迭代 `4000`。
-- `Q = 30`：L2 ratio `0.88`，Hamming ratio `0.93`；重投影阈值 `0.875` 像素，
-  最大迭代 `4500`。
-- `Q <= 20`：L2 ratio `0.89`，Hamming ratio `0.94`；重投影阈值 `1.00` 像素，
-  最大迭代 `5000`。
+- `Q >= 60`：L2 ratio `0.85`、绝对距离 `1.50`；Hamming ratio `0.90`、绝对距离 `0.50`；身份阈值 `0.80`。
+- `Q = 50`：L2 ratio `0.86`、绝对距离约 `1.5375`；Hamming ratio `0.91`、绝对距离约 `0.5125`；身份阈值约 `0.7875`。
+- `Q = 40`：L2 ratio `0.87`、绝对距离约 `1.575`；Hamming ratio `0.92`、绝对距离约 `0.525`；身份阈值约 `0.775`。
+- `Q = 30`：L2 ratio `0.88`、绝对距离约 `1.6125`；Hamming ratio `0.93`、绝对距离约 `0.5375`；身份阈值约 `0.7625`。
+- `Q <= 20`：L2 ratio `0.89`、绝对距离 `1.65`；Hamming ratio `0.94`、绝对距离 `0.55`；身份阈值 `0.75`。
 
 Lowe ratio 是最近邻距离与次近邻距离的比例测试，阈值略大可以保留更多较弱的
-真实对应点。RANSAC 是从候选点中估计几何变换并排除不一致匹配的算法；适当
-提高重投影容差，可容纳低质量图像的关键点定位误差，提高迭代次数则增加寻找
-正确变换的机会，但不保证一定运行到最大次数。
-
-当前选择在 100×110 原图上最多放宽到 1 像素，而不是直接使用 3–5 像素的大
-容差。更换图像分辨率后，需要重新确认这个以原图像素为单位的范围。
+真实对应点。绝对距离阈值限制候选描述子与最近邻之间的最大距离；适当放宽它可以
+保留距离稍大的候选，但也可能增加后续 RANSAC、内点处理和纹理验证的耗时与 FAR。
 
 ### 保持不变的参数
 
-- 最终身份接受阈值 `identification.match_score_threshold=0.80`。
-- L2 绝对距离上限 `1.50`、归一化 Hamming 距离上限 `0.50`。
+- RANSAC 重投影阈值 `0.50` 像素和最大迭代次数 `3000`。
+- 最少唯一内点 `3`、几何分数饱和内点数 `12`。
 - 候选策略 `ratio_only`、每点近邻数及 RANSAC 候选数量上限。
 - 尺度范围 `0.80–1.20` 与 RANSAC 后一对一内点去重。
-- 最少唯一内点 `3`、几何分数饱和内点数 `12`。
 - 几何/纹理权重 `0.70/0.30`、纹理区域和有效块门槛。
 - SIFT 检测参数、注册图像选择策略以及模板学习准入阈值。
 
-初期只放宽“能否形成候选和通过几何验证”，避免同时降低最终接受标准或使
-少量内点自动得到很高分。保持这些门槛不变仍不保证 FAR 不变，需要重评估。
+当前只放宽描述子候选阶段的 ratio 和绝对距离条件，并对低质量 query 降低最终身份接受阈值；几何验证和纹理参数保持不变。仍需同时用 genuine/impostor 数据重评估 FAR/FRR。
+### 身份融合与早停
+
+身份融合仅支持 `max` 与 `max_quality_tiebreak` 两种最大值类规则。每个 query 匹配某个身份时，比较注册模板的图像级分数；首次达到该 query 的 `effective_identity_acceptance_threshold` 即提前返回该模板分数。未达到阈值时才遍历完该身份的注册模板，并返回已计算模板中的最高分。不会计算 `mean` 或 `top3_mean`。
+
+模板顺序影响达到阈值前实际计算的模板数和返回的首个达标模板，但不改变 max 类规则下“是否达到阈值”的判断。模板学习仍使用该早停结果，不会额外强制完整遍历。
+
+输出中的 `match_score_threshold_curve.csv`、FAR/FRR、EER 和 AUC 文件仍照常生成，但基于可能早停的身份分数；不能把它们视为完整遍历全部注册模板最大分数的离线标定结果。
 
 ## 4. 怎么运行和检查结果
 
@@ -208,16 +221,18 @@ python myhardnet\match_new\run_hardnet_matching.py `
 - `eval_hardnet_<metric>/verification_scores.csv`：每次本人/非本人尝试的
   `query_frontend_quality_score`、`query_quality_band`、`quality_adaptation_applied`、
   `quality_relaxation_strength`、`effective_ratio_threshold`、
-  `effective_abs_distance_threshold`、`effective_ransac_reproj_threshold`、
-  `effective_ransac_max_iters` 和 `query_frontend_mask_applied`。
+  `effective_abs_distance_threshold`、`effective_identity_acceptance_threshold`、
+  `effective_ransac_reproj_threshold`、`effective_ransac_max_iters` 和
+  `query_frontend_mask_applied`。
+  其中两个 `effective_ransac_*` 字段保留用于兼容和核对，当前应始终等于基础配置，
+  不随 query 质量变化；质量分数当前会改变 ratio、绝对距离阈值和最终身份接受阈值。
 - `effective_config.yaml` 和 `metrics.json` 的 `effective_config`：保存基础配置、
   前端绝对路径及自适应规则。这里保留基础参数，每个 query 的实际参数以
   `verification_scores.csv` 为准。
 
 ### 模板复用
 
-只修改质量分档阈值、自适应增量、ratio、RANSAC 或质量 CSV 的分数，且原图、
-掩码、模型、patch 和 SIFT 均不变时，可以使用 `--skip-template-build`。
+只修改质量分档阈值、ratio、绝对距离放大倍率、身份阈值下降量/下限或质量 CSV 的分数，且原图、掩码、模型、patch 和 SIFT 均不变时，可以使用 `--skip-template-build`。
 评估会用本次 CSV 的分数覆盖模板保存的历史质量，不必重新运行 HardNet。
 
 开启/关闭掩码过滤、更换输入图像目录、掩码内容变化或二值化结果变化后，需要
@@ -240,18 +255,18 @@ python myhardnet\match_new\run_hardnet_matching.py `
 - `quality_floor`：15–30；改变从多少分开始停止继续放宽。
 - `low_quality_below`：35–45；只改变 medium/low 统计分档。
 - `ratio_threshold_increment`：0.02–0.06；上限保持 0.95–0.97 左右。
-- `ransac_reproj_multiplier_max`：1.5–2.5；当前基础 0.5 像素对应最终
-  0.75–1.25 像素，先避免大幅增加。
-- `ransac_max_iters_increment`：1000–3000；按精度和耗时一起选择。
+- `abs_distance_threshold_multiplier_max`：1.00–1.15；先控制绝对距离阈值的最大放宽比例。
 
+RANSAC 参数暂时不随质量调整，因此只使用基础配置中的 `ransac_reproj_threshold`
+和 `ransac_max_iters`。
 调参顺序：
 
 1. 固定相同图像、注册划分、模型和掩码，先跑“仅掩码”和“掩码+当前自适应”
    两份结果，分别统计全体和各质量段的 FAR/FRR。
-2. 在固定质量阈值下先调 ratio 增量，再调几何容差，最后调迭代上限；每次只
-   改一项，检查低质量本人是否得到更多正确唯一内点。
-3. 如果低质量 FRR 有下降但 FAR 上升，先收紧 ratio 增量或 RANSAC 容差；
-   保持身份接受阈值和最少内点门槛，不同时放宽全部条件。
+2. 在固定质量阈值下先调 ratio 增量，再调绝对距离放大倍率，最后调身份阈值下降量；
+   每次只改一项，检查低质量本人是否得到更多可靠候选和唯一内点。
+3. 如果低质量 FRR 有下降但 FAR 上升，先收紧 ratio 增量、绝对距离放大倍率或身份阈值下降量；
+   保持 `identity_threshold_floor`，以及几何验证和纹理参数不变。
 4. 如果主要损失发生在 RANSAC 前，检查 `num_ratio_pass`、`num_candidates`；
    如果主要损失发生在几何/纹理验证，检查 `unique_inliers`、`texture_decision`、
    `texture_valid_blocks`，避免盲目提高迭代次数。
@@ -260,7 +275,7 @@ python myhardnet\match_new\run_hardnet_matching.py `
    `max_impostor_identities_per_query=-1`，不能把小规模流程测试当作精度结论。
 
 极低质量、几乎没有前景或持续无法形成可靠几何证据的查询，更适合重新采集，
-而不是无限提高 ratio 或降低接受阈值。当前代码对质量 Q<=20 仅采用有界放宽，
+而不是无限放宽 ratio、绝对距离或继续降低身份接受阈值。当前对质量 Q<=20 采用有界放宽，
 尚未加入硬性质量拒绝或自动重采集。
 
 ### 测试结果
@@ -274,8 +289,9 @@ python myhardnet\match_new\run_hardnet_matching.py `
 - 两个手指、84 张图像用实际 checkpoint 和 ONNX Runtime 完成建模与匹配，
   共 4 个查询、8 次本人/非本人身份尝试；重用模板的流程也通过校验。
   结果位于 `myhardnet/outputs/frontend_v8/frontend_integration_smoke_20261010/`。
-- 实际低质量查询 `dhy_L3/pair_95.bmp` 的 Q=20.9627，应用 Hamming ratio
-  0.9390373、重投影阈值 0.98796625 像素、最大迭代 4952，符合连续插值规则。
+- 实际低质量查询 `dhy_L3/pair_95.bmp` 的历史记录曾使用 Hamming ratio
+  0.9390373、重投影阈值 0.98796625 像素、最大迭代 4952；这是旧版同时自适应
+  RANSAC 参数时的结果。当前版本只调整 ratio 和绝对距离阈值，RANSAC 使用基础配置。
 - 本次前端接入、身份匹配和推理回归的 53 项相关测试通过；测试脚本已按约定在验证后删除。
 
 以上属于关联和功能验证，尚未完成全量精度对照，不能据此推断 FAR/FRR 有所改善。

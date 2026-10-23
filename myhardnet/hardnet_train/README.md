@@ -5,7 +5,7 @@
 
 ## 文件说明
 
-- `model.py`：保留原 HardNet、MobileHardNet 与 HardNet Strong V2，统一接收 `[B, 1, 32, 32]` patch。
+- `model.py`：保留原 HardNet 与 MobileHardNet，统一接收 `[B, 1, 32, 32]` patch。
 - `model_report.py`：实际执行一次前向，生成逐层输入/输出、作用、参数量与 MACs/FLOPs 表。
 - `loss.py`：top-k hardest-in-batch triplet margin loss、top-1 加权和正样本 p95/p99 尾部约束。
 - `data.py`：CSV 数据集、轻量在线增强、坐标契约、PIL patch 读取、union-find 物理点分组和训练 batch sampler。
@@ -16,15 +16,15 @@
 - `binary_loss.py`：二值排序、teacher 关系保持、正样本一致性、量化、bit balance 和去相关组合损失。
 - `binary_validation.py`：固定验证计划上的归一化 Hamming 距离和 bit 分布指标。
 - `train_binary.py`：二值网络训练、续训、验证和 checkpoint 入口。
-- `config_binary_256.yaml`：带逐项注释的 256-bit 二值网络正式训练配置。
+- `config_binary_256.yaml`：带逐项注释的 MobileHardNet 256 维浮点特征 / 512-bit 二值网络正式训练配置。
 - `optim.py`：SGD/AdamW 工厂与 decay/no-decay 参数分组。
 - `train.py`：训练主入口，负责配置解析、训练、固定验证、checkpoint 和 metrics 输出。
-- `config.yaml`：浮点描述子的正式训练配置，默认训练 Strong V2。
+- `config.yaml`：浮点描述子的正式训练配置，默认训练 256 维 MobileHardNet。
 - `smoke_config.yaml`：快速自检配置，只跑极少 step。
 
 ## 输出文件
 
-训练结果默认写入 `../outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3/`：
+训练结果默认写入 `../outputs/models/hardnet_train_mobile_256_fixed_candidate_pool_v3/`：
 
 - `best.pt`：固定候选池协议上 `matching_composite_v1` 四项综合分数最高的 checkpoint；综合全部验证候选，不拆分同指/跨指分项。
 - `last.pt`：最后一个 epoch 的 checkpoint。
@@ -64,15 +64,15 @@ MACs，因此该统计适合做模型间统一比较，但不代表设备上的�
 
 ## 网络架构切换
 
-`config.yaml` 使用 `descriptor_dim: auto` 和 `output_dir: auto`，会按架构选择兼容维度及独立输出目录：
+`config.yaml` 默认使用 `mobile_hardnet`、`descriptor_dim: 256` 和 `output_dir: auto`。
+若把 `descriptor_dim` 改为 `auto`，两种保留架构都使用 128 维，并选择对应的独立输出目录：
 
 | `model.architecture` | 自动维度 | 自动输出目录 | 网络状态 |
 | --- | ---: | --- | --- |
-| `hardnet_strong_v2` | 256 | `outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3` | 默认高精度主干 |
-| `mobile_hardnet` | 128 | `outputs/models/hardnet_train_mobile_128_fixed_candidate_pool_v3` | 带 Coordinate Attention 的轻量主干 |
+| `mobile_hardnet` | 128 | `outputs/models/hardnet_train_mobile_128_fixed_candidate_pool_v3` | 默认轻量主干，带 Coordinate Attention |
 | `hardnet` | 128 | `outputs/models/hardnet_train_hardnet_128_fixed_candidate_pool_v3` | 论文版 HardNet 主干 |
 
-三种架构都支持把 `model.descriptor_dim` 设置为任意正整数；表中只是 `auto` 的
+两种架构都支持把 `model.descriptor_dim` 设置为任意正整数；表中只是 `auto` 的
 默认值。自定义维度只改变各模型的描述子输出投影和末端归一化层，不改变前面的
 特征提取主干。`output_dir: auto` 会把实际维度写进目录名，避免不同维度的
 checkpoint 混放。原 HardNet 配置为 128 时仍与旧版本保持 checkpoint 兼容。
@@ -82,19 +82,7 @@ Coordinate Attention，通过横、纵两个方向的池化保留位置敏感的
 架构标识仍为 `mobile_hardnet`，但结构已经更新，旧 MobileHardNet checkpoint
 不再兼容，必须重新训练；原 HardNet checkpoint 兼容性不受影响。
 
-当前 Strong V2 是针对 32×32 patch 收缩后的轻量高精度版本：Stem 只保留
-3×3 局部纹理和局部对比度两条分支；三个 stage 使用 32/64/128 通道及
-1/2/2 个普通残差块。逐块 SE 已移除，包含下采样块在内的 7 个残差块按照深度
-把 Stochastic Depth 从 0 线性增加到 `model.drop_path_rate`。原四分支上下文被
-单路扩张 depthwise ContextMixer 替代；8×8 特征通过 depthwise 8×8 空间投影和
-GeM 全局投影得到两个同维描述子，分别 L2 单位化后由一个可学习标量融合。
-
-Strong V2 的架构标识仍为 `hardnet_strong_v2`，但参数形状已经改变，旧 Strong V2
-checkpoint 不兼容。必须使用新的输出目录从头训练，并在浮点训练完成后把二值配置
-的 `backbone.checkpoint` 更新到新生成的 `best.pt`。
-
-因此，只把下面一行改为 `mobile_hardnet`，即可使用当前带 Coordinate Attention
-的 MobileHardNet 网络训练：
+例如，使用下面的配置可训练 128 维 MobileHardNet：
 
 ```yaml
 model:
@@ -102,11 +90,11 @@ model:
   descriptor_dim: auto
 ```
 
-该切换会自动改变网络结构、描述子维度和输出目录。当前 `dropout: 0.12`、`warmup_epochs: 3`、`lr: 0.08` 是 Strong V2 默认训练参数；若要严格复现旧 Mobile 配置，还应改回 `dropout: 0.1`、`warmup_epochs: 2`、`lr: 0.1`。
+该设置会使用 128 维描述子及对应输出目录。移除不再支持的架构后，当前公共训练参数仍保留 `dropout: 0.12`、`warmup_epochs: 3`、`lr: 0.08`；切换架构不会自动调整这些参数。复现已有实验时应使用该实验的 `resolved_config.json`。
 
 ## 训练在线增强
 
-浮点训练的三种架构和二值训练共用 `FingerprintPairDataset`，默认只对训练集启用
+浮点训练的两种架构和二值训练共用 `FingerprintPairDataset`，默认只对训练集启用
 轻量在线增强；固定验证集不增强。anchor 与 positive 独立采样扰动，使模型学习对
 关键点定位和成像误差的稳定性，而不是记忆固定 patch。默认参数为：
 
@@ -146,7 +134,7 @@ model:
 
 1. 已从 `pair_build` 生成 `outputs/butieping/train_pairs.csv` 和 `outputs/butieping/val_pairs.csv`，CSV 引用的 patch PNG 路径可读取；
 2. train/val 已按 `finger_id` 隔离，同一根手指不会跨集合；
-3. 已完成当前轻量 Strong V2 浮点网络训练，并存在 float/L2 teacher，例如 `outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3/best.pt`；
+3. 已完成浮点网络训练，并存在保留架构的 float/L2 teacher；默认 MobileHardNet 256 维输出为 `outputs/models/hardnet_train_mobile_256_fixed_candidate_pool_v3/best.pt`；
 4. `config_binary_256.yaml` 中的 `backbone.checkpoint` 指向该 teacher；程序会校验 checkpoint 类型、架构和描述子维度，并拒绝 binary/Hamming checkpoint；
 5. 正式训练使用新的 `output_dir`。目录中已有 `metrics.csv` 时，必须显式续训，程序不会覆盖旧实验；
 6. `training.device: cuda` 时，当前 PyTorch 必须能够使用 CUDA。
@@ -156,7 +144,7 @@ model:
 ```powershell
 Test-Path outputs\butieping\train_pairs.csv
 Test-Path outputs\butieping\val_pairs.csv
-Test-Path outputs\models\hardnet_train_strong_v2_256_fixed_candidate_pool_v3\best.pt
+Test-Path outputs\models\hardnet_train_mobile_256_fixed_candidate_pool_v3\best.pt
 python -c "import torch; print('cuda_available=', torch.cuda.is_available()); print('cuda_count=', torch.cuda.device_count())"
 ```
 
@@ -183,7 +171,9 @@ python -m hardnet_train.train --config hardnet_train/config.yaml
 - batch 结构、hard negative、学习率调度、梯度裁剪和早停；
 - 固定 Hamming 验证计划及 `best.pt` 综合选择权重。
 
-默认采用 `hash_bits: 256` 和 `backbone_trainable: false`，即冻结 teacher、只训练 hash head。这是更稳定的第一阶段。若后续需要联合微调，应复制配置到新的输出目录，将 `backbone_trainable` 改为 `true`，并显著降低学习率，避免破坏已经训练好的浮点描述子。
+当前默认采用 `hash_bits: 512` 和 `backbone_trainable: false`，即冻结浮点主干、只训练 hash head。设置 `backbone_trainable: true` 可从浮点 checkpoint 初始化后联合训练主干与新 hash head，但不会自动降低主干学习率。已有冻结二值 checkpoint 不能直接改为 `true` 后 `--resume`，因为续训会校验冻结策略的一致性。
+
+当前训练流程、联合微调的 teacher 边界和从零训练的区别见[学习式二值描述子训练说明](../学习式二值描述子训练说明.md)。
 
 二值训练虽然复用 `HardNetLoss` 作为 metric loss，但不会再依赖其中隐藏的默认值。
 `training.hard_negative_top1_weight` 和五个 `positive_tail_*` 参数会写入
@@ -229,14 +219,14 @@ python -m hardnet_train.train_binary `
 ```powershell
 python -m hardnet_train.train_binary `
   --config hardnet_train/config_binary_256.yaml `
-  --backbone-checkpoint ../outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3/best.pt `
+  --backbone-checkpoint ../outputs/models/hardnet_train_mobile_256_fixed_candidate_pool_v3/best.pt `
   --hash-bits 256 `
   --batch-size 256 `
   --val-finger-count auto `
   --val-batch-count 256 `
   --val-batch-size 24 `
   --lr 0.001 `
-  --output-dir ../outputs/models/hardnet_binary_256_fixed_candidate_pool_v3
+  --output-dir ../outputs/models/hardnet_binary_mobile_256float_256bit_fixed_candidate_pool_v3
 ```
 
 `--backbone-checkpoint` 和 `--output-dir` 会作为配置值解析，相对路径以 `hardnet_train/config_binary_256.yaml` 所在目录为基准；`--resume` 的显式相对路径则以当前工作目录为基准。为避免歧义，建议优先在 YAML 中固定数据、teacher 和输出路径，命令行只覆盖临时实验参数。
@@ -258,14 +248,14 @@ python -m hardnet_train.train_binary `
 ```powershell
 python -m hardnet_train.train_binary `
   --config hardnet_train/config_binary_256.yaml `
-  --resume outputs/models/hardnet_binary_256_fixed_candidate_pool_v3/last.pt
+  --resume outputs/models/hardnet_binary_mobile_256float_512bit_fixed_candidate_pool_v3/last.pt
 ```
 
 续训时不能修改 backbone、hash bit 数、hash head 结构、bitorder、优化器或固定负样本协议；这些实验变量变化时必须使用新的输出目录重新训练。
 
 ### 训练产物和关键指标
 
-默认输出目录为 `outputs/models/hardnet_binary_256_fixed_candidate_pool_v3/`：
+默认输出目录为 `outputs/models/hardnet_binary_mobile_256float_512bit_fixed_candidate_pool_v3/`：
 
 - `best.pt`：`val_checkpoint_selection_score` 最高的二值 checkpoint；
 - `last.pt`：最后完成 epoch 的 checkpoint，用于续训；

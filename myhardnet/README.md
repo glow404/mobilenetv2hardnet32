@@ -7,6 +7,10 @@
 2. `hardnet_train/`：读取构建好的数据，训练浮点描述子或二值描述子网络。
 3. `match_new/`：使用训练完成的模型构建注册模板，执行离线全量匹配评估。
 
+后续模型与推理方案的筛选、性能验收须遵守[模型性能约束](模型性能约束.md)。
+
+SIFT、RootSIFT 与 HardNet 的描述子、二值化、速度和内存优化路线见[特征提取方案优化对比](SIFT与HardNet特征提取方案优化对比.md)。
+
 ## 目录说明
 
 - `hardnet.pdf`：HardNet 论文原文。
@@ -142,7 +146,7 @@ python match_new\run_hardnet_matching.py `
 
 ## 关键设计
 
-- 同时保留原 HardNet、MobileHardNet 和 Strong V2；输入为 `1x32x32`，描述子维度由训练配置决定。
+- 保留原 HardNet 与 MobileHardNet；浮点训练默认使用 256 维 MobileHardNet，输入为 `1x32x32`。
 - loss 使用 HardNet 论文的 hardest-in-batch triplet margin。
 - batch 采样结合指纹数据特点：每个 batch 包含多个手指，每个手指只使用一个两图组合。
 - 使用 union-find 合并跨图正样本连通的关键点，避免同一物理点被误当负样本。

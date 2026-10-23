@@ -44,14 +44,9 @@ class ModelProfile:
 
 _STRUCTURAL_LAYER_TYPES = {
     "BinaryDescriptorModel",
-    "ContrastAwareStem",
     "CoordinateAttention",
-    "HardNetStrongV2",
     "InvertedResidual",
-    "ContextMixer",
     "ResidualHashHead",
-    "ScalarWeightedFusion",
-    "StableResBlock",
 }
 
 
@@ -160,18 +155,6 @@ def _layer_purpose(module: nn.Module) -> str:
         return f"MobileNetV2 倒残差块：扩展、深度卷积、线性投影；{residual}；计算量由子层统计"
     if layer_type == "CoordinateAttention":
         return "分别编码高度与宽度上下文并重标定特征；计算量由子层统计"
-    if layer_type == "ContrastAwareStem":
-        return "融合 3×3 局部纹理和局部对比度两条输入分支；计算量由子层统计"
-    if layer_type == "DropPath":
-        return f"训练时按样本随机丢弃残差路径，p={module.probability}"
-    if layer_type == "StableResBlock":
-        return "预激活残差块，含抗混叠下采样、LayerScale 与 DropPath；计算量由子层统计"
-    if layer_type == "ContextMixer":
-        return "以扩张 depthwise 3×3 和 pointwise 1×1 单路径混合上下文；计算量由子层统计"
-    if layer_type == "ScalarWeightedFusion":
-        return "单位化空间/全局描述子，并以一个可学习标量加权融合；计算量由子层统计"
-    if layer_type == "GeM":
-        return "可学习广义均值全局池化，兼顾峰值响应和整体稳定性"
     if layer_type == "ResidualHashHead":
         return "浮点描述子投影及残差哈希变换；计算量由子层统计"
     if layer_type == "BinaryDescriptorModel":

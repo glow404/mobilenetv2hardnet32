@@ -6,13 +6,23 @@ import pytest
 import torch
 
 from hardnet_train.model import (
-    ContextMixer,
     CoordinateAttention,
-    ScalarWeightedFusion,
-    StableResBlock,
     build_descriptor_model,
+    checkpoint_descriptor_dim,
+    checkpoint_model_architecture,
 )
 from hardnet_train.train import default_output_dir
+
+
+# 显式保留已移除名称，避免以后误把旧 m2 配置静默映射到 m0/m1。
+REMOVED_ARCHITECTURES = (
+    "hardnet_strong_v2",
+    "hardnetstrongv2",
+    "hardnet_strong_v2_256",
+    "strong_v2",
+    "strongv2",
+    "m2",
+)
 
 
 @pytest.mark.parametrize("architecture", ["hardnet", "mobile_hardnet"])
@@ -107,83 +117,82 @@ def test_mobile_hardnet_contains_coordinate_attention() -> None:
     assert isinstance(model.coordinate_attention, CoordinateAttention)
 
 
-@pytest.mark.parametrize("descriptor_dim", [64, 128, 256])
-def test_strong_v2_lightweight_structure_and_output_dimension(
+@pytest.mark.parametrize("architecture", REMOVED_ARCHITECTURES)
+def test_removed_architectures_are_rejected(architecture: str) -> None:
+    with pytest.raises(ValueError, match="Unsupported model architecture"):
+        build_descriptor_model({"architecture": architecture})
+    with pytest.raises(ValueError, match="Unsupported model architecture"):
+        default_output_dir(architecture, 256)
+
+
+@pytest.mark.parametrize("architecture", REMOVED_ARCHITECTURES)
+@pytest.mark.parametrize("metadata_field", ["model_architecture", "config", "resolved_config"])
+def test_removed_checkpoint_architectures_are_rejected(
+    architecture: str,
+    metadata_field: str,
+) -> None:
+    checkpoint = (
+        {metadata_field: architecture}
+        if metadata_field == "model_architecture"
+        else {metadata_field: {"model": {"architecture": architecture}}}
+    )
+
+    with pytest.raises(ValueError, match="Unsupported model architecture"):
+        checkpoint_model_architecture(checkpoint)
+
+
+@pytest.mark.parametrize(
+    ("architecture", "directory_label"),
+    [("hardnet", "hardnet"), ("mobile_hardnet", "mobile")],
+)
+@pytest.mark.parametrize(("descriptor_dim", "directory_dim"), [(None, 128), (64, 64), (256, 256)])
+def test_default_output_directories_remain_compatible(
+    architecture: str,
+    directory_label: str,
+    descriptor_dim: int | None,
+    directory_dim: int,
+) -> None:
+    assert default_output_dir(architecture, descriptor_dim) == (
+        f"../outputs/models/hardnet_train_{directory_label}_{directory_dim}_"
+        "fixed_candidate_pool_v3"
+    )
+
+
+def test_legacy_checkpoint_without_metadata_keeps_hardnet_128_fallback() -> None:
+    assert checkpoint_model_architecture({}) == "hardnet"
+    assert checkpoint_descriptor_dim({}) == 128
+
+
+@pytest.mark.parametrize("architecture", ["hardnet", "mobile_hardnet"])
+@pytest.mark.parametrize("metadata_field", ["model_architecture", "config", "resolved_config"])
+def test_supported_checkpoint_metadata_keeps_default_descriptor_dim(
+    architecture: str,
+    metadata_field: str,
+) -> None:
+    checkpoint = (
+        {metadata_field: architecture}
+        if metadata_field == "model_architecture"
+        else {metadata_field: {"model": {"architecture": architecture}}}
+    )
+
+    assert checkpoint_model_architecture(checkpoint) == architecture
+    assert checkpoint_descriptor_dim(checkpoint) == 128
+
+
+@pytest.mark.parametrize("architecture", ["hardnet", "mobile_hardnet"])
+@pytest.mark.parametrize("descriptor_dim", [128, 256])
+def test_state_dict_roundtrip_preserves_float_descriptor_outputs(
+    architecture: str,
     descriptor_dim: int,
 ) -> None:
-    model = build_descriptor_model(
-        {
-            "architecture": "hardnet_strong_v2",
-            "descriptor_dim": descriptor_dim,
-            "drop_path_rate": 0.08,
-        }
-    ).eval()
+    options = {"architecture": architecture, "descriptor_dim": descriptor_dim}
+    original = build_descriptor_model(options).eval()
+    restored = build_descriptor_model(options).eval()
+    restored.load_state_dict(original.state_dict(), strict=True)
+    patches = torch.randn(2, 1, 32, 32)
 
     with torch.inference_mode():
-        features = model.forward_features(torch.randn(2, 1, 32, 32))
-
-    assert features.q.shape == features.f.shape == (2, descriptor_dim)
-    torch.testing.assert_close(
-        torch.linalg.vector_norm(features.f, dim=1),
-        torch.ones(2),
-    )
-    assert not hasattr(model.stem, "context_branch")
-    assert (len(model.stage1), len(model.stage2), len(model.stage3)) == (1, 2, 2)
-    assert isinstance(model.context, ContextMixer)
-    assert isinstance(model.fusion, ScalarWeightedFusion)
-
-    spatial_depthwise = model.spatial_projection[0]
-    assert isinstance(spatial_depthwise, torch.nn.Conv2d)
-    assert spatial_depthwise.kernel_size == (8, 8)
-    assert spatial_depthwise.groups == spatial_depthwise.in_channels == 128
-    assert model.spatial_projection[-1].out_channels == descriptor_dim
-
-    residual_blocks = [
-        module for module in model.modules() if isinstance(module, StableResBlock)
-    ]
-    drop_path_rates = [block.drop_path.probability for block in residual_blocks]
-    assert len(residual_blocks) == 7
-    assert drop_path_rates == sorted(drop_path_rates)
-    assert drop_path_rates[0] == 0.0
-    assert drop_path_rates[-1] == pytest.approx(0.08)
-    assert all(not hasattr(block, "attention") for block in residual_blocks)
-    assert sum(parameter.numel() for parameter in model.parameters()) < 1_300_000
-
-
-def test_strong_v2_lightweight_backbone_supports_backward() -> None:
-    model = build_descriptor_model(
-        {
-            "architecture": "hardnet_strong_v2",
-            "descriptor_dim": 128,
-            "drop_path_rate": 0.08,
-        }
-    )
-    anchor = model(torch.randn(4, 1, 32, 32))
-    positive = model(torch.randn(4, 1, 32, 32))
-    loss = (1.0 - (anchor * positive).sum(dim=1)).mean()
-    loss.backward()
-
-    assert torch.isfinite(loss)
-    assert model.fusion.weight_logit.grad is not None
-
-
-@pytest.mark.parametrize("drop_path_rate", [-0.01, 1.0])
-def test_strong_v2_rejects_invalid_drop_path_rate(drop_path_rate: float) -> None:
-    with pytest.raises(ValueError, match="drop_path_rate must be in"):
-        build_descriptor_model(
-            {
-                "architecture": "hardnet_strong_v2",
-                "drop_path_rate": drop_path_rate,
-            }
-        )
-
-
-def test_default_output_directory_includes_custom_descriptor_dim() -> None:
-    assert "hardnet_train_hardnet_256_" in default_output_dir("hardnet", 256)
-    assert "hardnet_train_mobile_64_" in default_output_dir("mobile_hardnet", 64)
-    assert "hardnet_train_strong_v2_384_" in default_output_dir(
-        "hardnet_strong_v2", 384
-    )
+        torch.testing.assert_close(restored(patches), original(patches))
 
 
 @pytest.mark.parametrize("architecture", ["hardnet", "mobile_hardnet"])

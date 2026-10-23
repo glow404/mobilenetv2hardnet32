@@ -108,7 +108,6 @@ def default_output_dir(architecture: str, descriptor_dim: Any = None) -> str:
     normalized = normalize_model_architecture(architecture)
     dimension = resolve_descriptor_dim(normalized, descriptor_dim)
     architecture_label = {
-        "hardnet_strong_v2": "strong_v2",
         "mobile_hardnet": "mobile",
         "hardnet": "hardnet",
     }[normalized]
@@ -922,12 +921,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--optimizer", choices=["sgd", "adamw"], default=None)
     parser.add_argument("--dropout", type=float, default=None)
-    parser.add_argument(
-        "--drop-path-rate",
-        type=float,
-        default=None,
-        help="Maximum Strong V2 stochastic-depth rate; ignored by other architectures.",
-    )
     parser.add_argument("--margin", type=float, default=None)
     parser.add_argument("--hard-negative-strategy", choices=["same_finger_allowed", "different_finger"], default=None)
     parser.add_argument(
@@ -1012,8 +1005,6 @@ def main() -> None:
         optim_cfg["name"] = args.optimizer
     if args.dropout is not None:
         model_cfg["dropout"] = float(args.dropout)
-    if args.drop_path_rate is not None:
-        model_cfg["drop_path_rate"] = float(args.drop_path_rate)
     if args.margin is not None:
         train_cfg["margin"] = float(args.margin)
     if args.hard_negative_strategy is not None:
@@ -1083,8 +1074,6 @@ def main() -> None:
         model_cfg["architecture"],
         model_cfg.get("descriptor_dim"),
     )
-    if model_cfg["architecture"] == "hardnet_strong_v2":
-        model_cfg["drop_path_rate"] = float(model_cfg.get("drop_path_rate", 0.08))
     train_cfg["hard_negative_strategy"] = normalize_hard_negative_strategy(train_cfg.get("hard_negative_strategy", "same_finger_allowed"))
     train_cfg["hard_negative_top_k"] = int(train_cfg.get("hard_negative_top_k", 3))
     configured_validation_fingers = validation_cfg["finger_count"]
@@ -1227,7 +1216,6 @@ def main() -> None:
         f"batch={batch_size} "
         f"fingers_per_batch={train_cfg.get('fingers_per_batch', 8)} "
         f"dropout={model_cfg.get('dropout', 0.1)} "
-        f"drop_path_rate={model_cfg.get('drop_path_rate', 0.0)} "
         f"optimizer={optimizer_name(optimizer)} "
         f"lr={optim_cfg.get('lr', 0.1)} {optimizer_detail} "
         f"margin={train_cfg.get('margin', 1.0)} steps_per_epoch={steps_per_epoch} epochs={epochs} "

@@ -16,7 +16,6 @@ from hardnet_train.model_report import profile_model, write_model_structure_repo
     [
         ("hardnet", 128),
         ("mobile_hardnet", 192),
-        ("hardnet_strong_v2", 256),
     ],
 )
 def test_profile_covers_all_float_architectures(
@@ -44,16 +43,28 @@ def test_profile_covers_all_float_architectures(
     assert sum(row.parameters for row in profile.layers) == profile.parameters
 
 
-def test_write_model_structure_report_creates_markdown_and_csv(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("architecture", "model_class", "head_path"),
+    [
+        ("hardnet", "HardNet", "features.7"),
+        ("mobile_hardnet", "MobileHardNet", "descriptor_head"),
+    ],
+)
+def test_write_model_structure_report_creates_markdown_and_csv(
+    tmp_path,
+    architecture: str,
+    model_class: str,
+    head_path: str,
+) -> None:
     model = build_descriptor_model(
-        {"architecture": "hardnet_strong_v2", "descriptor_dim": 128}
+        {"architecture": architecture, "descriptor_dim": 128}
     )
 
     profile, markdown_path, csv_path = write_model_structure_report(model, tmp_path)
 
     assert markdown_path.parent == csv_path.parent == tmp_path
     markdown = markdown_path.read_text(encoding="utf-8")
-    assert "HardNetStrongV2 模型结构报告" in markdown
+    assert f"{model_class} 模型结构报告" in markdown
     assert "逐层明细" in markdown
     assert f"{profile.parameters:,}" in markdown
 
@@ -61,7 +72,7 @@ def test_write_model_structure_report_creates_markdown_and_csv(tmp_path) -> None
         rows = list(csv.DictReader(handle))
     assert len(rows) == len(profile.layers)
     assert rows[0]["输入形状"] == "[1,1,32,32]"
-    assert any(row["层路径"].startswith("spatial_projection") for row in rows)
+    assert any(row["层路径"].startswith(head_path) for row in rows)
 
 
 def test_profile_supports_frozen_backbone_binary_model() -> None:

@@ -189,11 +189,11 @@ x' = \frac{x-\operatorname{mean}(x)}
 
 ## 第二步：共享网络前向
 
-anchor 和 positive 使用同一个 HardNet Strong V2：
+anchor 和 positive 使用同一个 MobileHardNet：
 
 ```text
 256 anchor patches   ─┐
-                      ├─ 同一个 HardNet → 256维 L2 单位描述子
+                      ├─ 同一个 MobileHardNet → 256维 L2 单位描述子
 256 positive patches ─┘
 ```
 

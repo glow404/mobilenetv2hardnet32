@@ -1,4 +1,4 @@
-# 256-bit residual binary fingerprint descriptor 训练配置。
+# MobileHardNet 256 维浮点特征 / 512-bit residual binary descriptor 训练配置。
 #
 # 运行位置：项目根目录 myhardnet。
 # 正式命令：
@@ -19,7 +19,7 @@ seed: 42
 
 # 二值实验必须与浮点实验分开保存。
 # 相对路径统一相对于本配置文件所在目录 hardnet_train 解析。
-output_dir: ../outputs/models/hardnet_binary_256float_512bit_fixed_candidate_pool_v3
+output_dir: ../outputs/models/hardnet_binary_mobile_256float_512bit_fixed_candidate_pool_v3
 
 data:
   # 二值 student 与浮点 teacher 必须使用相同的 patch/正样本数据契约。
@@ -69,14 +69,14 @@ data:
 backbone:
   # 必填：已经训练完成的浮点/L2 teacher。
   # 程序会拒绝 binary/Hamming checkpoint，并校验架构和描述子维度。
-  # 必须使用本次轻量 Strong V2 重新训练得到的 checkpoint；旧 Strong V2 权重不兼容。
-  checkpoint: ../outputs/models/hardnet_train_strong_v2_256_fixed_candidate_pool_v3/best.pt
+  # 默认对应 config.yaml 的 MobileHardNet 256 维浮点训练输出；须先完成浮点训练。
+  checkpoint: ../outputs/models/hardnet_train_mobile_256_fixed_candidate_pool_v3/best.pt
 
   # auto：直接采用 checkpoint 中记录的真实网络架构，避免手工配置不一致。
   architecture: auto
 
   # auto：直接采用 checkpoint 中记录的浮点描述子维度。
-  # Strong V2 通常是 256；该值不要求等于 binary_model.hash_bits。
+  # 当前浮点配置为 256 维；该值不要求等于 binary_model.hash_bits。
   descriptor_dim: auto
 
 binary_model:

@@ -1,8 +1,10 @@
-"""独立 residual binary descriptor 训练入口。"""
+"""Residual hash 与P9/P7-L直接二值描述子的训练、分阶段微调和续训入口。"""
 
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
 import math
 import os
@@ -82,9 +84,11 @@ from hardnet_train.validation import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train residual binary fingerprint descriptors."
+        description="Train residual hash or direct binary fingerprint descriptors (P9/P7-L)."
     )
     parser.add_argument("--config", default="hardnet_train/config_binary_256.yaml")
+    parser.add_argument("--seed", type=int, default=None, help="Training seed; fixed validation.seed is unchanged.")
+    parser.add_argument("--temperature-end", type=float, default=None, help="Final tanh temperature for a separate annealing experiment.")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -97,11 +101,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-batch-size", type=int, default=None)
     parser.add_argument("--hash-bits", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--head-warmup-epochs", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--backbone-checkpoint", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--resume-auto", action="store_true")
+    parser.add_argument("--smoke-test", action="store_true", help="Direct models: 3 epochs x 2 steps on a small data subset; not an accuracy experiment.")
     return parser.parse_args()
 
 
@@ -182,6 +188,127 @@ def quantization_temperature(
     return float(start) * math.pow(float(end) / float(start), progress)
 
 
+def is_direct_binary(model: torch.nn.Module) -> bool:
+    return getattr(model, "architecture", None) == "hardnet_direct_binary_v1"
+
+
+def build_binary_optimizer(
+    model: torch.nn.Module, config: Mapping[str, Any]
+) -> torch.optim.Optimizer:
+    """复用decay分组，为直接头区分主干/头的学习率；旧residual路径保持原样。"""
+
+    optimizer = build_optimizer(model, config)
+    if not is_direct_binary(model):
+        return optimizer
+    multiplier = float(config.get("backbone_lr_multiplier", 0.1))
+    if not math.isfinite(multiplier) or multiplier <= 0.0:
+        raise ValueError("optimizer.backbone_lr_multiplier must be finite and > 0.")
+    head_ids = {id(parameter) for parameter in model.hash_head.parameters()}
+    original_groups = list(optimizer.param_groups)
+    optimizer.param_groups.clear()
+    # 提前注册所有参数：冻结期间grad为None，AdamW不会更新主干或其衰减项。
+    # 联合阶段保留头部动量，避免切换阶段时打乱续训参数组顺序。
+    for group in original_groups:
+        for role, scale in (("backbone", multiplier), ("head", 1.0)):
+            parameters = [
+                parameter for parameter in group["params"]
+                if (id(parameter) in head_ids) == (role == "head")
+            ]
+            if parameters:
+                optimizer.add_param_group({
+                    **group,
+                    "params": parameters,
+                    "name": f"{role}_{group.get('name', 'parameters')}",
+                    "lr_scale": scale,
+                    "lr": float(config["lr"]) * scale,
+                })
+    return optimizer
+
+
+def binary_step_schedule(
+    *, global_step: int, total_steps: int, head_warmup_steps: int,
+    base_lr: float, scheduler: str, warmup_steps: int, eta_min: float,
+    temperature_start: float, temperature_end: float,
+) -> tuple[float, float, bool]:
+    """头适配保持温度；联合阶段从自己的第0步开始退火和学习率调度。"""
+
+    if head_warmup_steps > 0 and global_step < head_warmup_steps:
+        return base_lr, temperature_start, False
+    joint_step = global_step - head_warmup_steps
+    joint_total = max(1, total_steps - head_warmup_steps)
+    return (
+        scheduled_lr(base_lr, joint_step, joint_total, scheduler, warmup_steps, eta_min),
+        quantization_temperature(temperature_start, temperature_end, joint_step, joint_total),
+        True,
+    )
+
+
+def forward_binary_training_features(
+    model: torch.nn.Module, patches: torch.Tensor,
+    teacher: torch.nn.Module | None = None,
+):
+    features = model.forward_features(patches)
+    if teacher is not None:
+        # 同一份增强后输入交给独立、固定FP32教师；teacher不进入student的部署state。
+        with torch.no_grad(), torch.autocast(device_type=patches.device.type, enabled=False):
+            reference = teacher.forward_features(patches.float())
+        features = features._replace(
+            teacher_q=reference.q.detach(), teacher_f=reference.f.detach(),
+        )
+    return features
+
+
+def direct_training_contract(config: Mapping[str, Any]) -> dict[str, Any]:
+    """固定直接头的阶段边界、退火与教师来源，拒绝把不同实验误当作续训。"""
+
+    training = config["training"]
+    binary = config["binary_model"]
+    optimizer = config["optimizer"]
+    data_contract = {key: config.get("data", {}).get(key) for key in (
+        "train_csv", "val_csv", "normalize", "max_train_rows", "max_val_rows",
+        "max_train_rows_per_finger", "max_val_rows_per_finger",
+    )}
+    for key in ("train_csv", "val_csv"):
+        if data_contract[key] is not None and "_config_path" in config:
+            data_contract[key] = str(resolve_path(dict(config), data_contract[key]))
+    return {
+        "version": 1,
+        "seed": int(config.get("seed", 42)),
+        "data": data_contract,
+        "validation": dict(config.get("validation", {})),
+        "checkpoint_selection": dict(config.get("checkpoint_selection", {})),
+        "epochs": int(training["epochs"]),
+        "steps_per_epoch": int(training["steps_per_epoch"]),
+        "batch_size": int(training["batch_size"]),
+        "fingers_per_batch": int(training.get("fingers_per_batch", 32)),
+        "head_warmup_epochs": int(training.get("head_warmup_epochs", 0)),
+        "scheduler": str(training.get("scheduler", "warmup_cosine")),
+        "warmup_epochs": float(training.get("warmup_epochs", 2.0)),
+        "eta_min": float(training.get("eta_min", 1e-5)),
+        "lr": float(optimizer["lr"]),
+        "backbone_lr_multiplier": float(optimizer.get("backbone_lr_multiplier", 0.1)),
+        "weight_decay": float(optimizer.get("weight_decay", 1e-4)),
+        "betas": list(optimizer.get("betas", (0.9, 0.999))),
+        "eps": float(optimizer.get("eps", 1e-8)),
+        "temperature_start": float(binary.get("temperature_start", 1.0)),
+        "temperature_end": float(binary.get("temperature_end", 0.1)),
+        "freeze_backbone_bn": bool(binary.get("freeze_backbone_bn", True)),
+        "teacher_enabled": bool(config.get("teacher", {}).get("enabled", True)),
+        "source_sha256": config["backbone"]["checkpoint_sha256"],
+        "loss_weights": dict(config.get("binary_loss", {})),
+        # 缺省false维持旧P9的contract；显式开启后不可在续训中切换数值路径。
+        **({"quantization_fp32": True} if binary.get("quantization_fp32", False) else {}),
+    }
+
+
+def checkpoint_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def train_binary_one_epoch(
     model: BinaryDescriptorModel,
     criterion: BinaryDescriptorLoss,
@@ -203,10 +330,14 @@ def train_binary_one_epoch(
     amp_enabled: bool,
     amp_dtype: torch.dtype | None,
     channels_last: bool,
+    teacher: torch.nn.Module | None = None,
+    head_warmup_steps: int = 0,
 ) -> tuple[dict[str, float], int]:
     """训练一个二值 epoch；网络前向可混合精度，组合损失保持 FP32。"""
 
     model.train()
+    if teacher is not None:
+        teacher.eval()
     meter_names = (
         "loss",
         "loss_metric",
@@ -228,21 +359,22 @@ def train_binary_one_epoch(
     temperature = temperature_start
 
     for step, batch in enumerate(loader, start=1):
-        lr = scheduled_lr(
-            base_lr,
-            global_step,
-            total_steps,
-            scheduler,
-            warmup_steps,
-            eta_min,
+        lr, temperature, joint = binary_step_schedule(
+            global_step=global_step, total_steps=total_steps,
+            head_warmup_steps=head_warmup_steps,
+            base_lr=base_lr, scheduler=scheduler,
+            warmup_steps=warmup_steps, eta_min=eta_min,
+            temperature_start=temperature_start, temperature_end=temperature_end,
         )
-        set_optimizer_lr(optimizer, lr)
-        temperature = quantization_temperature(
-            temperature_start,
-            temperature_end,
-            global_step,
-            total_steps,
-        )
+        if is_direct_binary(model):
+            if model.backbone_trainable != joint:
+                model.set_backbone_trainable(joint)
+                model.train()
+            # 调度器更新基准LR时保留主干/头倍率，防止小LR联合微调退化成统一LR。
+            for group in optimizer.param_groups:
+                group["lr"] = lr * float(group.get("lr_scale", 1.0))
+        else:
+            set_optimizer_lr(optimizer, lr)
         model.set_quantization_temperature(temperature)
 
         anchor = batch["anchor"].to(device, non_blocking=True)
@@ -267,8 +399,8 @@ def train_binary_one_epoch(
             dtype=amp_dtype,
             enabled=amp_enabled,
         ):
-            anchor_features = model.forward_features(anchor)
-            positive_features = model.forward_features(positive)
+            anchor_features = forward_binary_training_features(model, anchor, teacher)
+            positive_features = forward_binary_training_features(model, positive, teacher)
         loss, stats = criterion(
             anchor_features,
             positive_features,
@@ -317,11 +449,18 @@ def train_binary_one_epoch(
             )
         global_step += 1
 
-    return {
+    result = {
         **{name: meter.value for name, meter in meters.items()},
         "lr": float(lr),
         "temperature": float(temperature),
-    }, global_step
+    }
+    if is_direct_binary(model):
+        result["backbone_lr"] = lr * float(next(
+            group["lr_scale"] for group in optimizer.param_groups
+            if str(group["name"]).startswith("backbone_")
+        )) if model.backbone_trainable else 0.0
+        result["joint_stage"] = int(model.backbone_trainable)
+    return result, global_step
 
 
 def save_binary_checkpoint(
@@ -379,6 +518,13 @@ def save_binary_checkpoint(
     }
     if scaler is not None and scaler.is_enabled():
         payload["amp_scaler"] = scaler.state_dict()
+    if is_direct_binary(model):
+        payload["direct_training_contract"] = direct_training_contract(config)
+        payload["training_stage"] = "joint" if model.backbone_trainable else "head"
+        payload["teacher_source"] = (
+            "independent_fixed_float_checkpoint"
+            if config.get("teacher", {}).get("enabled", True) else "disabled"
+        )
     torch.save(payload, path)
 
 
@@ -401,6 +547,13 @@ def load_binary_checkpoint(
         raise ValueError(
             f"Checkpoint is not a binary descriptor training checkpoint: {checkpoint_path}"
         )
+    if is_direct_binary(model):
+        expected_contract = direct_training_contract(config)
+        if checkpoint.get("direct_training_contract") != expected_contract:
+            raise ValueError(
+                "P9/P7-L direct training contract changed (stages, LR, data, loss, or source "
+                "checkpoint). Resume with the original config or start a new output directory."
+            )
     expected = binary_model_metadata(model)
     for field in (
         "model_architecture",
@@ -418,12 +571,23 @@ def load_binary_checkpoint(
         "float_descriptor_dim",
         "backbone_trainable",
     ):
+        # 直接头在同一次训练内切换冻结状态，阶段由global_step恢复，不作为架构差异。
+        if field == "backbone_trainable" and is_direct_binary(model):
+            continue
         if checkpoint.get(field) != expected[field]:
             raise ValueError(
                 f"Binary checkpoint metadata mismatch for {field}: "
                 f"checkpoint={checkpoint.get(field)!r}, model={expected[field]!r}."
             )
+    if is_direct_binary(model):
+        if bool(checkpoint.get("quantization_fp32", False)) != model.quantization_fp32:
+            raise ValueError("Direct checkpoint quantization_fp32 does not match the current model.")
+        for field in ("freeze_backbone_bn", "backbone_dropout"):
+            if checkpoint.get(field) != expected[field]:
+                raise ValueError(f"Direct checkpoint metadata mismatch for {field}.")
     model.load_state_dict(checkpoint["model"])
+    if is_direct_binary(model):
+        model.set_backbone_trainable(bool(checkpoint["backbone_trainable"]))
 
     saved_optimizer_name = checkpoint.get("optimizer_name")
     if saved_optimizer_name is not None:
@@ -449,6 +613,8 @@ def load_binary_checkpoint(
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    if args.seed is not None:
+        config["seed"] = int(args.seed)
     seed = int(config.get("seed", 42))
     set_seed(seed)
 
@@ -477,14 +643,33 @@ def main() -> None:
         validation_cfg["batch_size"] = int(args.val_batch_size)
     if args.hash_bits is not None:
         binary_cfg["hash_bits"] = int(args.hash_bits)
+    if args.temperature_end is not None:
+        binary_cfg["temperature_end"] = float(args.temperature_end)
     if args.lr is not None:
         optim_cfg["lr"] = float(args.lr)
+    if args.head_warmup_epochs is not None:
+        train_cfg["head_warmup_epochs"] = int(args.head_warmup_epochs)
     if args.device is not None:
         train_cfg["device"] = str(args.device)
     if args.backbone_checkpoint is not None:
         backbone_cfg["checkpoint"] = str(args.backbone_checkpoint)
     if args.output_dir is not None:
         config["output_dir"] = str(args.output_dir)
+
+    if args.smoke_test:
+        if str(binary_cfg.get("architecture", "")) != "hardnet_direct_binary_v1":
+            raise ValueError("--smoke-test is defined for direct binary configurations only.")
+        # 显式小样本自检覆盖head→joint切换，写独立目录，不能混入正式精度实验。
+        train_cfg.update(epochs=3, steps_per_epoch=2, batch_size=8,
+                         fingers_per_batch=1, head_warmup_epochs=1, log_interval=1)
+        data_cfg.update(num_workers=0, persistent_workers=False,
+                        max_train_rows=64, max_val_rows=64,
+                        max_train_rows_per_finger=None, max_val_rows_per_finger=None)
+        validation_cfg.update(finger_count=1, batch_count=1, batch_size=8)
+        if args.output_dir is None:
+            config["output_dir"] = str(config["output_dir"]) + "_smoke"
+        config["smoke_test"] = True
+        print("SMOKE TEST: small subset, 6 training steps; no accuracy/performance conclusion.", flush=True)
 
     epochs = int(train_cfg.get("epochs", 100))
     steps_per_epoch = int(train_cfg.get("steps_per_epoch", 1000))
@@ -578,10 +763,30 @@ def main() -> None:
         config
     )
     model = build_binary_descriptor_model(backbone, binary_cfg).to(device)
+    direct = is_direct_binary(model)
+    teacher = None
+    head_warmup_epochs = int(train_cfg.get("head_warmup_epochs", 0))
+    if direct:
+        if not binary_cfg["backbone_trainable"]:
+            raise ValueError("Direct training requires binary_model.backbone_trainable=true; use head_warmup_epochs for freezing.")
+        if not 0 <= head_warmup_epochs < epochs:
+            raise ValueError("Direct training requires 0 <= training.head_warmup_epochs < training.epochs.")
+        backbone_cfg["checkpoint_sha256"] = checkpoint_sha256(backbone_checkpoint_path)
+        teacher_cfg = config.setdefault("teacher", {})
+        teacher_enabled = bool(teacher_cfg.setdefault("enabled", True))
+        if not teacher_enabled and float(loss_cfg.get("teacher_similarity_weight", 0.5)) != 0.0:
+            raise ValueError("teacher.enabled=false requires binary_loss.teacher_similarity_weight=0.")
+        if teacher_enabled:
+            # direct factory复制student权重；原浮点实例独立冻结，不随student漂移。
+            teacher = backbone.to(device).eval().requires_grad_(False)
+            if channels_last:
+                teacher = teacher.to(memory_format=torch.channels_last)
+    elif head_warmup_epochs:
+        raise ValueError("head_warmup_epochs is only supported by direct binary architectures.")
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
     criterion = BinaryDescriptorLoss.from_config(train_cfg, loss_cfg)
-    optimizer = build_optimizer(model, optim_cfg)
+    optimizer = build_binary_optimizer(model, optim_cfg)
 
     train_loader = make_loader(
         config,
@@ -655,6 +860,14 @@ def main() -> None:
             config=config,
             scaler=scaler,
         )
+        if direct and metrics_path.exists():
+            with metrics_path.open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            if rows and int(rows[-1]["epoch"]) != start_epoch - 1:
+                raise ValueError(
+                    "Direct resume checkpoint epoch does not match the last metrics.csv row. "
+                    "Resume last.pt, or use a new output directory for a checkpoint branch."
+                )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     model_profile, model_report_md, model_report_csv = write_model_structure_report(
@@ -701,6 +914,11 @@ def main() -> None:
     )
 
     for epoch in range(start_epoch, epochs + 1):
+        if direct:
+            # 续训从绝对epoch恢复采样计划，避免重放第1轮的batch索引。
+            train_loader.batch_sampler.set_epoch(epoch - 1)
+            stage = "head" if epoch <= head_warmup_epochs else "joint"
+            print(f"direct backbone={model.backbone_architecture} stage={stage} epoch={epoch} teacher_fixed={teacher is not None}", flush=True)
         train_metrics, global_step = train_binary_one_epoch(
             model=model,
             criterion=criterion,
@@ -722,6 +940,8 @@ def main() -> None:
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             channels_last=channels_last,
+            teacher=teacher,
+            head_warmup_steps=head_warmup_epochs * steps_per_epoch,
         )
         val_metrics = evaluate_binary_fixed_validation_batches(
             model=model,

@@ -1,7 +1,7 @@
 """HardNet 系列 32×32 灰度 patch 描述子网络。
 
-本模块保留旧 HardNet 的稳定 checkpoint 协议，以带 Coordinate Attention 的
-MobileHardNet 提供轻量主干。两个模型通过 `forward_features()` 暴露归一化前
+本模块保留旧 HardNet 的稳定 checkpoint 协议，提供 MobileHardNet 和窄通道
+PlainSpatialL（P7-L）主干。各模型通过 `forward_features()` 暴露归一化前
 特征 `q` 和 L2 单位描述子 `f`，
 供浮点匹配及独立 hash head 共用。
 """
@@ -42,6 +42,7 @@ class HardNet(nn.Module):
     """
 
     architecture = "hardnet"
+    channels = (32, 32, 64, 64, 128, 128)
 
     def __init__(self, dropout: float = 0.1, descriptor_dim: int = 128, final_bn_affine: bool = False) -> None:
         super().__init__()
@@ -53,16 +54,14 @@ class HardNet(nn.Module):
         #   32x32 -> 32x32 -> 32x32 -> 16x16 -> 16x16 -> 8x8 -> 8x8 -> 1x1
         # 通道变化：
         #   1 -> 32 -> 32 -> 64 -> 64 -> 128 -> 128 -> 128
+        # P7-L只改变通道宽度；层次和state_dict键保持相同，便于复用头融合逻辑。
+        widths = (1, *self.channels)
         self.features = nn.Sequential(
-            self._conv_block(1, 32, stride=1),
-            self._conv_block(32, 32, stride=1),
-            self._conv_block(32, 64, stride=2),
-            self._conv_block(64, 64, stride=1),
-            self._conv_block(64, 128, stride=2),
-            self._conv_block(128, 128, stride=1),
+            *(self._conv_block(widths[i], widths[i + 1], stride=stride)
+              for i, stride in enumerate((1, 1, 2, 1, 2, 1))),
             nn.Dropout(p=float(dropout)),
             nn.Conv2d(
-                128,
+                self.channels[-1],
                 self.descriptor_dim,
                 kernel_size=8,
                 stride=1,
@@ -108,6 +107,21 @@ class HardNet(nn.Module):
     def forward(self, patches: torch.Tensor) -> torch.Tensor:
         """前向计算配置维度的单位长度描述子。"""
         return self.forward_features(patches).f
+
+
+class PlainSpatialL(HardNet):
+    """P7-L：24/48/96通道普通CNN，保留完整8×8空间头。
+
+    复用HardNet的初始化、BN和L2输出协议；须先训练自己的浮点权重，
+    不能按同名state_dict键强行加载m0的不同形状权重。
+    """
+
+    architecture = "plain_spatial_l"
+    channels = (24, 24, 48, 48, 96, 96)
+
+    def __init__(self, dropout: float = 0.1, descriptor_dim: int = 256,
+                 final_bn_affine: bool = False) -> None:
+        super().__init__(dropout, descriptor_dim, final_bn_affine)
 
 
 class InvertedResidual(nn.Module):
@@ -310,6 +324,9 @@ _MODEL_ARCHITECTURE_ALIASES = {
     "mobilehardnet": "mobile_hardnet",
     "mobilenet_v2": "mobile_hardnet",
     "mobilev2": "mobile_hardnet",
+    "plain_spatial_l": "plain_spatial_l",
+    "p7_l": "plain_spatial_l",
+    "p7-l": "plain_spatial_l",
 }
 
 
@@ -325,8 +342,8 @@ def normalize_model_architecture(value: str | None) -> str:
 def default_descriptor_dim(architecture: str | None) -> int:
     """返回架构默认维度；旧 checkpoint 的回退规则集中维护在此处。"""
 
-    normalize_model_architecture(architecture)
-    return 128
+    normalized = normalize_model_architecture(architecture)
+    return 256 if normalized == "plain_spatial_l" else 128
 
 
 def resolve_descriptor_dim(architecture: str | None, value: Any = None) -> int:
@@ -355,6 +372,8 @@ def build_descriptor_model(model_config: Mapping[str, Any] | None = None) -> nn.
     }
     if architecture == "hardnet":
         return HardNet(**options)
+    if architecture == "plain_spatial_l":
+        return PlainSpatialL(**options)
     return MobileHardNet(**options)
 
 

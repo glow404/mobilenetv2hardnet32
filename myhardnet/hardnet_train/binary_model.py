@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from hardnet_train.model import model_architecture, model_descriptor_dim
+
+if TYPE_CHECKING:
+    from hardnet_train.direct_binary_model import DirectBinaryDescriptorModel
 
 
 BINARY_MODEL_ARCHITECTURE = "residual_binary_hash_v1"
@@ -266,10 +269,18 @@ class BinaryDescriptorModel(nn.Module):
 def build_binary_descriptor_model(
     backbone: nn.Module,
     config: Mapping[str, Any] | None = None,
-) -> BinaryDescriptorModel:
+) -> BinaryDescriptorModel | DirectBinaryDescriptorModel:
     """从 binary_model 配置段构建可训练二值网络。"""
 
     options = config or {}
+    architecture = str(options.get("architecture", BINARY_MODEL_ARCHITECTURE)).strip().lower()
+    if architecture == "hardnet_direct_binary_v1":
+        # 延迟导入避免直接头复用本模块的二值契约时产生循环依赖。
+        from hardnet_train.direct_binary_model import DirectBinaryDescriptorModel
+
+        return DirectBinaryDescriptorModel.from_float_backbone(backbone, options)
+    if architecture != BINARY_MODEL_ARCHITECTURE:
+        raise ValueError(f"Unsupported binary model architecture: {architecture!r}.")
     return BinaryDescriptorModel(
         backbone=backbone,
         hash_bits=int(options.get("hash_bits", 256)),
@@ -281,9 +292,13 @@ def build_binary_descriptor_model(
     )
 
 
-def binary_model_metadata(model: BinaryDescriptorModel) -> dict[str, object]:
+def binary_model_metadata(
+    model: BinaryDescriptorModel | DirectBinaryDescriptorModel,
+) -> dict[str, object]:
     """返回 checkpoint、导出和未来 Hamming matcher 共用的二值契约。"""
 
+    if model.architecture == "hardnet_direct_binary_v1":
+        return model.checkpoint_metadata()
     return {
         "model_architecture": model.architecture,
         "descriptor_kind": BINARY_DESCRIPTOR_KIND,

@@ -110,6 +110,7 @@ def default_output_dir(architecture: str, descriptor_dim: Any = None) -> str:
     architecture_label = {
         "mobile_hardnet": "mobile",
         "hardnet": "hardnet",
+        "plain_spatial_l": "p7_l",
     }[normalized]
     return (
         f"../outputs/models/hardnet_train_{architecture_label}_{dimension}_"
@@ -907,6 +908,8 @@ def parse_args() -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(description="Train HardNet fingerprint patch descriptor.")
     parser.add_argument("--config", default="hardnet_train/config.yaml")
+    parser.add_argument("--seed", type=int, default=None, help="Training seed; fixed validation.seed is unchanged.")
+    parser.add_argument("--smoke-test", action="store_true", help="3 epochs x 2 steps on a small subset; not an accuracy experiment.")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument(
@@ -967,6 +970,8 @@ def main() -> None:
     validation_cfg = config.setdefault("validation", {})
     data_cfg = config.setdefault("data", {})
     data_cfg["train_augmentation"] = train_augmentation_contract(config)
+    if args.seed is not None:
+        config["seed"] = int(args.seed)
     seed = int(config.get("seed", 42))
     set_seed(seed)
 
@@ -1035,6 +1040,22 @@ def main() -> None:
         train_cfg["eta_min"] = float(args.eta_min)
     if args.output_dir is not None:
         config["output_dir"] = args.output_dir
+
+    if args.smoke_test:
+        # 与二值入口保持相同的小样本自检口径；独立目录防止污染正式实验。
+        train_cfg.update(epochs=3, steps_per_epoch=2, batch_size=8,
+                         fingers_per_batch=1, warmup_epochs=1, log_interval=1)
+        data_cfg.update(num_workers=0, persistent_workers=False,
+                        max_train_rows=64, max_val_rows=64,
+                        max_train_rows_per_finger=None, max_val_rows_per_finger=None)
+        validation_cfg.update(finger_count=1, batch_count=1, batch_size=8)
+        if args.output_dir is None:
+            raw_output = config.get("output_dir", "auto")
+            if str(raw_output).strip().lower() == "auto":
+                raw_output = default_output_dir(model_cfg.get("architecture"), model_cfg.get("descriptor_dim"))
+            config["output_dir"] = str(raw_output) + "_smoke"
+        config["smoke_test"] = True
+        print("SMOKE TEST: small subset, 6 training steps; no accuracy/performance conclusion.", flush=True)
 
     epochs = int(train_cfg.get("epochs", 10))
     steps_per_epoch = int(train_cfg.get("steps_per_epoch", 1000))
@@ -1273,6 +1294,9 @@ def main() -> None:
         print(f"nothing to train: start_epoch={start_epoch} > epochs={epochs}", flush=True)
 
     for epoch in range(start_epoch, epochs + 1):
+        if model_architecture(model) == "plain_spatial_l":
+            # 新方案续训按绝对epoch恢复采样计划，避免重新播放第一轮的batch。
+            train_loader.batch_sampler.set_epoch(epoch - 1)
         train_metrics, global_step = train_one_epoch(
             model=model,
             criterion=criterion,

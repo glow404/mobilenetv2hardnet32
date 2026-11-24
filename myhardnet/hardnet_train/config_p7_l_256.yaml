@@ -1,0 +1,127 @@
+# P7-L浮点预训练基线：只改变架构，训练配方对齐已有m0_256_v2。
+# 训练命令：python -m hardnet_train.train --config hardnet_train/config_p7_l_256.yaml
+# 输出256维；完成后用config_binary_p7_l_direct_256.yaml转换并联合微调。
+
+seed: 42
+# 独立目录避免覆盖m0/P9或其他实验。
+output_dir: ../outputs/models/hardnet_p7_l_float_256
+
+data:
+  train_csv: ../outputs/butieping/train_pairs.csv
+  val_csv: ../outputs/butieping/val_pairs.csv
+  normalize: true
+  # 只对训练 patch 在线增强；anchor/positive 独立采样，验证集始终保持原图。
+  # patch 已按关键点方向对齐，因此几何扰动保持轻微，不使用翻转或大角度旋转。
+  train_augmentation:
+    enabled: true
+    # 30% patch 保持原样，70% 执行下列随机扰动。
+    probability: 0.70
+    max_rotation_degrees: 5.0
+    max_translation_pixels: 1.0
+    scale_jitter: 0.03
+    contrast_jitter: 0.10
+    gamma_jitter: 0.10
+    blur_probability: 0.15
+    max_blur_radius: 0.40
+    # 灰度值范围为 0～255，最大噪声标准差 2 约等于 0.8% 满量程。
+    noise_probability: 0.25
+    max_noise_std: 2.0
+  # Windows 下使用多个常驻 worker 提前读取 patch，减少 GPU 等待磁盘/PIL 解码。
+  num_workers: 4
+  pin_memory: false
+  persistent_workers: true
+  prefetch_factor: 2
+  max_train_rows:
+  max_val_rows:
+  max_train_rows_per_finger:
+  max_val_rows_per_finger:
+
+model:
+  # 六层普通3x3卷积：24/24/48/48/96/96，完整8x8投影头。
+  architecture: plain_spatial_l
+  # P7-L默认256维，直接二值头也要求浮点源为256维。
+  descriptor_dim: 256
+  dropout: 0.12
+  final_bn_affine: false
+
+training:
+  # 明确要求 CUDA，避免 CUDA 版 PyTorch 缺失时静默退回 CPU。
+  device: cuda
+  # 卷积前向使用 FP16，hardest-negative 距离矩阵和 loss 仍使用 FP32。
+  mixed_precision: fp16
+  channels_last: true
+  cudnn_benchmark: false  #当前批处理输入的关键点数量不固定，每次搜索最优卷积算法花的时间很长。
+  allow_tf32: true
+  # 允许长程训练并保留 last.pt 续训；当前固定协议可用于稳定观察过拟合拐点。
+  epochs: 100
+  steps_per_epoch: 1000
+  # 单手指点数不足会从已选样本重复采样补齐；整个 batch 仍不足则丢弃。伪负样本由 point_group 屏蔽。
+  batch_size: 256
+  # fingers_per_batch=1 时，每 batch 只选 1 根手指，全部 256 对来自同一手指的一个两图组合。
+  fingers_per_batch: 30
+  # Hard negative mining strategy:
+  # - same_finger_allowed: allow same-finger negatives, but mask connected point_group.
+  # - different_finger: only use negatives from different finger_id values.
+  hard_negative_strategy: same_finger_allowed
+  # 同指且位于同一原图坐标系的候选必须在锚点中心 32x32 方形邻域之外：
+  # max(|dx|, |dy|) >= 16；跨指或跨图候选不比较原始坐标。
+  same_finger_min_coordinate_separation_px: 16
+  # 每条正样本从双向合法候选中选择距离最小的 k 个负样本；设为 1 可复现原来的 hardest-negative。
+  hard_negative_top_k: 3
+  # top-1 使用该权重；其余有效 top-k 负样本均分剩余权重。0.6 会让最近负样本获得主要梯度。
+  hard_negative_top1_weight: 0.6
+  # 对有效正样本的 p95/p99 距离施加平方 hinge 约束；目标是单位描述子的 L2 距离。
+  # p99 在 batch=256 时样本数较少，因此默认权重低于 p95，避免训练抖动。
+  positive_tail_loss_weight: 0.10
+  positive_tail_p95_weight: 0.7
+  positive_tail_p99_weight: 0.3
+  positive_tail_p95_target: 0.60
+  positive_tail_p99_target: 0.80
+  # 保留m0源实验的margin=0.9；调整margin需另开目录做对照。
+  margin: 0.9
+  # 长训练先禁用早停；需要时可命令行设置 --early-stop-patience。
+  early_stop_patience: 0
+  early_stop_min_relative_improvement: 0.002
+  scheduler: warmup_cosine
+  warmup_epochs: 3
+  eta_min: 0.0001
+  log_interval: 50
+
+validation:
+  # 固定候选池协议：完整合法候选计算 ROC/FPR，动态 top-k 仅计算排序与 loss。
+  protocol: fixed_candidate_pool_v3
+  seed: 10042
+  # auto 使用 min(验证集可用手指数, batch_size)，保证每根手指至少贡献 1 对样本。
+  # batch_count 只控制固定验证 batch 数；image_pair 不足时会确定性循环，不会因此报错。
+  finger_count: auto
+  batch_count: 256
+  # batch_size=正样本对数
+  batch_size: 32
+
+# 匹配导向的综合选择：各指标先转换为 [0, 1] 的“越大越好”分量，
+# 再按以下权重求和：score = sum(normalized_weight_i * component_i)。
+# 非负权重会按总和自动归一化，但权重总和必须大于 0。
+checkpoint_selection:
+  strategy: matching_composite_v1
+  weights:
+    # 动态 hard top-k margin loss：1 - clamp(val_loss / (2 + margin), 0, 1)。
+    loss: 0.30
+    # 完整合法候选池均值间隔：clamp((val_neg_mean - val_pos_mean) / 2, 0, 1)。
+    distance_gap: 0.20
+    # 完整合法候选池误接受：1 - clamp(val_fpr_at_tpr95, 0, 1)。
+    fpr_at_tpr95: 0.35
+    # 正样本尾部距离：1 - clamp(val_pos_p95 / 2, 0, 1)。
+    pos_p95: 0.15
+
+optimizer:
+  # 默认使用 SGD + Nesterov。切换为 adamw 时也要显式设置对应学习率，
+  # 不会静默改写 lr，确保 resolved_config 能准确记录实验变量。
+  name: sgd
+  lr: 0.08
+  momentum: 0.9
+  nesterov: true
+  # 仅 Conv/Linear 权重衰减；BatchNorm 参数和所有 bias 固定为 no-decay。
+  weight_decay: 0.0001
+  # 仅 AdamW 使用。
+  betas: [0.9, 0.999]
+  eps: 1.0e-8

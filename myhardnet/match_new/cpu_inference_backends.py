@@ -1,7 +1,8 @@
 """Optional ONNX Runtime/OpenVINO FP32 CPU inference adapters.
 
-The exported graph only produces the continuous HardNet output (or the raw
-pre-hash backbone feature for a native binary checkpoint). Existing NumPy/Torch
+The exported graph produces the continuous HardNet output, raw pre-hash
+backbone features for residual binary models, or final logits for direct binary
+models. Existing NumPy/Torch
 postprocessing remains in ``runtime.py`` so normalization, Hadamard/sign rules,
 zero handling, and packed bit order stay centralized.
 """
@@ -27,8 +28,15 @@ class _InferenceExportGraph(nn.Module):
         super().__init__()
         self.model = model
         self.native_binary = bool(native_binary)
+        self.direct_binary = bool(
+            native_binary
+            and getattr(model, "architecture", "") == "hardnet_direct_binary_v1"
+        )
 
     def forward(self, patches: torch.Tensor) -> torch.Tensor:
+        if self.direct_binary:
+            # 直接二值头属于CNN输出层，整张student图一次导出，不再分回PyTorch跑头。
+            return self.model.forward_logits(patches)
         if self.native_binary:
             return self.model.backbone.forward_features(patches).q
         return self.model(patches)
@@ -75,6 +83,12 @@ def ensure_onnx_model(
         "opset_version": int(opset_version),
         "torch_version": str(torch.__version__),
         "graph_kind": type(model).__name__,
+        "inference_output": (
+            "binary_logits"
+            if native_binary
+            and getattr(model, "architecture", "") == "hardnet_direct_binary_v1"
+            else "backbone_features" if native_binary else "float_descriptor"
+        ),
     }
     if configured_path:
         onnx_path = Path(configured_path).expanduser().resolve()

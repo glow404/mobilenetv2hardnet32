@@ -16,6 +16,8 @@
 - `binary_loss.py`：二值排序、teacher 关系保持、正样本一致性、量化、bit balance 和去相关组合损失。
 - `binary_validation.py`：固定验证计划上的归一化 Hamming 距离和 bit 分布指标。
 - `train_binary.py`：二值网络训练、续训、验证和 checkpoint 入口。
+- `direct_binary_model.py`：P9的m0直接256-bit头、最终BN/Hadamard融合及自包含checkpoint加载。
+- `config_binary_m0_direct_256.yaml`：P9独立实验配置，前3轮头适配、后37轮联合微调。
 - `config_binary_256.yaml`：带逐项注释的 MobileHardNet 256 维浮点特征 / 512-bit 二值网络正式训练配置。
 - `optim.py`：SGD/AdamW 工厂与 decay/no-decay 参数分组。
 - `train.py`：训练主入口，负责配置解析、训练、固定验证、checkpoint 和 metrics 输出。
@@ -116,7 +118,175 @@ model:
 
 `matching_composite_v1` 是描述子阶段的代理目标，不替代最终 `match_new` 全量模板、双向验证和 Lowe 比率评估；正式部署前仍应在独立匹配实验中确认阈值和误报行为。
 
-## 二值网络训练
+## P9：开启m0直接256-bit二值头联合微调（2026-10-27）
+
+新增方案复用已经训练好的m0浮点256维模型，将最终卷积、BN running statistics和H256/16融合为带bias的完整8×8输出层。输出为256个logits，部署按`z >= 0`取1，再按little位序打包为32 bytes；没有独立residual hash head，教师也不参与部署。student为2,384,288参数，FP32参数净大小9.537152 MB、Conv/Linear约80.2816 MFLOPs/patch，属于“80左右”的边界，不是严格小于80。
+
+### 1. 选择配置并确认环境
+
+本方案使用独立文件`hardnet_train/config_binary_m0_direct_256.yaml`，原来的`config_binary_256.yaml`仍是residual方案，不能混用。
+
+默认输入是已有的`outputs/models/3/m0/m0_256_v2/best.pt`，程序要求它是m0/HardNet、float/L2、256维checkpoint。训练CSV仍使用`outputs/butieping/train_pairs.csv`和`val_pairs.csv`，相对路径以YAML所在目录解析。正式训练前确认这些文件及CSV引用的patch存在。
+
+本机已经验证`hardnet-cuda`环境可以使用RTX 3070 Laptop GPU；默认系统Python是CPU版。建议在PowerShell使用明确的解释器，避免误用CPU环境：
+
+```powershell
+Set-Location C:\Users\ZYH\Desktop\harnet32\myhardnet
+& "C:\Users\ZYH\.conda\envs\hardnet-cuda\python.exe" -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+```
+
+如果已激活正确环境，也可以将后续完整解释器路径替换为`python`。其他机器应替换为自己的GPU版PyTorch解释器。
+
+### 2. 先运行6步冒烟检查
+
+```powershell
+& "C:\Users\ZYH\.conda\envs\hardnet-cuda\python.exe" -m hardnet_train.train_binary --config hardnet_train/config_binary_m0_direct_256.yaml --smoke-test
+```
+
+`--smoke-test`显式使用64条训练/验证记录、batch 8、单手指、0个DataLoader worker，运行3轮×2步；第1轮只训练头，第2～3轮联合训练。默认输出为`outputs/models/hardnet_m0_direct_256bit_p9_smoke`。这是检查加载、融合、梯度、阶段切换、验证与保存的流程，不是精度或性能验收；单手指验证出现提示是预期行为。
+
+冒烟目录已有记录时，使用新的`--output-dir`，或加`--resume-auto`验证恢复。完成3轮后续训不会额外增加轮次。没有CUDA时可以在此命令加`--device cpu`；无需为短检查修改正式配置。
+
+### 3. 启动正式训练
+
+```powershell
+& "C:\Users\ZYH\.conda\envs\hardnet-cuda\python.exe" -m hardnet_train.train_binary --config hardnet_train/config_binary_m0_direct_256.yaml
+```
+
+默认输出目录为`outputs/models/hardnet_m0_direct_256bit_p9`。正式命令不带`--smoke-test`，采用全部配置数据。输出包括`best.pt`、`last.pt`、`metrics.csv`、`resolved_config.json`和逐层结构报告；不会改写原m0 checkpoint。
+
+配置中的主要实验起点：
+
+- 总计40轮，每轮1000步；前3轮仅训练直接头，学习率1e-4、温度1固定。
+- 后37轮主干与头联合，主干/头峰值学习率分别1e-5/1e-4。联合阶段重新计数，先做1轮LR warmup再余弦衰减，温度从1退火至0.1。
+- 所有参数组提前建立；冻结阶段主干没有梯度，不发生AdamW更新或weight decay。切换时保留头部优化器动量，调度器始终保持主干/头1:10倍率。
+- 默认冻结主干BN的running mean/var，但联合阶段BN affine仍可学习。最终输出头后没有BN或L2。
+- 默认启用独立、固定、eval状态的原m0教师；教师与student使用同一份增强后的patch。教师FP32前向，student默认FP16训练，组合损失仍为FP32。
+- 六项损失复用现有二值实现；训练增强概率0.7与此次m0源实验一致，seed和训练/验证CSV不变。40轮、学习率及损失权重是待验证起点，不是最优结论。
+
+可在新实验目录中修改`training.head_warmup_epochs`、`optimizer.lr`、`optimizer.backbone_lr_multiplier`、`freeze_backbone_bn`等；头适配轮数必须小于总轮数。做无教师对照时，同时设置`teacher.enabled: false`和`binary_loss.teacher_similarity_weight: 0`，并使用新的output_dir。
+
+更换源checkpoint时可使用`--backbone-checkpoint`加绝对路径；仍必须是m0浮点256维。调整batch会改变困难负样本池，应作为独立实验记录。
+
+### 4. 中断后继续训练
+
+```powershell
+& "C:\Users\ZYH\.conda\envs\hardnet-cuda\python.exe" -m hardnet_train.train_binary --config hardnet_train/config_binary_m0_direct_256.yaml --resume-auto
+```
+
+恢复原目录的last.pt、优化器、AMP scaler和global_step；头适配/联合阶段及退火位置不会重置。采样计划按绝对epoch恢复，但多worker增强和GPU运算不承诺逐bit复现。保留原配置与浮点源文件；源文件SHA256、阶段长度、总预算、LR、损失及数据配置变化会拒绝作为同一实验续训。
+
+不要在同一目录用较早的best.pt覆盖后续metrics历史。要从较早checkpoint建立分支，使用新的`--output-dir`和`--resume`绝对路径。正式配置的best仍按原有综合patch代理分数选择，可能出现在头适配期；检查checkpoint的training_stage和metrics中的train_joint_stage，最终仍按相同FAR比较身份级FRR。
+
+### 5. 使用新checkpoint匹配
+
+在新的匹配配置中设置模型checkpoint为P9的best.pt，`model.architecture: auto`、`descriptor_dim: auto`，关闭额外Hadamard后处理。P9已经输出二值码，不能再施加一次H变换。原模板与新模型编码不兼容，必须重新生成模板并使用新的模板目录。
+
+PyTorch和CPU ONNX Runtime均已接入：ORT导出完整student到logits，然后sign/pack，不再回到PyTorch执行独立哈希头。推理加载只依赖P9 checkpoint，不需要原浮点源文件或教师；训练/续训仍需源文件校验。参数净大小不等于训练checkpoint文件大小，后者还含优化器等状态。
+
+本轮只完成代码、短流程和数值回归。冒烟结果不能证明精度提高，也不能认证完整识别100 ms或峰值ΔRSS 30 MB。
+
+## P7-L：浮点预训练与直接256-bit联合微调（2026-10-27）
+
+P7-L已注册为`plain_spatial_l`（别名`p7-l`、`p7_l`）。它复用现有数据、采样、损失和评估入口；没有增加依赖。正式训练需要按顺序完成以下两阶段，不能直接完整加载m0权重。
+
+### 1. 结构与计算预算
+
+```text
+32×32灰度patch
+  → Conv3×3 1→24   s1 + BN + ReLU     [24,32,32]
+  → Conv3×3 24→24  s1 + BN + ReLU     [24,32,32]
+  → Conv3×3 24→48  s2 + BN + ReLU     [48,16,16]
+  → Conv3×3 48→48  s1 + BN + ReLU     [48,16,16]
+  → Conv3×3 48→96  s2 + BN + ReLU     [96,8,8]
+  → Conv3×3 96→96  s1 + BN + ReLU     [96,8,8]
+  → Dropout（仅训练启用）
+  → 完整Conv8×8 96→256                 [256,1,1]
+      浮点阶段：无bias卷积 → BN → L2 → 256维float
+      二值阶段：带bias融合卷积 → z≥0 → pack → 32 bytes
+```
+
+二值student为**1,734,712参数、6.938848 MB FP32参数、23.027712M MAC/patch = 46.055424 MFLOPs/patch**；保留骨干BN参数，按1 MAC=2 FLOPs统计Conv/Linear。浮点阶段为1,734,456参数，MAC相同。相对P9，卷积计算量约减少42.6%。实际RSS和400个关键点、40模板的完整识别时间仍需测量。
+
+### 2. 启动两阶段正式训练
+
+以下命令在PowerShell执行；第一阶段完成后再运行第二阶段。
+
+```powershell
+Set-Location C:\Users\ZYH\Desktop\harnet32\myhardnet
+
+# 阶段A：从随机初始化训练P7-L浮点256维模型。
+& "C:\Users\ZYH\.conda\envs\hardnet-cuda\python.exe" -m hardnet_train.train --config hardnet_train/config_p7_l_256.yaml
+
+# 阶段B：加载阶段A的best.pt，融合BN/H256，再训练直接二值头。
+& "C:\Users\ZYH\.conda\envs\hardnet-cuda\python.exe" -m hardnet_train.train_binary --config hardnet_train/config_binary_p7_l_direct_256.yaml
+```
+
+- 阶段A输出：`outputs/models/hardnet_p7_l_float_256`。默认100轮×1000步，batch256、30指，SGD+Nesterov，lr0.08，3轮warmup后余弦衰减。除结构和输出目录外，关键训练配方对齐现有m0_256_v2；未改变数据划分、seed42、增强概率0.7。
+- 阶段B输出：`outputs/models/hardnet_p7_l_direct_256bit`。默认40轮，前3轮只适配头，后37轮联合；AdamW头/主干峰值LR为1e-4/1e-5。教师是阶段A的独立冻结P7-L浮点模型，未额外引入m0教师。
+- 阶段B继承P9的融合、分组LR、BN统计冻结、温度退火和自包含checkpoint格式；元数据记录`backbone_architecture: plain_spatial_l`及头输入6144，防止与m0的8192维头混淆。
+- 新P7-L配置启用`binary_model.quantization_fp32: true`：卷积仍使用AMP，但`tanh/STE`使用FP32，降低半精度舍入造成的额外梯度饱和。P9原配置与旧checkpoint缺省为false，保留原实验数值路径；要让P9采用此改进，应新建实验目录并明确设置true。
+- 中断后在相应命令末尾加`--resume-auto`。调整超参、seed或教师源文件时另开目录，从头运行对应阶段；尤其不能通过修改总epoch来给原余弦调度实验“无缝加轮次”。
+
+### 3. 先运行短流程检查
+
+```powershell
+& "C:\Users\ZYH\.conda\envs\hardnet-cuda\python.exe" -m hardnet_train.train --config hardnet_train/config_p7_l_256.yaml --smoke-test --no-plot
+
+& "C:\Users\ZYH\.conda\envs\hardnet-cuda\python.exe" -m hardnet_train.train_binary --config hardnet_train/config_binary_p7_l_direct_256.yaml --smoke-test --backbone-checkpoint "C:\Users\ZYH\Desktop\harnet32\myhardnet\outputs\models\hardnet_p7_l_float_256_smoke\best.pt"
+```
+
+两阶段分别运行3轮×2步，输出目录末尾带`_smoke`。二值短检查必须显式指向浮点短检查的checkpoint，不能把短检查权重当成正式模型。短检查只证明代码流程可运行；单手指验证提示是预期行为。已有短检查目录请换`--output-dir`或使用`--resume-auto`。
+
+### 4. 损失函数与改进顺序
+
+**早出现best.pt不等于陷入局部最优。** 实际核对`outputs/models/3`下的记录：m0_256_v2的best在第4轮，训练loss从该轮0.3459降至第100轮0.1585，但验证综合分数从0.7995变为0.7940；m1_256_v2的best在第64轮，后续训练loss从0.2455降到0.2133，验证loss也从0.1931降到0.1895，而验证FPR95由0.0004301升到0.0006133。训练仍在优化，代理目标与泛化/匹配目标未必同步改善；这些结果不能定位某个数学意义的局部极小点，更不能证明全局最优。
+
+当前浮点损失是top-3加权triplet hinge（margin0.9，top1权重0.6）加正样本p95/p99尾部约束（权重0.1）。二值阶段为：
+
+```text
+L = 1.0 Lmetric + 0.5 Lteacher + 0.1 Lpositive
+  + 0.1 Lquantization + 0.02 Lbalance + 0.02 Ldecorrelation
+```
+
+其中`Lmetric`包含margin0.5的二值排序代理及权重0.05的正样本尾部约束；teacher约束保持batch内关系，量化项推动连续码接近±1，均衡和去相关项减少常量bit与重复bit。单位化硬码的L2距离是`2*sqrt(Hamming/256)`，所以margin0.5不是固定的bit差。保持原损失作为结构对照，避免同时换结构、损失、采样和优化器而无法判断收益来源。
+
+建议按以下顺序实验，每一行均与基线单独比较，不能把多项修改一次叠加就称为某个因素的收益：
+
+| 优先级 | 单变量实验 | 判断依据与代价 |
+|---|---|---|
+| 1 | 浮点lr0.08→0.04 | 判断高LR是否阻碍更细的适配；较低LR也可能变慢，并不保证更优。总step、其他配方不变。 |
+| 2 | 入围配方训练seed42/43/44，固定validation.seed10042 | 降低对一次初始化/采样的依赖；报告均值和波动，验证集选择方案，独立测试集只做最终评估。 |
+| 3 | 二值末温度0.1→0.2 | `tanh(z/T)`在低T下更容易饱和；较高T保留更宽梯度区间，但可能增加软码与硬码差异。看硬码验证表现，不能只比总训练loss。 |
+| 4 | top1权重0.6→0.4，仍top3 | 若极难负例噪声较多，减少单个负例主导。保留同点与同图坐标屏蔽；先检查配对质量。 |
+| 5 | teacher权重0.5→0.2；量化权重0.1→0.03分别对照 | 教师可能限制student超越浮点基线；过强量化可能过早固定码。降低约束也可能丢失稳定性，分别新建配置和输出目录。 |
+| 条件性 | soft-margin、LR warm restarts、渐进量化权重 | 当前未实现，不作为默认。先观察有效triplet/饱和情况；重启增大探索也可能损坏已学编码，不能保证跳出局部极小点。 |
+
+可直接使用的两项单变量命令如下；这些选项已接入实际配置记录和二值续训契约：
+
+```powershell
+# 浮点LR对照，从随机初始化开始；不会覆盖基线。
+& "C:\Users\ZYH\.conda\envs\hardnet-cuda\python.exe" -m hardnet_train.train --config hardnet_train/config_p7_l_256.yaml --lr 0.04 --output-dir ../outputs/models/hardnet_p7_l_float_256_lr004
+
+# 二值温度对照，默认读取同一个正式浮点基线，单独启动。
+& "C:\Users\ZYH\.conda\envs\hardnet-cuda\python.exe" -m hardnet_train.train_binary --config hardnet_train/config_binary_p7_l_direct_256.yaml --temperature-end 0.2 --output-dir ../outputs/models/hardnet_p7_l_direct_256bit_t02
+```
+
+两入口均新增`--seed`，例如浮点命令加`--seed 43 --output-dir ../outputs/models/hardnet_p7_l_float_256_seed43`。完整两阶段多seed实验必须在二值阶段显式指定对应浮点seed的`best.pt`和独立二值目录；若固定同一个浮点源只改变二值seed，衡量的是微调阶段波动，不能当作完整训练波动。
+
+梯度解释：`d tanh(z/T)/dz = (1-tanh²(z/T))/T`。本次测试中`z/T=5`时，FP16 tanh已经舍入成1、梯度为0，而FP32仍有非零梯度。这是数值饱和例子，不代表真实模型所有bit都存在此问题；FP32也无法解决极大logit导致的真实饱和。当前`train_mean_abs_continuous`、量化损失和验证bit均衡可辅助观察，但它们不是梯度范数，也不能单独诊断局部最优。
+
+方法背景：[HashNet](https://openaccess.thecvf.com/content_iccv_2017/html/Cao_HashNet_Deep_Learning_ICCV_2017_paper.html)研究从连续到离散的渐进优化；[Triplet Loss研究](https://arxiv.org/abs/1703.07737)讨论batch-hard及soft-margin；[SGDR](https://arxiv.org/abs/1608.03983)研究余弦重启。这些研究支持开展相应对照，**不能把论文中的效果或特定收敛结论直接当作当前指纹/STE方案达到全局最优的保证**。
+
+最终仍用同一数据划分、同一FAR下的身份级FRR比较P9与P7-L，再测完整识别延时和峰值ΔRSS。当前best.pt按原综合patch代理分数选取，不等同于最终身份级FRR最优。
+
+### 5. 推理与验证范围
+
+P7-L浮点模型支持原L2匹配和固定Hadamard基线；直接二值模型支持Torch及完整student的ORT导出。匹配配置设置`model.architecture: auto`、`descriptor_dim: auto`并指向新checkpoint；直接二值模型关闭额外Hadamard，重新生成注册模板。部署不需要浮点源权重或教师。
+
+本次只运行小步CUDA流程及结构/梯度/融合/部署回归，尚未启动正式长训练；不能声称精度提高或完整时间/RSS达标。
+
+## 原residual二值网络训练
 
 二值网络不是把浮点描述子在推理时直接执行一次 `sign`。`train_binary.py` 会加载已经训练好的浮点/L2 checkpoint 作为 teacher，在其后增加 residual hash head，通过可退火的 `tanh + straight-through sign` 学习固定长度的 0/1 bit code。
 

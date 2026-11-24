@@ -11,6 +11,8 @@
 
 SIFT、RootSIFT 与 HardNet 的描述子、二值化、速度和内存优化路线见[特征提取方案优化对比](SIFT与HardNet特征提取方案优化对比.md)。
 
+面向完整识别平均 < 100 ms、预热单请求峰值 RSS 增量 < 30 MB 的新设计见[256-bit 直接二值描述子模型设计](256bit直接二值描述子模型设计.md)。
+
 ## 目录说明
 
 - `hardnet.pdf`：HardNet 论文原文。

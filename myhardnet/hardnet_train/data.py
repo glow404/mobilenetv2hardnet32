@@ -557,6 +557,12 @@ class FingerImagePairBatchSampler(Sampler[list[int]]):
         """一个 epoch 产生多少个 batch。"""
         return self.batches_per_epoch
 
+    def set_epoch(self, epoch: int) -> None:
+        """按从0开始的epoch恢复采样序列；未调用时仍沿用原自动递增行为。"""
+        if int(epoch) < 0:
+            raise ValueError("Sampler epoch must be >= 0.")
+        self._iteration = int(epoch)
+
     def __iter__(self) -> Iterator[list[int]]:
         """逐 batch 产生 dataset index 列表。"""
         # 同一个 sampler 会被 DataLoader 在每个 epoch 重新迭代。

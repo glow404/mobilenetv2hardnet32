@@ -25,11 +25,16 @@ import numpy as np
 import torch
 
 from hardnet_train.binary_model import (
+    BINARY_MODEL_ARCHITECTURE,
     BINARY_DESCRIPTOR_KIND,
     BINARY_STORAGE,
     HAMMING_DISTANCE_METRIC,
     build_binary_descriptor_model,
     pack_binary_codes,
+)
+from hardnet_train.direct_binary_model import (
+    DIRECT_BINARY_MODEL_ARCHITECTURE,
+    build_direct_binary_from_checkpoint,
 )
 from hardnet_train.model import (
     build_descriptor_model,
@@ -582,6 +587,13 @@ class HardNetDescriptor:
                     "Configured model architecture does not match binary checkpoint: "
                     f"config={requested_architecture}, checkpoint={binary_architecture}."
                 )
+            if binary_architecture not in {
+                BINARY_MODEL_ARCHITECTURE,
+                DIRECT_BINARY_MODEL_ARCHITECTURE,
+            }:
+                raise ValueError(
+                    f"Unsupported binary checkpoint architecture: {binary_architecture!r}."
+                )
             saved_config = checkpoint.get("resolved_config", checkpoint.get("config", {}))
             saved_config = saved_config if isinstance(saved_config, Mapping) else {}
             saved_backbone = saved_config.get("backbone", {})
@@ -622,19 +634,23 @@ class HardNetDescriptor:
             }
             load_error: RuntimeError | None = None
             self.model = None
-            for final_bn_affine in (False, True):
-                backbone_config["final_bn_affine"] = final_bn_affine
-                candidate = build_binary_descriptor_model(
-                    build_descriptor_model(backbone_config),
-                    binary_config,
-                )
-                try:
-                    candidate.load_state_dict(state)
-                except RuntimeError as exc:
-                    load_error = exc
-                    continue
-                self.model = candidate
-                break
+            if binary_architecture == DIRECT_BINARY_MODEL_ARCHITECTURE:
+                # P9 checkpoint已包含完整student，推理不依赖原浮点模型或训练teacher。
+                self.model = build_direct_binary_from_checkpoint(checkpoint)
+            else:
+                for final_bn_affine in (False, True):
+                    backbone_config["final_bn_affine"] = final_bn_affine
+                    candidate = build_binary_descriptor_model(
+                        build_descriptor_model(backbone_config),
+                        binary_config,
+                    )
+                    try:
+                        candidate.load_state_dict(state)
+                    except RuntimeError as exc:
+                        load_error = exc
+                        continue
+                    self.model = candidate
+                    break
             if self.model is None:
                 raise ValueError(
                     f"Binary checkpoint model structure is incompatible: {checkpoint_path}"
@@ -673,6 +689,10 @@ class HardNetDescriptor:
                 )
 
         self.model_descriptor_kind = descriptor_kind
+        self.direct_binary = bool(
+            descriptor_kind == BINARY_DESCRIPTOR_KIND
+            and self.model.architecture == DIRECT_BINARY_MODEL_ARCHITECTURE
+        )
         self.hadamard_binarizer: HadamardBinarizer | None = None
         self.descriptor_transform_metadata: dict[str, Any] = {}
         if hadamard_binarization_enabled(config):
@@ -900,8 +920,9 @@ class HardNetDescriptor:
     ) -> tuple[np.ndarray, dict[str, Any]]:
         """描述子生成的细分墙钟计时；CPU 无设备同步，CUDA 同步后计时。
 
-        CNN 阶段含 backbone 输出及其归一化，不含二值网络 hash head、
-        Hadamard/sign/packbits 或输出转换。普通 describe() 保持不插入同步。
+        CNN阶段包含浮点backbone或直接二值student到logits；仅residual二值网络
+        的独立hash head另计。Hadamard/sign/packbits及输出转换也另计。
+        普通describe()保持不插入同步。
         CUDA 失败回退时，失败尝试的时间计入 inference_overhead，设备字段
         记录最后成功的实际设备。空输入所有计算阶段为 0。
         """
@@ -1021,9 +1042,12 @@ class HardNetDescriptor:
                 batch_output = self.cpu_backend(backend_batch)
                 end_stage("hardnet_cnn_ms", stage_started)
                 if self.model_descriptor_kind == BINARY_DESCRIPTOR_KIND:
-                    stage_started = start_stage()
-                    logits = self.model.hash_head(batch_output)
-                    end_stage("hardnet_hash_head_ms", stage_started)
+                    if self.direct_binary:
+                        logits = batch_output
+                    else:
+                        stage_started = start_stage()
+                        logits = self.model.hash_head(batch_output)
+                        end_stage("hardnet_hash_head_ms", stage_started)
                     stage_started = start_stage()
                     batch_output = pack_binary_codes(
                         (logits >= 0).to(torch.uint8), self.model.bitorder
@@ -1041,7 +1065,15 @@ class HardNetDescriptor:
                     enabled=self.amp_enabled,
                 ), mkldnn_context:
                     if self.model_descriptor_kind == BINARY_DESCRIPTOR_KIND:
-                        if timings is None:
+                        if self.direct_binary:
+                            logits = self.model.forward_logits(batch)
+                            end_stage("hardnet_cnn_ms", stage_started)
+                            stage_started = start_stage()
+                            batch_output = pack_binary_codes(
+                                (logits >= 0).to(torch.uint8), self.model.bitorder
+                            )
+                            end_stage("hardnet_binarization_ms", stage_started)
+                        elif timings is None:
                             batch_output = self.model.encode_binary(batch, packed=True)
                         else:
                             features = self.model.backbone.forward_features(batch)

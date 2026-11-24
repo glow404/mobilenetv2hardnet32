@@ -1,0 +1,115 @@
+# P9：m0浮点256 → BN/Hadamard融合直接头 → 头适配 → 二值联合微调。
+# 在myhardnet目录运行：python -m hardnet_train.train_binary --config hardnet_train/config_binary_m0_direct_256.yaml
+# 相对路径以本YAML目录为基准；旧浮点checkpoint和旧residual实验不被覆盖。
+seed: 42
+output_dir: ../outputs/models/hardnet_m0_direct_256bit_p9
+
+data:
+  train_csv: ../outputs/butieping/train_pairs.csv
+  val_csv: ../outputs/butieping/val_pairs.csv
+  normalize: true
+  # 沿用此次m0浮点checkpoint的增强概率0.7，保持已有训练/验证划分。
+  train_augmentation:
+    enabled: true
+    probability: 0.70
+    max_rotation_degrees: 5.0
+    max_translation_pixels: 1.0
+    scale_jitter: 0.03
+    contrast_jitter: 0.10
+    gamma_jitter: 0.10
+    blur_probability: 0.15
+    max_blur_radius: 0.40
+    noise_probability: 0.25
+    max_noise_std: 2.0
+  num_workers: 4
+  pin_memory: false
+  persistent_workers: true
+  prefetch_factor: 2
+  max_train_rows:
+  max_val_rows:
+  max_train_rows_per_finger:
+  max_val_rows_per_finger:
+
+backbone:
+  checkpoint: ../outputs/models/3/m0/m0_256_v2/best.pt
+  architecture: hardnet
+  descriptor_dim: 256
+
+binary_model:
+  architecture: hardnet_direct_binary_v1
+  hash_bits: 256
+  # 目标阶段联合训练；前几轮冻结由training.head_warmup_epochs管理。
+  backbone_trainable: true
+  # 冻结running mean/var；联合阶段BN affine仍可更新。
+  freeze_backbone_bn: true
+  temperature_start: 1.0
+  temperature_end: 0.10
+  bitorder: little
+
+teacher:
+  # 独立冻结的原m0，只用于训练；关闭时同时将teacher_similarity_weight改为0。
+  enabled: true
+
+binary_loss:
+  metric_weight: 1.0
+  teacher_similarity_weight: 0.50
+  positive_consistency_weight: 0.10
+  quantization_weight: 0.10
+  balance_weight: 0.02
+  decorrelation_weight: 0.02
+
+training:
+  device: cuda
+  mixed_precision: fp16
+  channels_last: true
+  cudnn_benchmark: false
+  allow_tf32: true
+  # 前3轮仅头；后37轮联合。总预算改变会改变退火，不能在resume时悄悄修改。
+  epochs: 40
+  head_warmup_epochs: 3
+  steps_per_epoch: 1000
+  batch_size: 256
+  fingers_per_batch: 30
+  hard_negative_strategy: same_finger_allowed
+  same_finger_min_coordinate_separation_px: 16
+  hard_negative_top_k: 3
+  hard_negative_top1_weight: 0.60
+  positive_tail_loss_weight: 0.05
+  positive_tail_p95_weight: 0.70
+  positive_tail_p99_weight: 0.30
+  positive_tail_p95_target: 0.60
+  positive_tail_p99_target: 0.80
+  margin: 0.50
+  scheduler: warmup_cosine
+  # 头适配期LR/T固定；这里的warmup从联合阶段第0步重新计数。
+  warmup_epochs: 1
+  eta_min: 1.0e-6
+  grad_clip_norm: 5.0
+  early_stop_patience: 0
+  early_stop_min_relative_improvement: 0.002
+  log_interval: 50
+
+validation:
+  protocol: fixed_candidate_pool_v3
+  seed: 10042
+  finger_count: auto
+  batch_count: 256
+  batch_size: 32
+  margin: 0.10
+
+checkpoint_selection:
+  strategy: matching_composite_v1
+  weights:
+    loss: 0.30
+    distance_gap: 0.20
+    fpr_at_tpr95: 0.35
+    pos_p95: 0.15
+
+optimizer:
+  name: adamw
+  lr: 1.0e-4
+  # joint阶段主干1e-5、头1e-4为峰值；调度期间一直保持1:10倍率。
+  backbone_lr_multiplier: 0.10
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
